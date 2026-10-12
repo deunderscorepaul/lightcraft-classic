@@ -94,6 +94,31 @@ fn a_grid_view_from_develop_shows_library_panels() {
     assert!(!h.app.ui.right.is_edit_tool(), "{:?}", h.app.ui.right);
 }
 
+// The tool strip is the module's: Develop carries the editing tools (Edit, Crop, Remove, Masking,
+// Red Eye), Library carries only the panels it shares with Develop. Library used to list the
+// editing tools too, so a strip click took the user out of Library and into Develop.
+#[test]
+fn the_tool_strip_offers_the_modules_own_panels() {
+    let mut h = demo();
+    const TOOLS: [&str; 5] = ["edit", "crop", "remove", "masking", "redeye"];
+    const SHARED: [&str; 4] = ["versions", "activity", "keywords", "info"];
+    for id in SHARED {
+        assert!(has_widget(&h, &format!("icon:{id}")), "Library's strip offers {id}");
+    }
+    for id in TOOLS {
+        assert!(!has_widget(&h, &format!("icon:{id}")), "Library's strip must not offer {id}");
+    }
+    run(&mut h, "module.develop", json!({}));
+    for id in TOOLS.iter().chain(SHARED.iter()) {
+        assert!(has_widget(&h, &format!("icon:{id}")), "Develop's strip offers {id}");
+    }
+    // a shared panel opens there and then: opening it from Library does not leave Library
+    run(&mut h, "module.library", json!({}));
+    run(&mut h, "panel.info", json!({}));
+    assert_eq!(h.app.ui.module, ModuleId::Library);
+    assert_eq!(h.app.ui.right, RightPanel::Info);
+}
+
 #[test]
 fn panel_state_is_per_module_and_persists() {
     let mut h = demo();

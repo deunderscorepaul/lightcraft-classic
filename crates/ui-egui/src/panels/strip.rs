@@ -1,4 +1,6 @@
-//! The vertical tool strip at the far right (Presets, Edit, Crop, Remove, Masking, Red Eye …).
+//! The vertical tool strip at the far right: Presets, then the module's own panels (in Develop the
+//! editing tools — Edit, Crop, Remove, Masking, Red Eye — and the panels it shares with the library,
+//! Info, Keywords, Versions, Activity).
 
 use egui::vec2;
 use serde_json::json;
@@ -28,19 +30,11 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                 if icon_button(ui, "presets", Icon::Presets, sz, app.ui.presets, has_photo, "Presets (Shift+P)").clicked() {
                     let _ = app.run("panel.presets", json!({}));
                 }
-                // the module's right group in the user's order, then the other panels (Library offers
-                // the editing tools as a way into Develop)
-                let mut order = crate::module::right_group(app);
-                for p in crate::module::get(crate::module::ModuleId::Develop).right_panels() {
-                    if !order.contains(p) && !app.ui.hidden_panels.contains(p) {
-                        order.push(*p);
-                    }
-                }
-                let group = order.len().min(crate::module::get(app.ui.module).right_panels().len());
-                for (i, p) in order.iter().enumerate() {
-                    if i == group && i > 0 {
-                        separator(ui, &t);
-                    }
+                // the module's right group in the user's order, then the panels it shares with
+                // Develop (Info, Keywords, Versions, Activity); the editing tools (Edit, Crop,
+                // Remove, Masking, Red Eye) are Develop's alone
+                let panels = strip_panels(app);
+                for p in panels.iter() {
                     let Some((id, icon, panel, tip, needs_photo)) = entry(*p) else { continue };
                     let on = app.ui.right == panel || (panel == RightPanel::Edit && app.ui.right == RightPanel::Profiles);
                     let video = crate::video_ui::blocked(app, &format!("panel.{id}"));
@@ -50,7 +44,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                         let _ = app.run(&format!("panel.{id}"), json!({}));
                     }
                     // the same header menu as the Classic columns: show/hide, solo, hiding mode
-                    crate::panels::classic::side_menu(app, &resp, crate::module::get(crate::module::ModuleId::Develop).right_panels());
+                    crate::panels::classic::side_menu(app, &resp, &panels);
                 }
                 separator(ui, &t);
                 if icon_button(ui, "more", Icon::More, sz, false, true, "More").clicked() {
@@ -58,6 +52,25 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                 }
             });
         });
+}
+
+/// The strip's buttons, in order.
+///
+/// Develop offers its whole right group. Everywhere else the strip is the library's own: the panels
+/// a module shares with Develop that are not editing tools (Info, Keywords, Versions, Activity).
+/// Edit, Crop, Remove, Masking and Red Eye belong to Develop, so opening one from Library never
+/// happens — the strip carries no way into Develop's tools.
+fn strip_panels(app: &LccApp) -> Vec<crate::module::PanelId> {
+    let mut all: Vec<crate::module::PanelId> = crate::module::right_group(app).into_iter().filter(|p| entry(*p).is_some()).collect();
+    if app.ui.module != crate::module::ModuleId::Develop {
+        for p in crate::module::get(crate::module::ModuleId::Develop).right_panels() {
+            let shared = p.right_panel().is_some_and(|r| !r.is_edit_tool());
+            if shared && entry(*p).is_some() && !all.contains(p) && !app.ui.hidden_panels.contains(p) {
+                all.push(*p);
+            }
+        }
+    }
+    all
 }
 
 /// The strip button of a right-group panel: (widget id, icon, panel, tooltip, needs a photo).
