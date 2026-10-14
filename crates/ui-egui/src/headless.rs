@@ -2178,8 +2178,10 @@ mod tests {
         assert!(h.app.export.is_none(), "finished");
         let last = h.request("ui.inspect", json!({}), t)["result"]["export"]["last"].clone();
         // no destination folder was given at all: both files went beside their own originals
-        let files: Vec<String> =
-            last["files"].as_array().unwrap_or(&Vec::new()).iter().filter_map(|f| f["path"].as_str()).map(|p| p.replace('\\', "/")).collect();
+        let files: Vec<String> = match last["files"].as_array() {
+            Some(files) => files.iter().filter_map(|f| f["path"].as_str()).map(|p| p.replace('\\', "/")).collect(),
+            None => Vec::new(),
+        };
         assert_eq!(files.len(), 2, "{last}");
         // (the batch order is the grid's, so the two are only checked to be there)
         assert!(files.iter().any(|f| f.ends_with("one/P0.jpg")), "{files:?}");

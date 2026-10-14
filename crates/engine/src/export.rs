@@ -1761,7 +1761,7 @@ fn prepare_guarded(
     let mut file_name = o.file_name_for(p, seq);
     // issue #80: export beside the original. Resolved here, where the catalog is at hand; a photo
     // with no file of its own keeps `None` and falls back to the destination folder when placed.
-    let own_dir = (o.target == ExportTarget::SourceFolder).then(|| photo_folder(p)).flatten();
+    let own_dir = if o.target == ExportTarget::SourceFolder { photo_folder(p) } else { None };
     if let Some(v) = p.video.as_ref().filter(|_| o.format.is_rendered()) {
         let lcc_catalog::Source::File { path } = &p.source else {
             return Err(format!("{}: a video clip without a file", p.file_name));

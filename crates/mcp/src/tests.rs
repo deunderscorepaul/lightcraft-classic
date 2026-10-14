@@ -185,8 +185,10 @@ fn export_tool_writes_beside_each_original() {
     let r = call_tool(&mut b, "export", &json!({"ids": ids, "target": "sourceFolder", "longEdge": 32, "format": "jpeg"}));
     assert!(!r.is_error, "{r:?}");
     let out = r.structured.unwrap();
-    let written: Vec<String> =
-        out["files"].as_array().unwrap_or(&Vec::new()).iter().filter_map(|f| f["path"].as_str()).map(|p| p.replace('\\', "/")).collect();
+    let written: Vec<String> = match out["files"].as_array() {
+        Some(files) => files.iter().filter_map(|f| f["path"].as_str()).map(|p| p.replace('\\', "/")).collect(),
+        None => Vec::new(),
+    };
     assert_eq!(written.len(), 2, "{out}");
     assert!(written.iter().any(|p| p.ends_with("a/M0.jpg")), "{written:?}");
     assert!(written.iter().any(|p| p.ends_with("b/M1.jpg")), "{written:?}");
