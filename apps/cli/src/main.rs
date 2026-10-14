@@ -787,6 +787,12 @@ fn render(args: &[String]) -> Result<(), String> {
         p[k] = v;
     }
     let mut o = ExportOptions::from_params(&p).map_err(|e| e.to_string())?;
+    if o.target == lcc_engine::export::ExportTarget::SourceFolder {
+        // `render` writes to the path it is given: it has no per-photo destination to resolve
+        return Err(format!(
+            "--opt target=sourceFolder: `{CLI} render` writes to the path you give (-o); use `{CLI} run app.export target=sourceFolder …` to export beside each original"
+        ));
+    }
     if p.get("format").is_none() {
         let ext = Path::new(&output).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
         match (ExportFormat::parse(&ext), lcc_engine::export_video::VideoFormat::parse(&ext)) {

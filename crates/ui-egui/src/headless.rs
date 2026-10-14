@@ -2124,6 +2124,69 @@ mod tests {
         assert!(last["files"][0]["width"].as_u64().is_some_and(|w| w <= 64));
     }
 
+    /// Issue #80: "Export To: Same folder as original photo" — the Export dialog's choice reaches
+    /// the export, and with no destination folder at all each photo still lands beside its own
+    /// original.
+    #[test]
+    fn export_dialog_writes_beside_each_original() {
+        use lcc_engine::export::{ExportFormat, ExportOptions, ExportTarget};
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-beside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut paths = Vec::new();
+        for (i, folder) in ["one", "two"].into_iter().enumerate() {
+            let d = dir.join(folder);
+            std::fs::create_dir_all(&d).unwrap();
+            let img = lcc_raster::Rgba8::from_fn(32, 24, |x, y| [((x * 7) as u8).wrapping_add(29 * i as u8), (y * 5) as u8, 90, 255]);
+            let png = lcc_engine::export::encode_image(&img, &ExportOptions { format: ExportFormat::Png, ..Default::default() }).unwrap();
+            let f = d.join(format!("P{i}.png"));
+            std::fs::write(&f, png).unwrap();
+            paths.push(f.to_string_lossy().to_string());
+        }
+        let mut session = lcc_engine::Session::new().with_fs();
+        session.execute("library.import", &json!({"paths": paths})).unwrap();
+        let ids: Vec<u64> = session.catalog.photos().map(|p| p.id.0).collect();
+        assert_eq!(ids.len(), 2, "two distinct originals in two folders");
+        let services = crate::Services {
+            png: None,
+            write_shared: Some(Arc::new(|p: &str, bytes: &[u8]| lcc_engine::export::write_file(p, bytes))),
+            ..Default::default()
+        };
+        let mut h = Headless::new(LccApp::new(session, services), [1200.0, 900.0], 1.0);
+        h.settle(SETTLE);
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": ids}}), t);
+        h.request("engine.execute", json!({"command": "dialog.export", "params": {}}), t);
+        h.step();
+        // the dialog's own choice: the folder field is left empty on purpose
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "button:exportTarget-0"}), t)["ok"], true);
+        h.step();
+        {
+            let Some(crate::state::Dialog::Export { opts, full_size, resize, dir, .. }) = &mut h.app.ui.dialog else {
+                panic!("the export dialog is open")
+            };
+            assert_eq!(opts.target, ExportTarget::SourceFolder, "Export To: same folder as original photo");
+            dir.clear();
+            *full_size = false;
+            *resize = lcc_engine::export::Resize::long_edge(64);
+        }
+        let r = h.request("ui.dialog.confirm", json!({}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        let t0 = Instant::now();
+        while h.app.export.is_some() && t0.elapsed() < Duration::from_secs(120) {
+            h.step();
+        }
+        assert!(h.app.export.is_none(), "finished");
+        let last = h.request("ui.inspect", json!({}), t)["result"]["export"]["last"].clone();
+        // no destination folder was given at all: both files went beside their own originals
+        let files: Vec<String> =
+            last["files"].as_array().unwrap_or(&Vec::new()).iter().filter_map(|f| f["path"].as_str()).map(|p| p.replace('\\', "/")).collect();
+        assert_eq!(files.len(), 2, "{last}");
+        // (the batch order is the grid's, so the two are only checked to be there)
+        assert!(files.iter().any(|f| f.ends_with("one/P0.jpg")), "{files:?}");
+        assert!(files.iter().any(|f| f.ends_with("two/P1.jpg")), "{files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Issue #236: the Export dialog's Add to Apple Photos is there on macOS only; there the
     /// background export hands the files it wrote to Photos (a fake runner: tests never start
     /// osascript or Photos) and the toast says how it went.

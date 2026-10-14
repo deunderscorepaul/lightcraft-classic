@@ -500,7 +500,7 @@ pub fn default_export_dir() -> String {
 /// [`lcc_engine::export::ExportOptions::from_json`], plus `dir` (output folder) or `path`
 /// (exact output file, single photo), `ids` (default: the selection, else the active photo).
 pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
-    use lcc_engine::export::{Destination, ExportOptions, export_batch};
+    use lcc_engine::export::{Destination, ExportOptions, ExportTarget, export_batch};
     let p = &app.session.export_params(p)?;
     let mut opts = ExportOptions::from_params(p).map_err(|e| e.to_string())?;
     if let (Some(path), None) = (p.get("path").and_then(Value::as_str), p.get("format")) {
@@ -525,7 +525,8 @@ pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
     // An exact output file needs no folder. A folder given but left blank (the Export dialog's Folder
     // field cleared) is an error, like Lightroom refusing to export to an unspecified folder, rather
     // than a silent write into the working directory. No folder at all (e.g. File → Export with
-    // Preset): the last export's, else the default.
+    // Preset): the last export's, else the default. Exporting beside each original (`target`)
+    // needs no folder at all: there it is only where a photo without a file of its own goes.
     let exact = p.get("path").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string);
     let dir = match p.get("dir").and_then(Value::as_str) {
         Some(d) => d.trim().to_string(),
@@ -535,7 +536,7 @@ pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
             last_dir.map(str::to_string).unwrap_or_else(default_export_dir)
         }
     };
-    if dir.is_empty() && exact.is_none() {
+    if dir.is_empty() && exact.is_none() && opts.target != ExportTarget::SourceFolder {
         return Err(NO_EXPORT_FOLDER.into());
     }
     let to = Destination { dir: dir.clone(), exact };

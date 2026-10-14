@@ -162,6 +162,32 @@ pub enum Conflict {
     Skip,
 }
 
+/// Where an export's files go (Lightroom's "Export To").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportTarget {
+    /// The destination folder (`dir`), with `subfolder` inside it.
+    #[default]
+    Folder,
+    /// The folder each original photo is in, with `subfolder` inside it — the shoot's `Edited`
+    /// folder beside its raws. A photo with no file of its own (a generated demo scene, an
+    /// original that isn't there any more) falls back to the `dir` folder.
+    SourceFolder,
+}
+
+/// The folder a photo's own file is in — what [`ExportTarget::SourceFolder`] exports beside, and
+/// what `{folder}` names. `None` for a photo with no file of its own: a generated demo scene, or a
+/// path without a folder (both fall back to the destination folder).
+pub fn photo_folder(p: &lcc_catalog::Photo) -> Option<String> {
+    match &p.source {
+        lcc_catalog::Source::File { path } => {
+            let dir = std::path::Path::new(path).parent()?;
+            (!dir.as_os_str().is_empty()).then(|| dir.to_string_lossy().into_owned())
+        }
+        lcc_catalog::Source::Demo { .. } => None,
+    }
+}
+
 /// A named set of `app.export` params.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExportPreset {
@@ -682,7 +708,10 @@ pub struct ExportOptions {
     pub naming: String,
     /// First `{seq}` value.
     pub start_number: u32,
-    /// Created inside the destination folder (empty = none).
+    /// Where the files go: one destination folder, or each photo's own folder (issue #80).
+    pub target: ExportTarget,
+    /// Created inside the destination folder (empty = none). With [`ExportTarget::SourceFolder`]
+    /// it is created inside each photo's own folder.
     pub subfolder: String,
     /// When a file of the same name exists in the destination folder.
     pub conflict: Conflict,
@@ -740,6 +769,7 @@ impl Default for ExportOptions {
             sharpen_amount: SharpenAmount::Standard,
             naming: "{name}".into(),
             start_number: 1,
+            target: ExportTarget::Folder,
             subfolder: String::new(),
             conflict: Conflict::Unique,
             tiff_compression: TiffCompression::Deflate,
@@ -785,6 +815,7 @@ pub const OPTION_PARAMS: &[&str] = &[
     "sharpenAmount",
     "naming",
     "startNumber",
+    "target",
     "subfolder",
     "conflict",
     "tiffCompression",
@@ -985,6 +1016,7 @@ impl ExportOptions {
                 "sharpenAmount" => one_of(k, v, &["low", "standard", "high"])?,
                 "hdrTransfer" => one_of(k, v, &["pq", "hlg"])?,
                 "conflict" => one_of(k, v, &["unique", "overwrite", "skip"])?,
+                "target" => one_of(k, v, &["folder", "sourceFolder"])?,
                 "tiffCompression" => one_of(k, v, &["none", "lzw", "zip", "deflate"])?,
                 "jxlEffort" => one_of(k, v, &["fast", "normal"])?,
                 "dngCompression" => {
@@ -1106,6 +1138,7 @@ impl ExportOptions {
             sharpen_amount: enm(p, "sharpenAmount").unwrap_or(d.sharpen_amount),
             naming: s("naming").map_or(d.naming, str::to_string),
             start_number: u("startNumber").map_or(d.start_number, |v| v.min(999_999) as u32),
+            target: enm(p, "target").unwrap_or(d.target),
             subfolder: s("subfolder").map_or(d.subfolder, |v| v.trim().replace(['\\', ':', '\0'], "_")),
             conflict: enm(p, "conflict").unwrap_or(d.conflict),
             tiff_compression: match s("tiffCompression").map(str::to_ascii_lowercase).as_deref() {
@@ -1663,6 +1696,10 @@ pub fn export_photo(session: &mut crate::Session, id: lcc_catalog::PhotoId, o: &
 pub struct PreparedExport {
     pub photo: lcc_catalog::PhotoId,
     pub file_name: String,
+    /// The folder this photo's files go into for [`ExportTarget::SourceFolder`] — the folder its
+    /// own original is in. `None`: the destination folder ([`Destination::dir`]), which is also
+    /// where a photo without a file of its own goes.
+    pub own_dir: Option<String>,
     work: Work,
     /// The library's originals, which [`run_batch`] never writes over (shared by a batch).
     guard: std::sync::Arc<crate::originals::OriginalGuard>,
@@ -1722,6 +1759,9 @@ fn prepare_guarded(
 ) -> Result<PreparedExport, String> {
     let p = session.catalog.photo(id).ok_or("no such photo")?;
     let mut file_name = o.file_name_for(p, seq);
+    // issue #80: export beside the original. Resolved here, where the catalog is at hand; a photo
+    // with no file of its own keeps `None` and falls back to the destination folder when placed.
+    let own_dir = (o.target == ExportTarget::SourceFolder).then(|| photo_folder(p)).flatten();
     if let Some(v) = p.video.as_ref().filter(|_| o.format.is_rendered()) {
         let lcc_catalog::Source::File { path } = &p.source else {
             return Err(format!("{}: a video clip without a file", p.file_name));
@@ -1741,7 +1781,7 @@ fn prepare_guarded(
         };
         // a decoded frame, its graded copy and the pipeline's planes, plus the encoder's frames
         let weight = px.saturating_mul(96);
-        return Ok(PreparedExport { photo: id, file_name, work: Work::Video(Box::new(work)), guard, weight });
+        return Ok(PreparedExport { photo: id, file_name, own_dir, work: Work::Video(Box::new(work)), guard, weight });
     }
     // HDR output only for photos edited in HDR; the rest of the batch exports as usual
     let sdr_opts;
@@ -1789,7 +1829,7 @@ fn prepare_guarded(
         };
         (work, weight)
     };
-    Ok(PreparedExport { photo: id, file_name, work, guard, weight })
+    Ok(PreparedExport { photo: id, file_name, own_dir, work, guard, weight })
 }
 
 /// Why an export of `out` pixels (`w`, `h`), from a photo of `native_px` pixels at its own size,
@@ -1936,6 +1976,9 @@ pub enum DngCompression {
 /// applied to each file together with its sidecars), or one exact file path (single photo; an
 /// ordinary file already there is replaced). Either way a catalogued original (or its sidecar)
 /// is never written over: see [`crate::originals`].
+///
+/// With `ExportOptions::target` = [`ExportTarget::SourceFolder`] every photo goes beside its own
+/// original; `dir` is then only where a photo that has no folder of its own goes (issue #80).
 #[derive(Clone, Debug, Default)]
 pub struct Destination {
     pub dir: String,
@@ -2132,11 +2175,12 @@ fn run_batch_with(
                 break;
             }
             let (photo, name, guard) = (item.photo, item.file_name.clone(), item.guard.clone());
-            placer.place(photo, name, &guard, run_gated(item))?;
+            let own_dir = item.own_dir.clone();
+            placer.place(photo, name, own_dir.as_deref(), &guard, run_gated(item))?;
         }
         return Ok(std::mem::take(&mut placer.out));
     }
-    let heads: Vec<_> = items.iter().map(|i| (i.photo, i.file_name.clone(), i.guard.clone())).collect();
+    let heads: Vec<_> = items.iter().map(|i| (i.photo, i.file_name.clone(), i.own_dir.clone(), i.guard.clone())).collect();
     let queue = Queue {
         lane: std::sync::Mutex::new(Lane { items: items.into_iter().map(Some).collect(), next: 0, placed: 0, stop: false, done: Default::default() }),
         cv: std::sync::Condvar::new(),
@@ -2151,12 +2195,12 @@ fn run_batch_with(
             }
         }
         let placed = || {
-            for (i, (photo, name, guard)) in heads.into_iter().enumerate() {
+            for (i, (photo, name, own_dir, guard)) in heads.into_iter().enumerate() {
                 if !progress(i, &name) {
                     break;
                 }
                 let e = queue.result(i);
-                placer.place(photo, name, &guard, e)?;
+                placer.place(photo, name, own_dir.as_deref(), &guard, e)?;
             }
             Ok::<_, String>(())
         };
@@ -2267,11 +2311,12 @@ impl Queue {
     }
 }
 
-/// Where a batch's files go: each photo's path (subfolder, conflict policy, sidecars, never an
-/// original) and its write, in batch order.
+/// Where a batch's files go: each photo's path (its own folder or the destination one, subfolder,
+/// conflict policy, sidecars, never an original) and its write, in batch order.
 struct Placer<'a> {
     o: &'a ExportOptions,
     to: &'a Destination,
+    /// The destination folder ([`Destination::dir`]) with `subfolder` inside it.
     dir: String,
     single: bool,
     taken: std::collections::HashSet<String>,
@@ -2285,6 +2330,11 @@ fn join_path(a: &str, b: &str) -> String {
     if a.is_empty() { b.to_string() } else { format!("{}/{b}", a.trim_end_matches('/')) }
 }
 
+/// `dir` with `sub` created inside it (`sub` empty: `dir` itself).
+fn with_subfolder(dir: &str, sub: &str) -> String {
+    if sub.is_empty() { dir.to_string() } else { join_path(dir, sub) }
+}
+
 impl<'a> Placer<'a> {
     fn new(
         o: &'a ExportOptions,
@@ -2293,8 +2343,24 @@ impl<'a> Placer<'a> {
         exists: &'a dyn Fn(&str) -> bool,
         stop_on_error: bool,
     ) -> Placer<'a> {
-        let dir = if o.subfolder.is_empty() { to.dir.clone() } else { join_path(&to.dir, &o.subfolder) };
+        let dir = with_subfolder(&to.dir, &o.subfolder);
         Placer { o, to, dir, single: false, taken: Default::default(), out: Vec::new(), write, exists, stop_on_error }
+    }
+
+    /// The folder this photo's files go into: its own original's folder with the subfolder inside
+    /// it ([`ExportTarget::SourceFolder`], `own`), else the destination folder (already in
+    /// `self.dir`). An error when a photo without a file of its own would have nowhere to go.
+    fn dir_for(&self, own: Option<&str>) -> Result<String, String> {
+        match own.filter(|d| !d.is_empty()) {
+            Some(d) => Ok(with_subfolder(d, &self.o.subfolder)),
+            // issue #80: a photo with no file of its own (a generated scene, an original that is
+            // gone) falls back to the destination folder; with none either, saying so beats
+            // writing into the working directory
+            None if self.dir.is_empty() && self.o.target == ExportTarget::SourceFolder => {
+                Err("this photo has no original file to export beside: choose an export folder".into())
+            }
+            None => Ok(self.dir.clone()),
+        }
     }
 
     /// Place photo `photo`'s export result (file `name`): write it and record the outcome. `Err`
@@ -2303,11 +2369,11 @@ impl<'a> Placer<'a> {
         &mut self,
         photo: lcc_catalog::PhotoId,
         name: String,
+        own_dir: Option<&str>,
         guard: &crate::originals::OriginalGuard,
         e: Result<Exported, String>,
     ) -> Result<(), String> {
         use serde_json::json;
-        let (o, dir, exists) = (self.o, &self.dir, self.exists);
         let e = match e {
             Ok(e) => e,
             Err(err) if self.stop_on_error => return Err(err),
@@ -2316,6 +2382,18 @@ impl<'a> Placer<'a> {
                 return Ok(());
             }
         };
+        let dir = match self.dir_for(own_dir) {
+            Ok(d) => d,
+            Err(err) => {
+                let err = format!("{name}: {err}");
+                if self.stop_on_error {
+                    return Err(err);
+                }
+                self.out.push(json!({"photo": photo.0, "file": name, "error": err}));
+                return Ok(());
+            }
+        };
+        let (o, dir, exists) = (self.o, &dir, self.exists);
         // the exported file and its sidecars
         let group = |main: &str| std::iter::once(main.to_string()).chain(e.sidecars.iter().map(|(x, _)| sidecar_path(main, x))).collect::<Vec<_>>();
         let path = match self.to.exact.as_deref().filter(|_| self.single) {
@@ -2832,6 +2910,10 @@ mod tests {
         assert_eq!(o("{date:%Y-%m-%d}_{title}_{seq:2}").file_name_for(&p, 1), "2026-09-30_Harbour_09.jpg");
         assert_eq!(o("{camera}-{num}-{rating}").file_name_for(&p, 1), "Model X_2-0815-5.jpg", "path separators become _");
         assert_eq!(o("{name}-{seq}").file_name_for(&p, 3), "DSC_0815-011.jpg", "a bare {{seq}} keeps its 3 digits");
+        // issue #80: the sequence in a name: start number, and the padding either way
+        assert_eq!(o("{name} ({seq})").file_name_for(&p, 1), "DSC_0815 (009).jpg");
+        assert_eq!(o("{name} ({seq:1})").file_name_for(&p, 1), "DSC_0815 (9).jpg", "{{seq:1}} is not zero-padded");
+        assert_eq!(o("{name} ({seq:4})").file_name_for(&p, 2), "DSC_0815 (0010).jpg", "4 digits, counting from the start number");
         assert_eq!(o("{ext}_{name}").file_name_for(&p, 1), "NEF_DSC_0815.jpg");
         // nothing left after expanding: the original name
         p.meta.title.clear();

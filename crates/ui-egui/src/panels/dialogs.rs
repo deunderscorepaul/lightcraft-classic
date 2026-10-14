@@ -1000,18 +1000,40 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
                             opts.start_number = v as u32;
                         }
                     }
+                    // Where the files go: one folder for the batch, or each photo beside its
+                    // original (issue #80)
+                    use lcc_engine::export::ExportTarget as G;
+                    choices(
+                        ui,
+                        "Export To",
+                        "exportTarget",
+                        &[(G::SourceFolder, "Same folder as original photo"), (G::Folder, "Specific folder")],
+                        &mut opts.target,
+                    );
+                    let beside = opts.target == G::SourceFolder;
                     field(ui, "Folder", |ui| {
-                        trailing_button_row(ui, |ui| {
-                            if app.services.pick_folder.is_some()
-                                && crate::widgets::text_button(ui, "exportChooseFolder", crate::i18n::tr("Choose…"), false).clicked()
-                                && let Some(pick) = app.services.pick_folder.as_mut()
-                                && let Some(d) = pick()
-                            {
-                                *dir = d;
-                            }
-                            crate::widgets::named(ui.add(egui::TextEdit::singleline(dir).desired_width(ui.available_width())), crate::i18n::tr("Folder"));
+                        ui.add_enabled_ui(!beside, |ui| {
+                            trailing_button_row(ui, |ui| {
+                                if app.services.pick_folder.is_some()
+                                    && crate::widgets::text_button(ui, "exportChooseFolder", crate::i18n::tr("Choose…"), false).clicked()
+                                    && let Some(pick) = app.services.pick_folder.as_mut()
+                                    && let Some(d) = pick()
+                                {
+                                    *dir = d;
+                                }
+                                crate::widgets::named(ui.add(egui::TextEdit::singleline(dir).desired_width(ui.available_width())), crate::i18n::tr("Folder"));
+                            });
                         });
                     });
+                    if beside {
+                        ui.label(
+                            egui::RichText::new(crate::i18n::tr(
+                                "Each photo is written beside its original. The folder above is only used for a photo that has no file of its own.",
+                            ))
+                            .size(11.0)
+                            .color(t.text_dim),
+                        );
+                    }
                     field(ui, "Subfolder", |ui| {
                         crate::widgets::named(ui.add(egui::TextEdit::singleline(&mut opts.subfolder).hint_text(crate::i18n::tr("none")).desired_width(f32::INFINITY)), crate::i18n::tr("Subfolder"))
                     });

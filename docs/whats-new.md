@@ -1,5 +1,21 @@
 # What's new in {app}
 
+## 2026-10-14
+
+### Export beside the original, and `{seq}` numbering
+- The Export dialog has **Export To: Same folder as original photo** beside **Specific folder**. Each photo is
+  written next to its own original (a shoot's raws and its exports in one folder), and the Subfolder row creates
+  that folder inside each photo's own folder — so a mixed-folder selection gets one `Edited` folder per shoot
+  instead of one destination for all of them (issue #80). A photo with no file of its own (a procedural demo scene)
+  still goes to the folder in the Folder row.
+- Existing files are handled as before: **Add number** (the default) writes `IMG_1-2.jpg`, **Skip** leaves the photo
+  out, **Overwrite** replaces an ordinary file — and a photo's own original is never written over, whatever the
+  policy, so exporting a JPEG as JPEG beside itself cannot destroy it.
+- The file-name template's `{seq}` numbers the batch: `startNumber` sets the first value, `{seq}` is zero-padded to
+  three digits and `{seq:2}` (up to 9) chooses the width, so `{name} ({seq:2})` gives `image (01).jpg`. The numbers
+  follow the grid's (or an album's Custom Order) order and don't move when a photo in between is skipped or fails.
+  Agents: `app.export {"target": "sourceFolder"}` (also the MCP `export` tool).
+
 ## 2026-10-13
 
 ### Long exposure times keep their step

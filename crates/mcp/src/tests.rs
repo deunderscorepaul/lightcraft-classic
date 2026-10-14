@@ -160,6 +160,40 @@ fn export_tool_forwards_its_advertised_options() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Issue #80: the `export` tool's `target: "sourceFolder"` writes each photo beside its own
+/// original, and needs no `dir` for that.
+#[test]
+fn export_tool_writes_beside_each_original() {
+    let base = std::env::temp_dir().join(format!("lc-mcp-beside-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let mut b = Headless::demo();
+    let mut paths = Vec::new();
+    for (i, folder) in ["a", "b"].into_iter().enumerate() {
+        let d = base.join(folder);
+        std::fs::create_dir_all(&d).unwrap();
+        // different pixels: two identical files would be one photo to the import's content hash
+        let img = lcc_raster::Rgba8::from_fn(16, 12, |x, y| [((x * 11) as u8).wrapping_add(37 * i as u8), (y * 3) as u8, 40, 255]);
+        let png = lcc_codecs::encode_png(&lcc_codecs::EncodeImage::rgba8(&img), &lcc_codecs::EncodeMeta::default()).unwrap();
+        let f = d.join(format!("M{i}.png"));
+        std::fs::write(&f, png).unwrap();
+        paths.push(f.to_string_lossy().to_string());
+    }
+    let r = call_tool(&mut b, "import", &json!({"paths": paths}));
+    assert!(!r.is_error, "{r:?}");
+    let ids: Vec<u64> = ["M0.png", "M1.png"].iter().filter_map(|n| b.session.catalog.photos().find(|p| p.file_name == *n)).map(|p| p.id.0).collect();
+    assert_eq!(ids.len(), 2, "both imported originals are in the catalog");
+    let r = call_tool(&mut b, "export", &json!({"ids": ids, "target": "sourceFolder", "longEdge": 32, "format": "jpeg"}));
+    assert!(!r.is_error, "{r:?}");
+    let out = r.structured.unwrap();
+    let written: Vec<String> =
+        out["files"].as_array().unwrap_or(&Vec::new()).iter().filter_map(|f| f["path"].as_str()).map(|p| p.replace('\\', "/")).collect();
+    assert_eq!(written.len(), 2, "{out}");
+    assert!(written.iter().any(|p| p.ends_with("a/M0.jpg")), "{written:?}");
+    assert!(written.iter().any(|p| p.ends_with("b/M1.jpg")), "{written:?}");
+    assert!(base.join("a/M0.jpg").is_file() && base.join("b/M1.jpg").is_file(), "written beside the originals");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Issue #236: `app.export {addToPhotos, photosAlbum}` through the headless backend (the MCP
 /// `export` tool, `lcc-cli run`): the files written go to Photos and the result says how
 /// it went; where Photos isn't (not macOS), it is refused before anything is written. A fake

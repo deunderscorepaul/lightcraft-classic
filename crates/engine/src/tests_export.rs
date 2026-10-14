@@ -283,6 +283,110 @@ fn export_never_overwrites_an_original() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Issue #80: "Export To: Same folder as original photo" writes each photo of a mixed-folder
+/// selection beside its own original, with the subfolder created inside each source folder.
+#[test]
+fn export_beside_each_original_photo() {
+    use crate::export::{Destination, ExportTarget, export_batch};
+    let dir = temp_dir("export-beside");
+    let mut paths = Vec::new();
+    for (i, (folder, name)) in [("shoot-a", "A_1.png"), ("shoot-b", "B_1.png")].into_iter().enumerate() {
+        // different pixels: two identical files are one photo to the import's content hash
+        let img = lcc_raster::Rgba8::from_fn(24, 16, |x, y| [((x * 9) as u8).wrapping_add(31 * i as u8), (y * 13) as u8, 60, 255]);
+        let png = crate::export::encode_image(&img, &ExportOptions { format: ExportFormat::Png, ..Default::default() }).unwrap();
+        let d = dir.join(folder);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(name), &png).unwrap();
+        paths.push(d.join(name).to_string_lossy().to_string());
+    }
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": paths})).unwrap();
+    let ids: Vec<_> = s.catalog.photos().map(|p| p.id).collect();
+    assert_eq!(ids.len(), 2);
+
+    let o = ExportOptions { target: ExportTarget::SourceFolder, subfolder: "Edited".into(), ..Default::default() };
+    let mut written: Vec<String> = Vec::new();
+    let mut write = |p: &str, _: &[u8]| {
+        written.push(p.to_string());
+        Ok(())
+    };
+    // no destination folder at all: every photo of this batch has one of its own
+    let files = export_batch(&mut s, &ids, &o, &Destination::default(), &mut write, &|_| false).unwrap();
+    assert_eq!(written.len(), 2, "{files:?}");
+    let norm = |p: &str| p.replace('\\', "/");
+    assert!(norm(&written[0]).ends_with("shoot-a/Edited/A_1.jpg"), "{written:?}");
+    assert!(norm(&written[1]).ends_with("shoot-b/Edited/B_1.jpg"), "{written:?}");
+    assert!(files.iter().all(|f| f["path"].as_str().is_some()), "{files:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #80: a photo with no file of its own can't be written beside anything. It falls back to
+/// the destination folder, and with none of either the export names the photo rather than writing
+/// into the working directory.
+#[test]
+fn export_beside_a_photo_without_a_file() {
+    use crate::export::{Destination, ExportTarget};
+    let mut s = Session::with_demo();
+    let id = s.active().unwrap();
+    let o = ExportOptions { target: ExportTarget::SourceFolder, resize: Some(crate::export::Resize::long_edge(32)), ..Default::default() };
+    let out = temp_dir("export-beside-fallback");
+    let to = Destination { dir: out.to_string_lossy().to_string(), exact: None };
+    let files = disk_batch(&mut s, id, &o, &to).unwrap();
+    let path = files[0]["path"].as_str().unwrap_or_default();
+    assert!(path.starts_with(&out.to_string_lossy().to_string()) && path.ends_with(".jpg"), "{path}");
+    let err = disk_batch(&mut s, id, &o, &Destination::default()).unwrap_err();
+    assert!(err.contains("no original file to export beside"), "{err}");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Issue #80 with issue #93: exporting beside the original never replaces it — "Overwrite" is
+/// refused — and "Add number" writes the render next to it under a free name.
+#[test]
+fn export_beside_never_writes_over_the_original() {
+    use crate::export::{Conflict, Destination, ExportTarget};
+    let (mut s, id, dir, src, original) = library_with_jpeg("export-beside-guard");
+    let to = Destination::default();
+    let o = |conflict| ExportOptions { target: ExportTarget::SourceFolder, conflict, ..Default::default() };
+    let err = disk_batch(&mut s, id, &o(Conflict::Overwrite), &to).unwrap_err();
+    assert!(err.contains("original of IMG_1.jpg"), "{err}");
+    assert_eq!(std::fs::read(&src).unwrap(), original, "the original is byte-identical");
+    let files = disk_batch(&mut s, id, &o(Conflict::Skip), &to).unwrap();
+    let norm = |p: &str| p.replace('\\', "/");
+    assert_eq!(files[0]["skipped"].as_str().map(norm), Some(norm(&src.to_string_lossy())), "{files:?}");
+    let files = disk_batch(&mut s, id, &o(Conflict::Unique), &to).unwrap();
+    assert_eq!(files[0]["path"].as_str().map(norm), Some(norm(&dir.join("IMG_1-2.jpg").to_string_lossy())), "{files:?}");
+    assert_ne!(std::fs::read(dir.join("IMG_1-2.jpg")).unwrap(), original);
+    assert_eq!(std::fs::read(&src).unwrap(), original);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #80: `{seq}` numbering follows the batch position, so the number a photo gets doesn't
+/// move because a photo before it was skipped.
+#[test]
+fn sequence_numbers_are_stable_across_a_batch() {
+    use crate::export::{Conflict, Destination};
+    let mut s = Session::with_demo();
+    let ids: Vec<_> = s.visible().iter().copied().take(3).collect();
+    assert_eq!(ids.len(), 3);
+    let to = Destination { dir: "out".into(), exact: None };
+    let o = ExportOptions {
+        format: ExportFormat::Png,
+        resize: Some(crate::export::Resize::long_edge(16)),
+        naming: "pic-{seq}".into(),
+        conflict: Conflict::Skip,
+        ..Default::default()
+    };
+    let existing = ["out/pic-002.png".to_string()];
+    let mut written: Vec<String> = Vec::new();
+    let mut write = |p: &str, _: &[u8]| {
+        written.push(p.to_string());
+        Ok(())
+    };
+    let files = crate::export::export_batch(&mut s, &ids, &o, &to, &mut write, &|p| existing.contains(&p.to_string())).unwrap();
+    assert_eq!(written, ["out/pic-001.png", "out/pic-003.png"], "the skipped photo's number is not reused");
+    assert_eq!(files[1]["skipped"], "out/pic-002.png", "{files:?}");
+}
+
 /// Issue #93: the XMP sidecar of an "Original" export ignored the conflict policy.
 #[test]
 fn export_sidecars_follow_the_conflict_policy() {
