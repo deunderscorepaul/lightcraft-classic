@@ -61,7 +61,7 @@ Photos you already edited in <app> keep their edits; `updateExisting=true` repla
 
 Before changing anything, the importer saves the source records, decoded XMP, develop settings, history, snapshots
 and collection content to compressed recovery archives in the library's `Interop/` folder (best-effort, capped in
-size). Imports are bounded: a 1 GiB database, one million rows per table. Details and limits:
+size). Imports are bounded: a 4 GiB database, one million rows per table. Details and limits:
 [lightroom-catalog-import.md](../lightroom-catalog-import.md).
 
 ## Habits that carry over
