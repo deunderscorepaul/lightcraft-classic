@@ -278,7 +278,7 @@ mod tests {
             // the real repository, so the URL helpers are checked against what we publish to
             repo: lcc_brand::REPOSITORY.to_string(),
             current: Version::parse("1.0.0").expect("a version"),
-            target: Some(Target { os: Os::Windows, arch: "x64" }),
+            target: Some(Target { os: Os::Windows, arch: "x64", appimage: false }),
             prerelease: false,
             manifest_url: None,
         }
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn a_release_without_our_file_is_reported() {
-        let mac = Options { target: Some(Target { os: Os::Macos, arch: "universal" }), ..opts() };
+        let mac = Options { target: Some(Target { os: Os::Macos, arch: "universal", appimage: false }), ..opts() };
         let err = run(&mac, &feed("1.2.0")).expect_err("no dmg");
         assert!(matches!(err, UpdateError::NoAssetFor { .. }), "{err}");
         assert!(err.to_string().contains("macos-universal"), "{err}");

@@ -54,12 +54,15 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// The outcome for a manual install: the file is there, the user unpacks it.
+    /// The outcome for a manual install: the file is there, the user unpacks or installs it.
     pub fn manual(file: &Path) -> Outcome {
-        Outcome {
-            message: format!("The update was downloaded to {}. Quit the app and unpack it over this installation.", file.display()),
-            exit: false,
-        }
+        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let instruction = if name.ends_with(".deb") || name.ends_with(".rpm") || name.ends_with(".flatpak") {
+            "Quit the app and install it using your system package manager."
+        } else {
+            "Quit the app and unpack it over this installation."
+        };
+        Outcome { message: format!("The update was downloaded to {}. {}", file.display(), instruction), exit: false }
     }
 }
 
@@ -91,15 +94,20 @@ pub fn plan(kind: Kind, file: &Path, version: &str) -> Plan {
             destination: current_exe(),
             restart: Restart::QuitAndRelaunch,
         },
-        Kind::Archive => Plan {
-            summary: format!("Download {version} and install it by hand"),
-            steps: vec![
-                format!("The file is saved beside this download ({}) and its folder is shown.", file.display()),
-                "Quit the app and unpack it over this installation.".into(),
-            ],
-            destination: Some(file.to_path_buf()),
-            restart: Restart::Manual,
-        },
+        Kind::Archive => {
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let step2 = if name.ends_with(".deb") || name.ends_with(".rpm") || name.ends_with(".flatpak") {
+                "Quit the app and install it using your system package manager.".into()
+            } else {
+                "Quit the app and unpack it over this installation.".into()
+            };
+            Plan {
+                summary: format!("Download {version} and install it by hand"),
+                steps: vec![format!("The file is saved beside this download ({}) and its folder is shown.", file.display()), step2],
+                destination: Some(file.to_path_buf()),
+                restart: Restart::Manual,
+            }
+        }
         Kind::Checksums => Plan {
             summary: "Nothing to install: this is the release's checksum list".into(),
             steps: vec!["Pick the file for this system instead.".into()],
@@ -369,6 +377,19 @@ mod tests {
             assert_eq!(sh_quote("/tmp/a b"), "'/tmp/a b'");
             assert_eq!(sh_quote("/tmp/it's"), "'/tmp/it'\\''s'");
         }
+    }
+
+    #[test]
+    fn manual_install_instructions_differ_for_deb_and_archives() {
+        let deb_plan = plan(Kind::Archive, Path::new("/tmp/app.deb"), "1.2.3");
+        assert!(deb_plan.steps[1].contains("package manager"));
+        let deb_out = Outcome::manual(Path::new("/tmp/app.deb"));
+        assert!(deb_out.message.contains("package manager"));
+
+        let tar_plan = plan(Kind::Archive, Path::new("/tmp/app.tar.gz"), "1.2.3");
+        assert!(tar_plan.steps[1].contains("unpack it over this installation"));
+        let tar_out = Outcome::manual(Path::new("/tmp/app.tar.gz"));
+        assert!(tar_out.message.contains("unpack it over this installation"));
     }
 
     #[test]

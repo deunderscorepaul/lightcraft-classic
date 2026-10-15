@@ -67,7 +67,10 @@ impl Release {
     /// The file to install on `target`: an installer first, then a plain archive; `None` when the
     /// release has nothing this platform can use.
     pub fn best_asset(&self, target: &Target) -> Option<&Asset> {
-        self.assets.iter().filter(|a| a.kind != Kind::Checksums && target.matches_name(&a.name)).min_by_key(|a| (a.kind.rank(), a.size))
+        self.assets
+            .iter()
+            .filter(|a| a.kind != Kind::Checksums && target.matches_name(&a.name))
+            .min_by_key(|a| (a.kind.rank(), target.package_rank(&a.name), a.size))
     }
 
     /// The release's checksum list, when it publishes one.
@@ -186,13 +189,13 @@ mod tests {
     #[test]
     fn choices_the_installer_over_the_archive() {
         let r = newest(&feed(), false).expect("a release");
-        let win = Target { os: crate::target::Os::Windows, arch: "x64" };
+        let win = Target { os: crate::target::Os::Windows, arch: "x64", appimage: false };
         let picked = r.best_asset(&win).expect("an msi");
         assert_eq!((picked.name.as_str(), picked.kind), ("app-0.7.1-windows-x64.msi", Kind::Msi));
         assert_eq!(r.checksum_asset().map(|a| a.name.as_str()), Some("SHA256SUMS.txt"));
-        let lin = Target { os: crate::target::Os::Linux, arch: "x86_64" };
+        let lin = Target { os: crate::target::Os::Linux, arch: "x86_64", appimage: true };
         assert_eq!(r.best_asset(&lin).map(|a| a.name.as_str()), Some("app-0.7.1-linux-x86_64.AppImage"));
-        let arm = Target { os: crate::target::Os::Linux, arch: "aarch64" };
+        let arm = Target { os: crate::target::Os::Linux, arch: "aarch64", appimage: false };
         assert!(r.best_asset(&arm).is_none(), "no aarch64 file in this release");
     }
 
@@ -235,10 +238,37 @@ mod tests {
     }
 
     #[test]
+    fn linux_non_appimage_target_picks_deb_or_rpm_over_appimage() {
+        let body = serde_json::json!([{
+            "tag_name": "v0.8.2",
+            "name": "App v0.8.2",
+            "published_at": "2026-10-15T00:00:00Z",
+            "assets": [
+                {"name": "app-0.8.2-linux-x86_64.AppImage", "browser_download_url": "https://x/a.AppImage", "size": 120},
+                {"name": "app-0.8.2-linux-x86_64.deb", "browser_download_url": "https://x/a.deb", "size": 80},
+                {"name": "app-0.8.2-linux-x86_64.rpm", "browser_download_url": "https://x/a.rpm", "size": 80},
+                {"name": "app-0.8.2-linux-x86_64.tar.gz", "browser_download_url": "https://x/a.tar.gz", "size": 70},
+            ],
+        }])
+        .to_string();
+
+        let r = newest(&body, false).expect("release");
+
+        let appimage_target = Target { os: crate::target::Os::Linux, arch: "x86_64", appimage: true };
+        let picked_appimage = r.best_asset(&appimage_target).expect("asset");
+        assert_eq!(picked_appimage.name, "app-0.8.2-linux-x86_64.AppImage");
+
+        let non_appimage_target = Target { os: crate::target::Os::Linux, arch: "x86_64", appimage: false };
+        let picked_package = r.best_asset(&non_appimage_target).expect("asset");
+        assert_ne!(picked_package.name, "app-0.8.2-linux-x86_64.AppImage");
+        assert!(picked_package.name.ends_with(".deb") || picked_package.name.ends_with(".rpm") || picked_package.name.ends_with(".tar.gz"));
+    }
+
+    #[test]
     fn assets_without_a_url_are_skipped() {
         let v = serde_json::json!([{"tag_name": "v1.0.1", "assets": [{"name": "app-1.0.1-windows-x64.msi", "size": 1}]}]).to_string();
         let r = newest(&v, false).expect("a release");
         assert!(r.assets.is_empty());
-        assert!(r.best_asset(&Target { os: crate::target::Os::Windows, arch: "x64" }).is_none());
+        assert!(r.best_asset(&Target { os: crate::target::Os::Windows, arch: "x64", appimage: false }).is_none());
     }
 }

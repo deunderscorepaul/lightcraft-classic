@@ -174,7 +174,7 @@ mod tests {
             sha256: sha,
             published: None,
             notes: String::new(),
-            action: Target { os: Os::Linux, arch: "x86_64" }.describe(),
+            action: Target { os: Os::Linux, arch: "x86_64", appimage: true }.describe(),
         }
     }
 
