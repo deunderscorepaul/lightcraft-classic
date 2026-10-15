@@ -47,7 +47,7 @@ retained. Oldest managed archives are retired; legacy `.json` archives remain un
 `Interop/lightroom-index.json` records imported identities. Source catalogs and originals are
 never overwritten.
 
-Native import is bounded to a 1 GiB database/WAL, 64 MiB per record and 16 MiB XMP packets. The
+Native import is bounded to a 4 GiB database/WAL, 64 MiB per record and 16 MiB XMP packets. The
 in-tree, read-only Rust SQLite B-tree reader follows SQLite’s public file-format specification;
 it introduces no dependency or C runtime. Tables are streamed to the importer one row at a time,
 so memory follows what the importer keeps (mapped columns, never BLOBs), not the table's size:

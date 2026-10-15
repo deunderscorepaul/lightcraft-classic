@@ -647,10 +647,10 @@ mod tests {
     fn lightroom_failure_stays_readable_without_offering_a_success_action() {
         let mut h = demo();
         let (task, _tx, _, _) = fake_import(&h);
-        terminal(&mut h.app, &h.view.ctx, &task, json!({"error": "catalog or WAL exceeds 1 GiB import limit"}));
+        terminal(&mut h.app, &h.view.ctx, &task, json!({"error": "catalog or WAL exceeds 4 GiB import limit"}));
         h.step();
         h.step();
-        assert!(h.painted_text().join(" ").contains("exceeds 1 GiB import limit"));
+        assert!(h.painted_text().join(" ").contains("exceeds 4 GiB import limit"));
         assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::LightroomResult { first: None, .. })));
         assert!(!h.app.widgets.iter().any(|(id, _)| id == "button:dialogCancel"));
     }
