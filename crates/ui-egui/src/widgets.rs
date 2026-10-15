@@ -611,8 +611,16 @@ pub fn segmented(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<u
     let t = Tokens::get(ui.ctx());
     let per_row = per_row.max(1);
     let gap = 4.0;
+    let font = t.semibold(11.5);
     let w = ui.available_width();
-    let seg_w = ((w - gap * (per_row as f32 - 1.0)) / per_row as f32).max(24.0);
+    let mut max_label_w = 0.0f32;
+    for (label, _) in items {
+        let label_tr = crate::i18n::tr(label);
+        let galley = ui.painter().layout_no_wrap(label_tr.to_string(), font.clone(), t.text);
+        max_label_w = max_label_w.max(galley.size().x);
+    }
+    let min_seg_w = (max_label_w + 16.0).max(24.0);
+    let seg_w = ((w - gap * (per_row as f32 - 1.0)) / per_row as f32).max(min_seg_w);
     let mut clicked = None;
     for (row_i, row) in items.chunks(per_row).enumerate() {
         ui.horizontal(|ui| {
@@ -620,7 +628,7 @@ pub fn segmented(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<u
             for (j, (label, key)) in row.iter().enumerate() {
                 let label = crate::i18n::tr(label);
                 let i = row_i * per_row + j;
-                let (r, resp) = ui.allocate_exact_size(vec2(seg_w, 24.0), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(vec2(seg_w, 28.0), Sense::click());
                 register(ui.ctx(), format!("button:{id}-{key}"), r);
                 let fill = if active == Some(i) {
                     t.pressed
@@ -631,7 +639,7 @@ pub fn segmented(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<u
                 };
                 let p = ui.painter();
                 p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, t.button_border), StrokeKind::Inside);
-                p.text(r.center(), Align2::CENTER_CENTER, label, t.semibold(11.5), t.text);
+                p.text(r.center(), Align2::CENTER_CENTER, label, font.clone(), t.text);
                 if resp.clicked() {
                     clicked = Some(i);
                 }
@@ -877,6 +885,24 @@ mod tests {
     }
 
     /// Typed values (issue #322): signs, a decimal comma, units; on the control's steps, in range.
+    #[test]
+    fn segmented_control_uses_target_button_height() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            segmented(ui, "treatment", &[("Color", "color"), ("B&W", "bw")], Some(0), 2);
+        });
+        out.textures_delta.clear();
+        let reg = take_registry(&ctx);
+        let color_rect = reg.iter().find(|(id, _)| id == "button:treatment-color").map(|(_, r)| *r).unwrap();
+        let bw_rect = reg.iter().find(|(id, _)| id == "button:treatment-bw").map(|(_, r)| *r).unwrap();
+
+        assert_eq!(color_rect.height(), 28.0);
+        assert_eq!(bw_rect.height(), 28.0);
+        let gap = bw_rect.left() - color_rect.right();
+        assert_eq!(gap, 4.0);
+    }
+
     #[test]
     fn typed_values_are_stepped_and_clamped() {
         let exposure = lcc_develop::controls::find("light.exposure").unwrap();

@@ -139,12 +139,11 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
         });
     }
     divider(ui);
-    // Lightroom Classic's Basic panel opens with Treatment, then Profile
-    egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 14, bottom: 0 }).show(ui, |ui| {
+    egui::Frame::NONE.inner_margin(egui::Margin { left: 24, right: 22, top: 4, bottom: 4 }).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(crate::i18n::tr("Treatment")).font(t.font(13.0)).color(t.text_dim));
             let bw = crate::is_bw(&d);
-            if let Some(i) = crate::widgets::segmented(ui, "treatment", &[("Color", "color"), ("Black & White", "bw")], Some(usize::from(bw)), 2)
+            if let Some(i) = crate::widgets::segmented(ui, "treatment", &[("Color", "color"), ("B&W", "bw")], Some(usize::from(bw)), 2)
                 && (i == 1) != bw
             {
                 let _ = app.run("develop.treatment", json!({"bw": i == 1}));
