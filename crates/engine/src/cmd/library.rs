@@ -653,7 +653,11 @@ pub fn specs() -> Vec<CommandSpec> {
                             if !s.selection.contains(id) {
                                 s.selection.ids.push(id);
                             }
-                            s.selection.active = Some(id);
+                        }
+                        if let Some(a) = active {
+                            s.selection.active = Some(a);
+                        } else if s.selection.active.is_none() {
+                            s.selection.active = s.selection.ids.first().copied();
                         }
                     }
                     "toggle" => ids.into_iter().for_each(|id| s.selection.toggle(id)),

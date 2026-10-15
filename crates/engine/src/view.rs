@@ -124,11 +124,13 @@ impl Selection {
         if let Some(i) = self.ids.iter().position(|x| *x == id) {
             self.ids.remove(i);
             if self.active == Some(id) {
-                self.active = self.ids.last().copied();
+                self.active = self.ids.first().copied();
             }
         } else {
             self.ids.push(id);
-            self.active = Some(id);
+            if self.active.is_none() {
+                self.active = Some(id);
+            }
         }
     }
     /// Shift-click: select the range between the active photo and `id` in `order`.
@@ -144,7 +146,9 @@ impl Selection {
                 self.ids.push(*x);
             }
         }
-        self.active = Some(id);
+        if self.active.is_none() {
+            self.active = Some(anchor);
+        }
     }
 }
 
@@ -260,5 +264,43 @@ mod selection_state_tests {
         assert_eq!(s.state_of(ids[0]), SelectionState::Active);
         assert_eq!(s.state_of(ids[1]), SelectionState::Selected);
         assert_eq!(s.state_of(PhotoId(9)), SelectionState::NotSelected);
+    }
+
+    #[test]
+    fn toggle_preserves_first_selected_as_active_primary() {
+        let p1 = PhotoId(1);
+        let p2 = PhotoId(2);
+        let p3 = PhotoId(3);
+        let mut s = Selection::default();
+
+        s.toggle(p1);
+        assert_eq!(s.active, Some(p1));
+        assert_eq!(s.ids, vec![p1]);
+
+        s.toggle(p2);
+        assert_eq!(s.active, Some(p1), "adding secondary photo keeps first photo as active primary");
+        assert_eq!(s.ids, vec![p1, p2]);
+
+        s.toggle(p3);
+        assert_eq!(s.active, Some(p1), "adding third photo keeps first photo as active primary");
+        assert_eq!(s.ids, vec![p1, p2, p3]);
+
+        s.toggle(p2);
+        assert_eq!(s.active, Some(p1), "deselecting a secondary photo keeps active primary intact");
+        assert_eq!(s.ids, vec![p1, p3]);
+
+        s.toggle(p1);
+        assert_eq!(s.active, Some(p3), "deselecting primary photo promotes remaining first photo as primary");
+        assert_eq!(s.ids, vec![p3]);
+    }
+
+    #[test]
+    fn extend_to_preserves_anchor_as_active_primary() {
+        let order: Vec<PhotoId> = (1..=5).map(PhotoId).collect();
+        let mut s = Selection::single(order[0]);
+
+        s.extend_to(order[3], &order);
+        assert_eq!(s.active, Some(order[0]), "range extension preserves initial anchor as active primary");
+        assert_eq!(s.ids, vec![order[0], order[1], order[2], order[3]]);
     }
 }

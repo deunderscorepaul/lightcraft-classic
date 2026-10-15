@@ -583,6 +583,37 @@ fn capture_time_raw_metadata_session(raw: Option<&str>) -> Session {
 }
 
 #[test]
+fn multi_selection_maintains_first_selected_as_active_primary() {
+    let mut s = Session::with_demo();
+    let vis = s.visible_cloned();
+    let (p1, p2, p3) = (vis[0].0, vis[1].0, vis[2].0);
+
+    // Initial select
+    s.execute("library.select", &json!({"ids": [p1]})).unwrap();
+    assert_eq!(s.selection.active, Some(vis[0]));
+    assert_eq!(s.selection.ids, vec![vis[0]]);
+
+    // Adding photos via mode "add"
+    s.execute("library.select", &json!({"ids": [p2], "mode": "add"})).unwrap();
+    assert_eq!(s.selection.active, Some(vis[0]), "adding secondary photo keeps first photo active");
+    assert_eq!(s.selection.ids, vec![vis[0], vis[1]]);
+
+    s.execute("library.select", &json!({"ids": [p3], "mode": "add"})).unwrap();
+    assert_eq!(s.selection.active, Some(vis[0]), "adding third photo keeps first photo active");
+    assert_eq!(s.selection.ids, vec![vis[0], vis[1], vis[2]]);
+
+    // Toggling off secondary photo
+    s.execute("library.select", &json!({"ids": [p2], "mode": "toggle"})).unwrap();
+    assert_eq!(s.selection.active, Some(vis[0]), "toggling secondary photo off keeps active photo");
+    assert_eq!(s.selection.ids, vec![vis[0], vis[2]]);
+
+    // Toggling off primary photo promotes remaining first selected photo
+    s.execute("library.select", &json!({"ids": [p1], "mode": "toggle"})).unwrap();
+    assert_eq!(s.selection.active, Some(vis[2]), "toggling primary photo off promotes remaining photo to primary");
+    assert_eq!(s.selection.ids, vec![vis[2]]);
+}
+
+#[test]
 fn capture_time_invalid_calendar_anchor_keeps_other_targets_and_redo() {
     use lcc_catalog::{Op, Photo, PhotoId, Source};
     for raw in ["2026-02-30T12:00:00", "2026x03x01T12:00:00"] {
