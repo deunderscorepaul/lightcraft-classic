@@ -445,6 +445,43 @@ fn remove_spots_by_pointer_and_keyboard() {
     h.settle(SETTLE);
 }
 
+#[test]
+fn wheel_resizes_brush_and_remove_tool_without_zooming() {
+    let mut h = detail("panel.remove");
+    h.app.ui.settings.wheel_resizes_brush = true;
+    let initial_remove_size = h.app.ui.remove_size;
+    h.app.ui.tool = "remove".into(); // make sure tool is correctly set since right panel alone might not set it
+    let initial_zoom = h.app.ui.zoom;
+
+    // A notch on the wheel zooms the image up/down normally
+    // but here it resizes the brush when the setting is enabled.
+    // A wheel event triggers resize instead of zooming when the setting is enabled.
+    // The pointer must be over the canvas for the loupe gesture handler to receive the wheel event.
+    let right_panel = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
+    h.request(
+        "ui.move",
+        json!({"x": right_panel.center().x - 200.0, "y": right_panel.center().y}), // Move left to canvas
+        T,
+    );
+    h.step();
+    h.step();
+
+    // Emulate wheel event on the canvas via `ui.wheel` control
+    h.request(
+        "ui.wheel",
+        json!({"dy": 10.0, "modifiers": {}}), // explicitly clear modifiers just in case
+        T,
+    );
+    for _ in 0..10 {
+        h.step();
+    }
+
+    // Zoom should be unchanged
+    assert_eq!(h.app.ui.zoom, initial_zoom);
+    // Remove tool size should increase
+    assert!(h.app.ui.remove_size > initial_remove_size);
+}
+
 /// Masks list: double-click renames in place, the hover eye hides a mask, the overlay colour
 /// cycles through the swatches.
 #[test]

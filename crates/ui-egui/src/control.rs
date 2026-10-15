@@ -334,6 +334,16 @@ pub fn handle(app: &mut LccApp, ctx: &egui::Context, req: &ControlRequest) -> Ou
             ctx.request_repaint();
             ok(Value::Null)
         }
+        "ui.wheel" => {
+            app.synthetic.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(f("dx").unwrap_or(0.0) as f32, f("dy").unwrap_or(0.0) as f32),
+                phase: egui::TouchPhase::Move,
+                modifiers: modifiers(p),
+            });
+            ctx.request_repaint();
+            ok(Value::Null)
+        }
         "ui.zoom" => {
             let Some(factor) = f("factor").map(|v| v as f32).filter(|v| v.is_finite() && *v > 0.0) else {
                 return err("ui.zoom: factor must be a finite positive number (1 = unchanged)");
@@ -525,8 +535,7 @@ pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
     // An exact output file needs no folder. A folder given but left blank (the Export dialog's Folder
     // field cleared) is an error, like Lightroom refusing to export to an unspecified folder, rather
     // than a silent write into the working directory. No folder at all (e.g. File → Export with
-    // Preset): the last export's, else the default. "Same folder as original photo" needs none:
-    // each photo goes to its own folder.
+    // Preset): the last export's, else the default.
     let exact = p.get("path").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).map(str::to_string);
     let dir = match p.get("dir").and_then(Value::as_str) {
         Some(d) => d.trim().to_string(),
@@ -536,8 +545,7 @@ pub fn export_active(app: &mut LccApp, p: &Value) -> Result<Value, String> {
             last_dir.map(str::to_string).unwrap_or_else(default_export_dir)
         }
     };
-    let own_folders = opts.destination_mode == lcc_engine::export::DestinationMode::SameAsOriginal;
-    if dir.is_empty() && exact.is_none() && !own_folders {
+    if dir.is_empty() && exact.is_none() {
         return Err(NO_EXPORT_FOLDER.into());
     }
     let to = Destination { dir: dir.clone(), exact };
