@@ -377,12 +377,11 @@ impl Container<'_> {
 fn displayed(mut w: u32, mut h: u32, ts: &[Transform]) -> (u32, u32) {
     for t in ts {
         match *t {
-            Transform::Clap { w: cw, h: ch, .. } => {
-                if cw >= 1.0 && ch >= 1.0 {
-                    w = (cw.round() as u32).min(w).max(1);
-                    h = (ch.round() as u32).min(h).max(1);
-                }
+            Transform::Clap { w: cw, h: ch, .. } if cw >= 1.0 && ch >= 1.0 => {
+                w = (cw.round() as u32).min(w).max(1);
+                h = (ch.round() as u32).min(h).max(1);
             }
+            Transform::Clap { .. } => {}
             Transform::Rot(n) if n % 2 == 1 => std::mem::swap(&mut w, &mut h),
             _ => {}
         }

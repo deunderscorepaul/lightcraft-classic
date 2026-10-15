@@ -1930,3 +1930,33 @@ fn presets_apply_the_imported_profile_they_name() {
     assert_eq!(apply(&mut s, "Portra Soft").profile.id, "lc.vivid");
     let _ = std::fs::remove_dir_all(&src);
 }
+
+#[test]
+fn import_defaults_with_optics_preset() {
+    let src = temp_dir("import-optics-preset");
+    let meta = lcc_meta::Metadata { make: Some("Nikon".into()), model: Some("Z 9".into()), ..Default::default() };
+    std::fs::write(src.join("raw.dng"), crate::tests_xmp::synthetic_dng_with(None, meta)).unwrap();
+    let mut s = Session::new().with_fs();
+
+    // Create an Optics preset
+    let mut dev = lcc_develop::DevelopSettings::default();
+    dev.optics.lens_profile = true;
+    dev.optics.remove_ca = true;
+    let preset = lcc_develop::Preset::from_settings("p-optics", "Auto Optics", "User", &dev, &[lcc_develop::SettingsGroup::Optics]);
+    s.presets.push(preset);
+
+    // Configure raw_preset import default
+    s.execute("library.preferences", &json!({"import": {"rawPreset": "p-optics"}})).unwrap();
+
+    // Import photo
+    let r = s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    assert_eq!(ids(&r, "imported"), 1);
+
+    let photo = s.catalog.photos().next().unwrap();
+    assert_eq!(photo.kind, lcc_catalog::MediaKind::Raw);
+    assert!(photo.develop.optics.lens_profile, "lens_profile enabled by import default");
+    assert!(photo.develop.optics.remove_ca, "remove_ca enabled by import default");
+    assert!(!photo.is_edited(), "photo with import defaults remains unedited");
+
+    let _ = std::fs::remove_dir_all(&src);
+}

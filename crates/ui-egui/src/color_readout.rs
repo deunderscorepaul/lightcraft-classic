@@ -90,7 +90,7 @@ pub fn on_picker(resp: egui::Response, rgb: [u8; 3]) -> egui::Response {
 /// The colour of a loupe pixel as the histogram counts it: `pixels` hold the `Main` render, in
 /// the display profile's values when one is in use (then converted back to sRGB).
 pub fn srgb_at(pixels: &egui::ColorImage, u: f32, v: f32, display: Option<&lcc_engine::display::Display>) -> Option<[u8; 3]> {
-    if !(u.is_finite() && v.is_finite()) || !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+    if !(u.is_finite() && v.is_finite() && (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)) {
         return None;
     }
     let [w, h] = pixels.size;

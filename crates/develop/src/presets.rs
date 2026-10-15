@@ -406,4 +406,22 @@ mod tests {
         deep_merge(&mut a, &json!({"x": {"b": 3}, "y": [2, 3]}));
         assert_eq!(a, json!({"x": {"a": 1, "b": 3}, "y": [2, 3]}));
     }
+
+    #[test]
+    fn optics_preset_enables_automatic_lens_corrections() {
+        let mut dev = DevelopSettings::default();
+        dev.optics.lens_profile = true;
+        dev.optics.remove_ca = true;
+        let p = Preset::from_settings("p1", "Optics Auto", "User", &dev, &[SettingsGroup::Optics]);
+        assert_eq!(p.settings["optics"]["lens_profile"], true);
+        assert_eq!(p.settings["optics"]["remove_ca"], true);
+
+        let base = DevelopSettings::default();
+        assert!(!base.optics.lens_profile);
+        assert!(!base.optics.remove_ca);
+
+        let applied = p.apply(&base, 1.0);
+        assert!(applied.optics.lens_profile);
+        assert!(applied.optics.remove_ca);
+    }
 }
