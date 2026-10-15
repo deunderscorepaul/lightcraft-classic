@@ -70,7 +70,13 @@ impl Kind {
         if lower.ends_with(".appimage") {
             return Some(Kind::AppImage);
         }
-        if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".zip") || lower.ends_with(".flatpak") {
+        if lower.ends_with(".tar.gz")
+            || lower.ends_with(".tgz")
+            || lower.ends_with(".zip")
+            || lower.ends_with(".flatpak")
+            || lower.ends_with(".deb")
+            || lower.ends_with(".rpm")
+        {
             return Some(Kind::Archive);
         }
         None
@@ -115,6 +121,8 @@ pub struct Target {
     pub os: Os,
     /// `x64`, `x86`, `arm64`, `x86_64`, `aarch64`, `riscv64`.
     pub arch: &'static str,
+    /// Whether this copy of the app is running as an AppImage (Linux only).
+    pub appimage: bool,
 }
 
 impl Target {
@@ -127,7 +135,7 @@ impl Target {
     /// [`Target::current`] from a pair of `std::env::consts` strings, so the mapping can be tested
     /// for every platform we ship.
     pub fn of(os: &str, arch: &str) -> Option<Target> {
-        let (os, arch) = match (os, arch) {
+        let (os_enum, arch) = match (os, arch) {
             ("windows", "x86_64") => (Os::Windows, "x64"),
             ("windows", "x86") => (Os::Windows, "x86"),
             ("windows", "aarch64") => (Os::Windows, "arm64"),
@@ -138,7 +146,8 @@ impl Target {
             ("freebsd", "x86_64") => (Os::Freebsd, "x86_64"),
             _ => return None,
         };
-        Some(Target { os, arch })
+        let appimage = if os_enum == Os::Linux { is_running_appimage() } else { false };
+        Some(Target { os: os_enum, arch, appimage })
     }
 
     /// Whether `name` names an artifact for this platform: it carries the OS and architecture slug.
@@ -154,7 +163,53 @@ impl Target {
         match self.os {
             // the macOS build is one universal app; either arch slug is the same file
             Os::Macos => lower.contains("-macos-universal") || lower.contains("-macos-x86_64") || lower.contains("-macos-aarch64"),
+            Os::Linux => {
+                if !lower.contains(&format!("-linux-{}", self.arch)) {
+                    return false;
+                }
+                if lower.ends_with(".appimage") && !self.appimage {
+                    return false;
+                }
+                true
+            }
             _ => lower.contains(&format!("-{}-{}", self.os.slug(), self.arch)),
+        }
+    }
+
+    /// How much we prefer `name` among matching packages on Linux (lower is better).
+    pub fn package_rank(&self, name: &str) -> u8 {
+        if self.os != Os::Linux || self.appimage {
+            return 0;
+        }
+        let lower = name.to_ascii_lowercase();
+        let is_deb = lower.ends_with(".deb");
+        let is_rpm = lower.ends_with(".rpm");
+        let is_tar = lower.ends_with(".tar.gz") || lower.ends_with(".tgz");
+
+        if is_debian_derivative() {
+            if is_deb {
+                0
+            } else if is_tar {
+                1
+            } else if is_rpm {
+                2
+            } else {
+                3
+            }
+        } else if is_rpm_derivative() {
+            if is_rpm {
+                0
+            } else if is_tar {
+                1
+            } else if is_deb {
+                2
+            } else {
+                3
+            }
+        } else if is_tar {
+            0
+        } else {
+            1
         }
     }
 
@@ -163,7 +218,9 @@ impl Target {
         match self.os {
             Os::Windows => format!("run the {} installer and then start the app again", self.words_for_arch()),
             Os::Macos => "copy the app out of the disk image over this installation and start it again".into(),
-            Os::Linux if self.arch == "x86_64" || self.arch == "aarch64" => "replace this program with the new one and start it again".into(),
+            Os::Linux if self.appimage && (self.arch == "x86_64" || self.arch == "aarch64") => {
+                "replace this program with the new one and start it again".into()
+            }
             _ => "download it and open the folder it is in, so you can install it".into(),
         }
     }
@@ -180,6 +237,49 @@ impl Target {
     }
 }
 
+fn is_running_appimage() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(var) = std::env::var_os("APPIMAGE") {
+            let path = std::path::PathBuf::from(var);
+            return path.is_file();
+        }
+    }
+    false
+}
+
+fn is_debian_derivative() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::path::Path::new("/etc/debian_version").exists() {
+            return true;
+        }
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+            let lower = content.to_ascii_lowercase();
+            if lower.contains("debian") || lower.contains("ubuntu") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_rpm_derivative() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if std::path::Path::new("/etc/redhat-release").exists() {
+            return true;
+        }
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+            let lower = content.to_ascii_lowercase();
+            if lower.contains("fedora") || lower.contains("rhel") || lower.contains("suse") || lower.contains("centos") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +291,8 @@ mod tests {
         assert_eq!(Kind::of("app-1.2.3-macos-universal.dmg"), Some(Kind::Dmg));
         assert_eq!(Kind::of("app-1.2.3-linux-x86_64.AppImage"), Some(Kind::AppImage));
         assert_eq!(Kind::of("app-1.2.3-linux-x86_64.tar.gz"), Some(Kind::Archive));
+        assert_eq!(Kind::of("app-1.2.3-linux-x86_64.deb"), Some(Kind::Archive));
+        assert_eq!(Kind::of("app-1.2.3-linux-x86_64.rpm"), Some(Kind::Archive));
         assert_eq!(Kind::of("app-1.2.3-freebsd-x86_64.tar.gz"), Some(Kind::Archive));
         assert_eq!(Kind::of("app-1.2.3-linux-x86_64.flatpak"), Some(Kind::Archive));
         assert_eq!(Kind::of("SHA256SUMS.txt"), Some(Kind::Checksums));
@@ -202,40 +304,46 @@ mod tests {
 
     #[test]
     fn maps_the_shipped_platforms() {
-        assert_eq!(Target::of("windows", "x86_64"), Some(Target { os: Os::Windows, arch: "x64" }));
-        assert_eq!(Target::of("windows", "x86"), Some(Target { os: Os::Windows, arch: "x86" }));
-        assert_eq!(Target::of("windows", "aarch64"), Some(Target { os: Os::Windows, arch: "arm64" }));
-        assert_eq!(Target::of("macos", "aarch64"), Some(Target { os: Os::Macos, arch: "universal" }));
-        assert_eq!(Target::of("macos", "x86_64"), Some(Target { os: Os::Macos, arch: "universal" }));
-        assert_eq!(Target::of("linux", "riscv64"), Some(Target { os: Os::Linux, arch: "riscv64" }));
-        assert_eq!(Target::of("freebsd", "x86_64"), Some(Target { os: Os::Freebsd, arch: "x86_64" }));
+        assert_eq!(Target::of("windows", "x86_64"), Some(Target { os: Os::Windows, arch: "x64", appimage: false }));
+        assert_eq!(Target::of("windows", "x86"), Some(Target { os: Os::Windows, arch: "x86", appimage: false }));
+        assert_eq!(Target::of("windows", "aarch64"), Some(Target { os: Os::Windows, arch: "arm64", appimage: false }));
+        assert_eq!(Target::of("macos", "aarch64"), Some(Target { os: Os::Macos, arch: "universal", appimage: false }));
+        assert_eq!(Target::of("macos", "x86_64"), Some(Target { os: Os::Macos, arch: "universal", appimage: false }));
+        assert_eq!(Target::of("linux", "riscv64"), Some(Target { os: Os::Linux, arch: "riscv64", appimage: false }));
+        assert_eq!(Target::of("freebsd", "x86_64"), Some(Target { os: Os::Freebsd, arch: "x86_64", appimage: false }));
         assert_eq!(Target::of("android", "aarch64"), None);
         assert_eq!(Target::of("windows", "powerpc"), None);
     }
 
     #[test]
     fn picks_only_this_platforms_files() {
-        let win = Target { os: Os::Windows, arch: "x64" };
+        let win = Target { os: Os::Windows, arch: "x64", appimage: false };
         assert!(win.matches_name("app-1.2.3-windows-x64.msi"));
         assert!(!win.matches_name("app-1.2.3-windows-x64-portable.zip"), "the portable zip is a manual install");
         assert!(!win.matches_name("app-1.2.3-windows-arm64.msi"));
         assert!(!win.matches_name("app-1.2.3-linux-x86_64.AppImage"));
         // a Windows version that only ever mentions x64 in prose still matches: the name is ours
         assert!(!win.matches_name("app-1.2.3-linux-x86_64.tar.gz"));
-        let mac = Target { os: Os::Macos, arch: "universal" };
+        let mac = Target { os: Os::Macos, arch: "universal", appimage: false };
         assert!(mac.matches_name("app-1.2.3-macos-universal.dmg"));
         assert!(mac.matches_name("app-1.2.3-macos-aarch64.dmg"), "a per-arch dmg is still the macOS app");
         assert!(!mac.matches_name("app-1.2.3-windows-x64.msi"));
-        let lin = Target { os: Os::Linux, arch: "aarch64" };
-        assert!(lin.matches_name("app-1.2.3-linux-aarch64.AppImage"));
-        assert!(!lin.matches_name("app-1.2.3-linux-x86_64.AppImage"));
+        let lin_appimage = Target { os: Os::Linux, arch: "aarch64", appimage: true };
+        assert!(lin_appimage.matches_name("app-1.2.3-linux-aarch64.AppImage"));
+        assert!(!lin_appimage.matches_name("app-1.2.3-linux-x86_64.AppImage"));
+        let lin_non_appimage = Target { os: Os::Linux, arch: "aarch64", appimage: false };
+        assert!(!lin_non_appimage.matches_name("app-1.2.3-linux-aarch64.AppImage"), "non-AppImage target rejects AppImage");
+        assert!(lin_non_appimage.matches_name("app-1.2.3-linux-aarch64.deb"));
+        assert!(lin_non_appimage.matches_name("app-1.2.3-linux-aarch64.rpm"));
+        assert!(lin_non_appimage.matches_name("app-1.2.3-linux-aarch64.tar.gz"));
     }
 
     #[test]
     fn describes_what_will_happen() {
-        assert!(Target { os: Os::Linux, arch: "x86_64" }.describe().contains("replace this program"));
-        assert!(Target { os: Os::Windows, arch: "x64" }.describe().contains("installer"));
-        assert!(Target { os: Os::Linux, arch: "riscv64" }.describe().contains("open the folder"));
+        assert!(Target { os: Os::Linux, arch: "x86_64", appimage: true }.describe().contains("replace this program"));
+        assert!(Target { os: Os::Linux, arch: "x86_64", appimage: false }.describe().contains("open the folder"));
+        assert!(Target { os: Os::Windows, arch: "x64", appimage: false }.describe().contains("installer"));
+        assert!(Target { os: Os::Linux, arch: "riscv64", appimage: false }.describe().contains("open the folder"));
     }
 
     #[test]
