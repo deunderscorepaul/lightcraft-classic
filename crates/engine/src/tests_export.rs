@@ -1117,7 +1117,7 @@ fn same_folder_as_original_refuses_photos_without_a_folder() {
         assert_eq!(f["photo"], id.0, "{f}");
         assert!(f["error"].as_str().unwrap().contains("no folder on disk"), "{f}");
     }
-    drop(write);
+    let _ = write;
     assert!(written.is_empty(), "{written:?}");
 
     // a photo on disk whose folder is gone (moved, an unplugged drive)
