@@ -469,8 +469,8 @@ pub fn get(url: &Url, headers: &[(&str, String)], limits: &Limits) -> Result<Res
         env!("CARGO_PKG_VERSION")
     );
     for (k, v) in headers {
-        if v.chars().any(|c| c == '\r' || c == '\n') || k.chars().any(|c| c == '\r' || c == '\n' || c == ':') {
-            return Err(HttpError::BadUrl("header with a line break".into()));
+        if v.chars().any(|c| c == '\r' || c == '\n' || c == '\0') || k.chars().any(|c| c == '\r' || c == '\n' || c == ':' || c == '\0') {
+            return Err(HttpError::BadUrl("header with a line break or NUL character".into()));
         }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
@@ -521,6 +521,16 @@ mod tests {
     fn rejects_oversized_and_control_character_urls() {
         assert!(Url::parse(&format!("https://example.com/{}", "x".repeat(16 * 1024))).is_err());
         assert!(Url::parse("https://example.com/x?secret=abc\r\nInjected: 1").is_err());
+    }
+
+    #[test]
+    fn rejects_header_injection_characters() {
+        let u = Url::parse("http://127.0.0.1:8080").unwrap();
+        let limits = Limits { connect: Duration::from_secs(1), stall: Duration::from_secs(1), cancel: &AtomicBool::new(false) };
+        assert!(get(&u, &[("X-Custom\0", "val".into())], &limits).is_err());
+        assert!(get(&u, &[("X-Custom", "val\0".into())], &limits).is_err());
+        assert!(get(&u, &[("X-Custom\r\nInjected: 1", "val".into())], &limits).is_err());
+        assert!(get(&u, &[("X-Custom", "val\r\nInjected: 1".into())], &limits).is_err());
     }
 
     #[test]
