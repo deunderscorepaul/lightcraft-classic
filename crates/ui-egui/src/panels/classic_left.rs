@@ -134,13 +134,12 @@ fn columns(app: &mut LccApp, ui: &mut egui::Ui, viewport: Rect, side: &[PanelId]
     for p in crate::panels::classic::ordered(app, side) {
         match p {
             PanelId::Navigator => {}
-            PanelId::Catalog => {
-                if crate::panels::classic::header(app, ui, p, side).1 {
-                    catalog_section(app, ui, total, picks, deleted, true);
-                    ui.add_space(6.0);
-                    dates_section(app, ui);
-                }
+            PanelId::Catalog if crate::panels::classic::header(app, ui, p, side).1 => {
+                catalog_section(app, ui, total, picks, deleted, true);
+                ui.add_space(6.0);
+                dates_section(app, ui);
             }
+            PanelId::Catalog => {}
             PanelId::Folders => {
                 let (r, open) = crate::panels::classic::header(app, ui, p, side);
                 crate::panels::folders::header_buttons(app, ui, r, viewport);
@@ -180,18 +179,16 @@ fn columns(app: &mut LccApp, ui: &mut egui::Ui, viewport: Rect, side: &[PanelId]
                 ui.add_space(6.0);
             }
             PanelId::Presets => {}
-            PanelId::Versions => {
-                if crate::panels::classic::header(app, ui, p, side).1 {
-                    versions_or_history(app, ui, crate::panels::right::versions_body);
-                    ui.add_space(6.0);
-                }
+            PanelId::Versions if crate::panels::classic::header(app, ui, p, side).1 => {
+                versions_or_history(app, ui, crate::panels::right::versions_body);
+                ui.add_space(6.0);
             }
-            PanelId::History => {
-                if crate::panels::classic::header(app, ui, p, side).1 {
-                    versions_or_history(app, ui, crate::panels::right::history_body);
-                    ui.add_space(6.0);
-                }
+            PanelId::Versions => {}
+            PanelId::History if crate::panels::classic::header(app, ui, p, side).1 => {
+                versions_or_history(app, ui, crate::panels::right::history_body);
+                ui.add_space(6.0);
             }
+            PanelId::History => {}
             // upstream's My Photos sidebar (hidden until it is asked for): the whole column as
             // upstream draws it — its title row (the open library's name, the sections' menu) and
             // its own pinned headers — as one panel of this column. Self-headered, like the

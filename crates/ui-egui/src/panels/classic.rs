@@ -302,7 +302,7 @@ fn body(app: &mut LccApp, ui: &mut egui::Ui, p: PanelId) {
     match p {
         PanelId::QuickDevelop => super::quick_develop::show(app, ui),
         PanelId::Keywording => super::right::keywording(app, ui),
-        PanelId::KeywordList => super::keyword_list::show(app, ui),
+        PanelId::KeywordList => super::keyword_list::show_body(app, ui),
         PanelId::Metadata => super::right::metadata_panel(app, ui),
         _ => {}
     }

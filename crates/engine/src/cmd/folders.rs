@@ -74,10 +74,8 @@ fn scan(dir: &Path, subfolders: bool) -> Vec<PathBuf> {
                 continue;
             }
             match e.file_type() {
-                Ok(t) if t.is_dir() => {
-                    if subfolders && depth < MAX_DEPTH {
-                        stack.push((p, depth + 1));
-                    }
+                Ok(t) if t.is_dir() && subfolders && depth < MAX_DEPTH => {
+                    stack.push((p, depth + 1));
                 }
                 Ok(t) if t.is_file() && crate::import::is_supported(&p) => out.push(p),
                 _ => {}

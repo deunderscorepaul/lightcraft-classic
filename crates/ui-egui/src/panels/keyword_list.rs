@@ -17,7 +17,7 @@ use crate::widgets::register;
 const ROW_H: f32 = 24.0;
 const INDENT: f32 = 14.0;
 
-/// The Keyword List section: a filter box, then the rows.
+/// The Keyword List section with its own collapsible section header (for embedders like `RightPanel::Keywords`).
 pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     crate::widgets::divider(ui);
@@ -42,29 +42,61 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     if !open {
         return;
     }
+    show_body(app, ui);
+}
+
+/// The Keyword List panel body without a section header (for Classic panel stack `PanelId::KeywordList`).
+pub fn show_body(app: &mut LccApp, ui: &mut egui::Ui) {
+    let t = Tokens::get(ui.ctx());
     let fid = egui::Id::new("keyword-list-filter");
     let mut filter: String = ui.data(|d| d.get_temp(fid)).unwrap_or_default();
-    ui.horizontal(|ui| {
-        ui.add_space(24.0);
-        crate::text_field::TextField::singleline("field:keywordFilter", &mut filter)
-            .hint(crate::i18n::tr("Filter Keywords"))
-            .width(ui.available_width() - 82.0)
-            .show(ui);
-        // + creates a keyword (inside the picked one), − deletes the picked one
-        let plus = ui.button("+").on_hover_text(crate::i18n::tr("Create Keyword Tag"));
-        register(ui.ctx(), "keywordList:create", plus.rect);
-        if plus.clicked() {
-            app.ui.dialog = Some(create_dialog(app));
-        }
-        let picked = app.ui.keyword_list_selected.clone().filter(|k| in_tree(&app.caches.keyword_tree(&app.session.catalog), k));
-        let minus = ui.add_enabled(picked.is_some(), egui::Button::new("−")).on_hover_text(crate::i18n::tr("Delete Keyword"));
-        register(ui.ctx(), "keywordList:delete", minus.rect);
-        if minus.clicked()
-            && let Some(k) = picked
-        {
-            app.ui.dialog = Some(delete_dialog(app, &k));
-        }
+    let dragging = app.ui.dragging_keyword.clone();
+
+    let (filter_rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    register(ui.ctx(), "keywordList:topLevel", filter_rect);
+
+    let (pointer, released) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.any_released()));
+    let over_top = dragging.is_some() && shown_under(ui, filter_rect, pointer);
+
+    ui.scope_builder(egui::UiBuilder::new().max_rect(filter_rect), |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(24.0);
+            crate::text_field::TextField::singleline("field:keywordFilter", &mut filter)
+                .hint(crate::i18n::tr("Filter Keywords"))
+                .width(ui.available_width() - 82.0)
+                .show(ui);
+            // + creates a keyword (inside the picked one), − deletes the picked one
+            let plus = ui.button("+").on_hover_text(crate::i18n::tr("Create Keyword Tag"));
+            register(ui.ctx(), "keywordList:create", plus.rect);
+            if plus.clicked() {
+                app.ui.dialog = Some(create_dialog(app));
+            }
+            let picked = app.ui.keyword_list_selected.clone().filter(|k| in_tree(&app.caches.keyword_tree(&app.session.catalog), k));
+            let minus = ui.add_enabled(picked.is_some(), egui::Button::new("−")).on_hover_text(crate::i18n::tr("Delete Keyword"));
+            register(ui.ctx(), "keywordList:delete", minus.rect);
+            if minus.clicked()
+                && let Some(k) = picked
+            {
+                app.ui.dialog = Some(delete_dialog(app, &k));
+            }
+        });
     });
+
+    if over_top {
+        ui.painter().rect_filled(filter_rect, 4.0, t.chrome);
+        ui.painter().rect_stroke(filter_rect.shrink2(vec2(8.0, 2.0)), 4.0, Stroke::new(1.5, t.accent), StrokeKind::Inside);
+        ui.painter().text(
+            pos2(filter_rect.left() + 14.0, filter_rect.center().y),
+            Align2::LEFT_CENTER,
+            crate::i18n::tr("Drop here for the top level"),
+            t.semibold(12.5),
+            t.text,
+        );
+        if released && let Some(k) = dragging {
+            drop_keyword(app, ui.ctx(), &k, None);
+        }
+    }
+
     ui.data_mut(|d| d.insert_temp(fid, filter.clone()));
     ui.add_space(6.0);
     let tree = app.caches.keyword_tree(&app.session.catalog);
