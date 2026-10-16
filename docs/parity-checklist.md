@@ -1,6 +1,6 @@
 # Lightroom parity checklist
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-16 · **Change:** minor (LRC-DEV-HISTOGRAM-DRAG: the histogram's five tonal zones — hover for the value, drag to adjust the Basic control the press locked, double-click to reset; LR-VIEW-HISTOGRAM note updated; integration batch 36: slideshow module, print-ready PDF fixes, local adjustment presets, Layout Image loupe overlay, Delete in an album removes from it, new languages Czech, Polish, Italian-ready catalogs; many rows' notes updated by their PRs) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-17 · **Change:** minor (LR-VIEW-HISTOGRAM-MODES (new, issue #206): `view.histogram.mode` / `view.histogram.scale` select an RGB overlay, a luminance curve, separated channel tracks or a chroma curve, at a linear (99th-percentile) or logarithmic scale, from the panel's own selector, its context menu, the control channel or MCP; the clipping indicators are colour-coded by the channels that clip and preview their overlay on hover; LR-VIEW-HISTOGRAM note updated) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
 
 The measured, row-by-row checklist: one row per Lightroom feature, menu item and shortcut, what we
 have and what is missing. It answers *does the feature exist?* (feature breadth). Whether it is good
@@ -28,7 +28,7 @@ cited here still exists. Formerly docs/parity.md.
 |---|---:|---:|---:|---:|---:|---:|
 | A. Import (IMP) | 12 | 3 | 1 | 1 | 4/6 (67%) | 5/5 (100%) |
 | B. Library management (LIB) | 22 | 2 | 1 | 2 | 9/9 (100%) | 9/9 (100%) |
-| C. Views & navigation (VIEW) | 16 | 1 | 1 | 0 | 9/9 (100%) | 4/4 (100%) |
+| C. Views & navigation (VIEW) | 17 | 1 | 1 | 0 | 9/9 (100%) | 4/4 (100%) |
 | D. Search & filter (FILT) | 11 | 1 | 1 | 0 | 4/4 (100%) | 4/4 (100%) |
 | E. Metadata (META) | 5 | 1 | 0 | 0 | 2/2 (100%) | 2/2 (100%) |
 | F. Edit panel — global adjustments (EDIT) | 44 | 2 | 3 | 1 | 28/28 (100%) | 13/14 (93%) |
@@ -53,9 +53,9 @@ cited here still exists. Formerly docs/parity.md.
 | Y. Menus | 84 | 0 | 4 | 8 | 47/47 (100%) | 23/23 (100%) |
 | Z. Keyboard shortcuts (desktop) | 78 | 4 | 2 | 1 | 49/52 (94%) | 24/26 (92%) |
 | Lightroom Classic extras | 41 | 23 | 23 | 8 | — | 24/26 (92%) |
-| **Total** | 420 | 61 | 59 | 35 | 194/201 (97%) | 148/161 (92%) |
+| **Total** | 421 | 61 | 59 | 35 | 194/201 (97%) | 148/161 (92%) |
 
-Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **83.4%** of 540 in-scope rows — P0 98.3% of 201 · P1 95.0% of 161 · P2 55.9% of 177.
+Weighted completion (✅ = 1, 🟡 = ½, 🚫 left out): **83.5%** of 541 in-scope rows — P0 98.3% of 201 · P1 95.0% of 161 · P2 56.2% of 178.
 <!-- /parity:summary -->
 
 ## Top gaps and shortcut notes
@@ -141,7 +141,8 @@ differences and missing bindings are in [ui-parity.md](ui-parity.md#shortcuts).
 | LR-VIEW-SLIDESHOW | Slideshow | P2 | ✅ | `cmd:view.slideshow` | View ▸ Slideshow (⌥⌘↩): the photos in view full screen from the selected one, played with the library's playback settings (see LRC-SS-PLAYBACK: fades, random order, repeat, previews prepared ahead; `interval` / any setting overrides one run); Space pauses, ←/→ step (a cut), Esc ends; playback controls on pointer movement |
 | LR-VIEW-SECONDWINDOW | Second display window [Classic] | P2 | ✅ | `cmd:view.secondWindow`, `crates/ui-egui/src/panels/second.rs` | Window ▸ Second Window (⌘F11): the active photo fitted in its own native window with its own render (a floating panel where there are no native windows); loupe view only (no grid / compare / survey there) |
 | LR-VIEW-CLIPPING | Clipping indicators | P0 | ✅ | `cmd:view.clipping` | |
-| LR-VIEW-HISTOGRAM | Histogram | P0 | ✅ | `cmd:view.histogram`, `crates/ui-egui/src/panels/edit.rs`, `crates/pipeline/src/lib.rs` (`hdr_histogram`) | HDR edits: SDR on the left half, the HDR range (0 to 5 stops above SDR white, a fixed scale) on the right with the headroom limit marked; colour bar (white, or Visualize HDR range's colours when that is on) and SDR / HDR labels; the plot's five tonal zones also drag to adjust their Basic control (LRC-DEV-HISTOGRAM-DRAG); it follows slider drags live (a small render beside the drafts, `Slot::HdrHistogram`) and never drops to the SDR layout mid-drag |
+| LR-VIEW-HISTOGRAM | Histogram | P0 | ✅ | `cmd:view.histogram`, `crates/ui-egui/src/panels/edit.rs`, `crates/pipeline/src/lib.rs` (`hdr_histogram`) | HDR edits: SDR on the left half, the HDR range (0 to 5 stops above SDR white, a fixed scale) on the right with the headroom limit marked; colour bar (white, or Visualize HDR range's colours when that is on) and SDR / HDR labels; the plot's five tonal zones also drag to adjust their Basic control (LRC-DEV-HISTOGRAM-DRAG); it follows slider drags live (a small render beside the drafts, `Slot::HdrHistogram`) and never drops to the SDR layout mid-drag; the plot itself is drawn in the mode `view.histogram.mode` selected and at the scale `view.histogram.scale` selected (LR-VIEW-HISTOGRAM-MODES) |
+| LR-VIEW-HISTOGRAM-MODES | Multiple histogram & scope views [issue #206] | P2 | ✅ | `cmd:view.histogram.mode`, `cmd:view.histogram.scale`, `crates/raster/src/histogram.rs`, `crates/ui-egui/src/panels/histogram.rs`, `crates/ui-egui/src/panels/edit.rs`, `crates/ui-egui/src/tests_histogram_modes.rs` | four modes, selected by the panel's own selector (bottom-left of the plot), its right-click menu, the View menu, a shortcut the user binds, the control channel or MCP: **RGB Overlay** (the default) draws the three channels additively — their pairwise overlaps read yellow / cyan / magenta and all three read neutral light grey — with the perceptual luminance as a hairline over them; **Luminance** draws that luminance alone; **Separated Channels** splits the plot into three stacked tracks on one shared scale, so a channel's own clipping and colour-balance shifts are unambiguous; **Chroma** draws HSV saturation, `(max − min) / max` of the display-encoded pixels, as one curve. Two scales: **Linear** against the 99th percentile of the bins (so a single spike — a crushed black, a blown sky — no longer flattens the rest of the curve) and **Logarithmic**, `log10(1 + bin)` against the same peak, which lifts the quiet end. Both values are saved with the UI state and read leniently, so a file another build wrote opens on the defaults. No waveforms or vectorscope yet |
 | LR-VIEW-HDR-DISPLAY | HDR display output | P2 | ⬜ | |, `apps/lightcraft/src/hdr_display.rs` (`choose`, `preferred_hdr_format`) | SDR/HDR decision (platform, surface format, OS headroom, `LIGHTCRAFT_HDR_DISPLAY=0`) is unit-tested and logged at start; always SDR today because eframe configures an 8-bit surface; no OS headroom query yet;  |
 
 ## D. Search & filter (FILT)
@@ -888,3 +889,4 @@ Latin stays upright. Advanced Japanese composition remains open. Regression cove
 | 2026-10-13 | minor | LRC-LIB-CATALOG-IMPORT review: offline Local promotion and result dismissal across library switches covered; redundant operation/settings copies removed. Status and summary counts unchanged. |
 | 2026-10-14 | patch | LRC-LIB-CATALOG-IMPORT: reconciled with upstream phased progress, cancellation kinds, WAL-only import, translations and current progress tracking. Status and summary counts unchanged. |
 | 2026-10-13 | minor | KEYC-COMPARE: `=` / `-` (also `+`) increase / decrease the grid thumbnail size (`view.thumbSizeUp` / `view.thumbSizeDown`, View menu), grids only; status unchanged (🟡) |
+| 2026-10-17 | minor | LR-VIEW-HISTOGRAM-MODES (new, ✅), LR-VIEW-HISTOGRAM: the histogram plot draws an RGB overlay (additively blended channel colours), a luminance curve, three separated channel tracks or a perceptual-chroma curve, at a linear (99th-percentile peak) or logarithmic scale; `view.histogram.mode` / `view.histogram.scale` select, step and validate them, the panel's own selector and context menu dispatch the same ids, and both values are saved with the UI state (read leniently). The clipping indicators are colour-coded by the channels that clip (white for all three, yellow / cyan / magenta for a pair) and preview the clipping overlay on hover. No waveform or vectorscope view yet |

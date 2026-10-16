@@ -100,6 +100,8 @@ mod tests_grid;
 #[cfg(test)]
 mod tests_histogram_drag;
 #[cfg(test)]
+mod tests_histogram_modes;
+#[cfg(test)]
 mod tests_info_dialogs;
 #[cfg(test)]
 mod tests_keymap;
@@ -401,6 +403,9 @@ pub struct LightcraftApp {
     pub film_scroll: Option<f32>,
     /// Widget registry from the last frame (automation ids → rects).
     pub widgets: Vec<(String, egui::Rect)>,
+    /// A histogram clipping indicator is hovered this frame: the clipping overlay is previewed on
+    /// the photo without turning the persistent one on ([`Self::hover_preview`]'s pattern).
+    pub clipping_preview: bool,
     /// In-progress on-canvas gesture (brush stroke points, gradient drag…).
     pub gesture: Option<panels::detail::Gesture>,
     /// The brush stroke being painted, as drawn on the photo until it's committed (issue #517).
@@ -548,6 +553,7 @@ impl LightcraftApp {
             last_export_result: None,
             slideshow_export_reported: true,
             hover_preview: None,
+            clipping_preview: false,
             window_is_fullscreen: false,
             gpu_applied: None,
             gpu_notice: false,
@@ -1436,6 +1442,8 @@ impl LightcraftApp {
         self.library_changed(&ctx);
         // panels set it again this frame while the pointer rests on a preset or profile
         self.hover_preview = None;
+        // …and the histogram sets this while the pointer rests on a clipping indicator
+        self.clipping_preview = false;
         self.ai_mask_detail(&ctx);
         self.place_names_outcome(&ctx);
         if self.ui.fullscreen {

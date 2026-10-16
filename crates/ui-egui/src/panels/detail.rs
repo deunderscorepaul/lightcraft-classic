@@ -787,7 +787,8 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     if app.ui.before_after == BeforeAfter::SplitTopBottom {
         p.line_segment([pos2(img_rect.left(), line.y), pos2(img_rect.right(), line.y)], Stroke::new(1.5, Color32::WHITE));
     }
-    if app.ui.show_clipping && !show_before && !fullscreen {
+    // the persistent clipping overlay (J), or the one a hovered histogram indicator previews
+    if (app.ui.show_clipping || app.clipping_preview) && !show_before && !fullscreen {
         clipping_overlay(app, &p, img_rect);
     }
     // View ▸ Loupe Overlay ▸ Layout Image, over the photo (the After view in a before/after)
