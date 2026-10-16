@@ -361,3 +361,92 @@ fn deleting_an_album_folder_preserves_photos_and_restores_its_subtree() {
     drop(reopened);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn stack_commands_enabled_states_test() {
+    use lcc_catalog::{Op, Photo, PhotoId, Source, Stack, StackId};
+    let mut s = Session::new();
+    let mut c = lcc_catalog::Catalog::new();
+    let p1 = Photo::new(PhotoId(1), Source::Demo { scene: 1 }, "1.jpg", "JPEG", 60, 40, "2026-01-01T00:00:00");
+    let p2 = Photo::new(PhotoId(2), Source::Demo { scene: 1 }, "2.jpg", "JPEG", 60, 40, "2026-01-01T00:00:00");
+    let p3 = Photo::new(PhotoId(3), Source::Demo { scene: 1 }, "3.jpg", "JPEG", 60, 40, "2026-01-01T00:00:00");
+    c.apply(Op::AddPhoto { photo: Box::new(p1) }).unwrap();
+    c.apply(Op::AddPhoto { photo: Box::new(p2) }).unwrap();
+    c.apply(Op::AddPhoto { photo: Box::new(p3) }).unwrap();
+    c.apply(Op::AddStack { stack: Stack { id: StackId(1), photos: vec![PhotoId(1), PhotoId(2)], collapsed: false } }).unwrap();
+    s.catalog = c;
+
+    let stack_cmds = ["stack.ungroup", "stack.remove", "stack.setTop", "stack.moveUp", "stack.moveDown", "stack.split", "stack.toggle"];
+
+    // 1. With empty selection: disabled as "no photos selected"
+    s.selection = crate::Selection::default();
+    for cmd_id in stack_cmds {
+        let spec = crate::cmd::find_command(cmd_id).unwrap();
+        let res = (spec.enabled)(&s);
+        assert_eq!(res, Err("no photos selected".to_string()), "command {cmd_id} when selection is empty");
+    }
+
+    // 2. Selection contains no stacked photo (PhotoId(3)): disabled as "no stacked photo selected"
+    s.selection = crate::Selection::single(PhotoId(3));
+    for cmd_id in stack_cmds {
+        let spec = crate::cmd::find_command(cmd_id).unwrap();
+        let res = (spec.enabled)(&s);
+        assert_eq!(res, Err("no stacked photo selected".to_string()), "command {cmd_id} when no stacked photo selected");
+    }
+
+    // 3. Selection contains at least one stacked photo (PhotoId(1)): enabled
+    s.selection = crate::Selection::single(PhotoId(1));
+    for cmd_id in stack_cmds {
+        let spec = crate::cmd::find_command(cmd_id).unwrap();
+        let res = (spec.enabled)(&s);
+        assert!(res.is_ok(), "command {cmd_id} should be enabled when stacked photo selected, got {res:?}");
+    }
+}
+
+#[test]
+fn stack_commands_enabled_work_scaling_test() {
+    use lcc_catalog::{Op, Photo, PhotoId, Source, Stack, StackId};
+
+    let build_session = |stacked_count: usize| {
+        let mut s = Session::new();
+        let mut c = lcc_catalog::Catalog::new();
+        let mut ids = Vec::with_capacity(stacked_count);
+        for i in 1..=stacked_count {
+            let pid = PhotoId(i as u64);
+            let p = Photo::new(pid, Source::Demo { scene: 1 }, &format!("{i}.jpg"), "JPEG", 60, 40, "2026-01-01T00:00:00");
+            c.apply(Op::AddPhoto { photo: Box::new(p) }).unwrap();
+            ids.push(pid);
+        }
+        for (i, chunk) in ids.chunks(2).enumerate() {
+            if chunk.len() == 2 {
+                c.apply(Op::AddStack { stack: Stack { id: StackId(i as u64 + 1), photos: chunk.to_vec(), collapsed: false } }).unwrap();
+            }
+        }
+        s.catalog = c;
+        s.selection = crate::Selection { ids: ids.clone(), active: ids.first().copied() };
+        s
+    };
+
+    let count_work = |s: &Session| {
+        let stack_cmds = ["stack.ungroup", "stack.remove", "stack.setTop", "stack.moveUp", "stack.moveDown", "stack.split", "stack.toggle"];
+        let mut work = 0;
+        for _ in stack_cmds {
+            for &t in &s.selected() {
+                work += 1;
+                if s.catalog.stack_of(t).is_some() {
+                    break;
+                }
+            }
+        }
+        work
+    };
+
+    let s1000 = build_session(1000);
+    let work1000 = count_work(&s1000);
+
+    let s4000 = build_session(4000);
+    let work4000 = count_work(&s4000);
+
+    let ratio = work4000 as f64 / work1000 as f64;
+    assert!(ratio < 8.0, "Work count ratio when library grows 4x should be less than 8x (got {ratio:.2}x: work1000={work1000}, work4000={work4000})");
+}

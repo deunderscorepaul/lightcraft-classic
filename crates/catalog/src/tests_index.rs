@@ -112,6 +112,32 @@ proptest! {
         }
         prop_assert!(c.stacks().next().is_none() && c.albums().next().is_none(), "all undone");
     }
+
+    #[test]
+    fn stack_of_agrees_with_full_scan_after_ops_and_repair(steps in proptest::collection::vec((0u8..3, 0u64..16, 0u16..512, any::<bool>()), 1..30)) {
+        let mut c = library();
+        for (kind, n, bits, collapsed) in steps {
+            let op = match kind {
+                0 => Op::AddStack { stack: Stack { id: StackId(n % 4 + 1), photos: ids(bits), collapsed } },
+                1 => Op::RemoveStack { id: StackId(n % 4 + 1) },
+                _ => Op::SetStack { id: StackId(n % 4 + 1), photos: ids(bits), collapsed },
+            };
+            let _ = c.apply(op);
+            for id in 1..=PHOTOS + 1 {
+                let pid = PhotoId(id);
+                let expected = c.stacks().find(|s| s.photos.contains(&pid)).map(|s| s.id);
+                let actual = c.stack_of(pid).map(|s| s.id);
+                prop_assert_eq!(actual, expected);
+            }
+        }
+        let _ = c.repair();
+        for id in 1..=PHOTOS + 1 {
+            let pid = PhotoId(id);
+            let expected = c.stacks().find(|s| s.photos.contains(&pid)).map(|s| s.id);
+            let actual = c.stack_of(pid).map(|s| s.id);
+            prop_assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[test]

@@ -7,12 +7,15 @@ use serde_json::{Value, json};
 use super::{CommandSpec, always, bad, bool_or, cmd, f64_or, has_selection, str_param};
 use crate::{Result, Selection, Session};
 
+use std::collections::HashSet;
+
 /// Stacks containing any of `targets`, in first-seen order.
 fn stacks_of(s: &Session, targets: &[PhotoId]) -> Vec<StackId> {
+    let mut seen = HashSet::new();
     let mut v = Vec::new();
     for t in targets {
         if let Some(st) = s.catalog.stack_of(*t)
-            && !v.contains(&st.id)
+            && seen.insert(st.id)
         {
             v.push(st.id);
         }
@@ -22,7 +25,7 @@ fn stacks_of(s: &Session, targets: &[PhotoId]) -> Vec<StackId> {
 
 fn in_stack(s: &Session) -> std::result::Result<(), String> {
     has_selection(s)?;
-    if stacks_of(s, &s.selected()).is_empty() { Err("no stacked photo selected".into()) } else { Ok(()) }
+    if s.selected().iter().any(|t| s.catalog.stack_of(*t).is_some()) { Ok(()) } else { Err("no stacked photo selected".into()) }
 }
 
 fn has_stacks(s: &Session) -> std::result::Result<(), String> {

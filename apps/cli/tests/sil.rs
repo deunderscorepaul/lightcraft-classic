@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 const BIN: &str = env!("CARGO_BIN_EXE_app-cli");
 /// A step that takes longer than this is a deadlock as far as the harness is concerned.
 const STEP_TIMEOUT: Duration = Duration::from_secs(180);
+/// Maximum photo count for the SIL monkey before virtualCopy is skipped to prevent unbounded harness growth.
+const MAX_MONKEY_PHOTOS: usize = 500;
 
 // ---------------------------------------------------------------- the driver
 
@@ -729,7 +731,13 @@ fn random_action(r: &mut Rng, ids: &[u64], albums: &[u64], root: &Path, step: us
         14 => ("develop.paste", json!({"ids": some})),
         15 => ("develop.sync", json!({})),
         16 => ("develop.reset", json!({})),
-        17 => ("photo.virtualCopy", json!({})),
+        17 => {
+            if ids.len() >= MAX_MONKEY_PHOTOS {
+                ("library.selectAll", json!({}))
+            } else {
+                ("photo.virtualCopy", json!({}))
+            }
+        }
         18 => ("history.previous", json!({})),
         19 => ("history.next", json!({})),
         20 => ("edit.undo", json!({})),
@@ -748,6 +756,18 @@ fn random_action(r: &mut Rng, ids: &[u64], albums: &[u64], root: &Path, step: us
         30 => ("ui.dialog.confirm", json!({})),
         31 => ("ui.dialog.cancel", json!({})),
         _ => ("app.export", json!({"format": "jpeg", "longEdge": 200, "ids": [id], "dir": root.join("monkey-export").to_string_lossy()})),
+    }
+}
+
+#[test]
+fn sil_monkey_cap_test() {
+    let mut r = Rng(1792083476984737001);
+    let ids: Vec<u64> = (0..MAX_MONKEY_PHOTOS as u64).collect();
+    let albums = vec![];
+    let root = Path::new("/tmp");
+    for step in 0..1000 {
+        let (action, _) = random_action(&mut r, &ids, &albums, root, step);
+        assert_ne!(action, "photo.virtualCopy", "monkey must skip photo.virtualCopy when library size reaches MAX_MONKEY_PHOTOS");
     }
 }
 
