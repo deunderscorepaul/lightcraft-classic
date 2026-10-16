@@ -720,9 +720,17 @@ pub fn text_button(ui: &mut Ui, id: &str, label: &str, active: bool) -> Response
     } else {
         t.button
     };
+    let border = if active || resp.hovered() { t.button_border.lerp_to_gamma(t.text, 0.3) } else { t.button_border };
     let p = ui.painter();
-    p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, t.button_border), StrokeKind::Inside);
-    p.galley(r.center() - galley.size() / 2.0, galley, t.text);
+    p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    let text_color = if active {
+        t.pick
+    } else if resp.hovered() {
+        t.text
+    } else {
+        t.text_label
+    };
+    p.galley(r.center() - galley.size() / 2.0, galley, text_color);
     resp
 }
 
@@ -741,19 +749,28 @@ pub fn segmented(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<u
             for (j, (label, key)) in row.iter().enumerate() {
                 let label = crate::i18n::tr(label);
                 let i = row_i * per_row + j;
+                let on = active == Some(i);
                 let (r, resp) = ui.allocate_exact_size(vec2(seg_w, 24.0), Sense::click());
-                crate::widgets::announce_selected(&resp, label.to_string(), active == Some(i));
+                crate::widgets::announce_selected(&resp, label.to_string(), on);
                 register(ui.ctx(), format!("button:{id}-{key}"), r);
-                let fill = if active == Some(i) {
+                let fill = if on {
                     t.pressed
                 } else if resp.hovered() {
                     t.hover
                 } else {
                     t.button
                 };
+                let border = if on || resp.hovered() { t.button_border.lerp_to_gamma(t.text, 0.3) } else { t.button_border };
                 let p = ui.painter();
-                p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, t.button_border), StrokeKind::Inside);
-                p.text(r.center(), Align2::CENTER_CENTER, label, t.semibold(11.5), t.text);
+                p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, border), StrokeKind::Inside);
+                let text_color = if on {
+                    t.pick
+                } else if resp.hovered() {
+                    t.text
+                } else {
+                    t.text_label
+                };
+                p.text(r.center(), Align2::CENTER_CENTER, label, t.semibold(11.5), text_color);
                 if resp.clicked() {
                     clicked = Some(i);
                 }
@@ -786,8 +803,9 @@ pub fn icon_segmented(ui: &mut Ui, id: &str, items: &[(Icon, &str, &str)], activ
             } else {
                 t.button
             };
+            let border = if on || resp.hovered() { t.button_border.lerp_to_gamma(t.text, 0.3) } else { t.button_border };
             let p = ui.painter();
-            p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, t.button_border), StrokeKind::Inside);
+            p.rect(r, CornerRadius::same(4), fill, Stroke::new(1.0, border), StrokeKind::Inside);
             let c = if on {
                 t.pick
             } else if resp.hovered() {

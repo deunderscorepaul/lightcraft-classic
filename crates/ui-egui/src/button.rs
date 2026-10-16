@@ -157,7 +157,10 @@ pub fn look(t: &Tokens, kind: Kind, state: State) -> Look {
                 State::Hovered => t.hover,
                 State::Pressed => t.pressed,
             }),
-            border: Some(t.button_border),
+            border: Some(match state {
+                State::Idle | State::Disabled => t.button_border,
+                State::Hovered | State::Pressed => t.button_border.lerp_to_gamma(t.text, 0.3),
+            }),
             content: t.text,
         },
         Kind::Ghost => Look {
