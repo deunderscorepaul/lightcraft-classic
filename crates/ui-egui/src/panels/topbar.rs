@@ -1,4 +1,4 @@
-//! The top bar: sidebar toggle, back/forward, search, filter, and the right-hand icons.
+//! The top bar: sidebar toggle, search, filter, and the right-hand icons.
 
 use egui::{Align2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
@@ -80,11 +80,6 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                 {
                     let _ = app.run("view.leftPanel", json!({}));
                 }
-                ui.add_space(8.0);
-                if icon_button(ui, "back", Icon::Back, vec2(30.0, 30.0), false, true, crate::i18n::tr("Back")).clicked() {
-                    let _ = app.run("view.back", json!({}));
-                }
-                icon_button(ui, "forward", Icon::Forward, vec2(30.0, 30.0), false, false, crate::i18n::tr("Forward"));
                 if !app.native_menu {
                     // no native menu bar (web, Windows, Linux): menus in the top bar
                     ui.add_space(10.0);
