@@ -1066,8 +1066,13 @@ impl RenderJob {
                     (Some(d), Some(_)) => {
                         let keep = self.view_cache.is_some() && self.request.quality == Quality::Full;
                         let (s, h) = crate::display::finish_render(&mut rendered.image, d, keep);
-                        // (an HDR edit's HDR histogram stays)
-                        if let Some(h) = h.filter(|_| rendered.histogram.hdr.is_none()) {
+                        // (an HDR edit's HDR histogram stays, and a diagnostic overlay's painted
+                        // tint must not replace the photo's own histogram)
+                        if let Some(h) = h.filter(|_| {
+                            rendered.histogram.hdr.is_none()
+                                && self.request.overlay == lcc_pipeline::Overlay::None
+                                && self.request.proof.is_none_or(|p| !p.dest_warning && !p.display_warning)
+                        }) {
                             rendered.histogram = h;
                         }
                         srgb = s;

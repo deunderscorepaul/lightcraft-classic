@@ -704,27 +704,18 @@ fn histogram(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
         preview |= response.hovered();
         let active = app.ui.show_clipping;
         // which channels reach this end of the histogram: the triangle takes their blend (white for
-        // all three, yellow / cyan / magenta for a pair, a channel's own colour for one), and stays
-        // hollow while none of them clip
+        // all three, yellow / cyan / magenta for a pair, a channel's own colour for one), fills in
+        // `t.text` while the per-pixel overlay is pinned on, and stays hollow while idle
         let parts = clipped.unwrap_or(Clipped::NONE);
         let lit = parts.any() || active;
-        // Keep the hit target comfortable, with a smaller box and clear space to the plot edges.
-        let box_rect = rect.shrink2(vec2(2.0, 2.0));
-        p.rect_filled(
-            box_rect,
-            3.0,
-            if active {
-                t.pressed
-            } else if response.hovered() {
-                t.hover
-            } else {
-                Color32::from_gray(60)
-            },
-        );
-        if active {
-            p.rect_stroke(box_rect, 3.0, Stroke::new(1.0, t.text), egui::StrokeKind::Inside);
-        }
-        paint_clip_triangle(p, rect, out, if lit { super::histogram::blend_color(parts.parts()) } else { t.text_dim }, lit);
+        let tri_color = if parts.any() {
+            super::histogram::blend_color(parts.parts())
+        } else if active || response.hovered() {
+            t.text
+        } else {
+            t.text_dim
+        };
+        paint_clip_triangle(p, rect, out, tri_color, lit);
         let status = match clipped {
             Some(c) if c.any() => "Clipping detected in this preview.",
             Some(_) => "No clipping detected in this preview.",
