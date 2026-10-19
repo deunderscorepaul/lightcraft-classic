@@ -234,7 +234,7 @@ pub fn scale_of(app: &LccApp) -> HistogramScale {
 }
 
 /// The red, green and blue a channel is drawn in.
-pub const CHANNEL_COLORS: [Color32; 3] = [Color32::from_rgb(223, 57, 57), Color32::from_rgb(68, 176, 114), Color32::from_rgb(59, 111, 224)];
+pub const CHANNEL_COLORS: [Color32; 3] = [Color32::from_rgb(223, 57, 57), Color32::from_rgb(68, 176, 114), Color32::from_rgb(60, 140, 255)];
 
 /// The five-bin box smoothing the panel draws its curves with: raw 256-bin histograms of a photo
 /// are spiky, and a single-bin spike would draw as a one-pixel needle.
@@ -406,7 +406,7 @@ pub fn scope_pos(center: Pos2, radius: f32, u: f32, v: f32) -> Pos2 {
 fn paint_vectorscope(p: &Painter, plot: Rect, h: &Histogram, scale: HistogramScale) {
     let (center, radius) = scope_disc(plot);
     // 1. Graticule backing, concentric saturation rings (25%, 50%, 75%), crosshairs and skin-tone line
-    p.circle_filled(center, radius, Color32::from_black_alpha(65));
+    p.circle_filled(center, radius, Color32::from_rgb(12, 12, 12));
     let ring_stroke = Stroke::new(1.0, Color32::from_gray(84).gamma_multiply(0.55));
     for r in [0.25, 0.50, 0.75] {
         p.circle_stroke(center, radius * r, ring_stroke);
@@ -437,7 +437,8 @@ fn paint_vectorscope(p: &Painter, plot: Rect, h: &Histogram, scale: HistogramSca
             }
             let d = scale.height(count as f32, peak);
             let [cr, cg, cb] = scope_rgb(u, v);
-            let color = Color32::from_rgb(cr, cg, cb).gamma_multiply(0.28 + 0.72 * d);
+            let boosted_d = d.powf(0.55);
+            let color = Color32::from_rgb(cr, cg, cb).gamma_multiply(0.35 + 0.65 * boosted_d);
             let pt = scope_pos(center, radius, u, v);
             push_quad(&mut mesh, Rect::from_center_size(pt, vec2(half * 2.0, half * 2.0)), color);
         }
@@ -484,11 +485,11 @@ pub fn waveform_tracks(plot: Rect, mode: HistogramMode) -> Vec<(Rect, Channel, C
 fn paint_waveform(p: &Painter, plot: Rect, h: &Histogram, mode: HistogramMode, scale: HistogramScale) {
     let (cols, levels) = (Histogram::WAVE_COLS, Histogram::WAVE_LEVELS);
     for (track, plane, color) in waveform_tracks(plot, mode) {
-        p.rect_filled(track, 2.0, Color32::from_black_alpha(65));
+        p.rect_filled(track, 2.0, Color32::from_rgb(12, 12, 12));
         // graticule: 0, 25, 50, 75 and 100 %
         for k in 0..=4 {
             let y = track.bottom() - track.height() * k as f32 / 4.0;
-            p.line_segment([pos2(track.left(), y), pos2(track.right(), y)], Stroke::new(1.0, Color32::from_gray(92).gamma_multiply(0.5)));
+            p.line_segment([pos2(track.left(), y), pos2(track.right(), y)], Stroke::new(1.0, Color32::from_gray(92).gamma_multiply(0.35)));
         }
         // columns narrower than about a pixel and a half are drawn together, so a narrow track (the parade's)
         // doesn't stripe
@@ -509,7 +510,25 @@ fn paint_waveform(p: &Painter, plot: Rect, h: &Histogram, mode: HistogramMode, s
                 let d = scale.height(n, peak);
                 let x = track.left() + g as f32 * cw;
                 let y = track.bottom() - (l + 1) as f32 * lh;
-                push_quad(&mut mesh, Rect::from_min_size(pos2(x, y), vec2(cw, lh)), color.gamma_multiply(0.2 + 0.8 * d));
+                // Boost low- and mid-density areas with a gamma curve and increased base intensity.
+                let boosted_d = d.powf(0.55);
+                let intensity = (0.35 + 0.65 * boosted_d).clamp(0.0, 1.0);
+                let base = color.gamma_multiply(intensity);
+                // Ensure high-density waveform peaks saturate cleanly toward bright/white values
+                // without clipping lower-density texture details.
+                let cell_color = if d > 0.6 {
+                    let t = (d - 0.6) / 0.4;
+                    let whiten = (t * t).clamp(0.0, 1.0);
+                    let (br, bg, bb, ba) = (base.r() as f32, base.g() as f32, base.b() as f32, base.a() as f32);
+                    let r = (br + (255.0 - br) * whiten).round().clamp(0.0, 255.0) as u8;
+                    let g = (bg + (255.0 - bg) * whiten).round().clamp(0.0, 255.0) as u8;
+                    let b = (bb + (255.0 - bb) * whiten).round().clamp(0.0, 255.0) as u8;
+                    let a = (ba + (255.0 - ba) * whiten).round().clamp(0.0, 255.0) as u8;
+                    Color32::from_rgba_unmultiplied(r, g, b, a)
+                } else {
+                    base
+                };
+                push_quad(&mut mesh, Rect::from_min_size(pos2(x, y), vec2(cw, lh)), cell_color);
             }
         }
         p.add(mesh);
