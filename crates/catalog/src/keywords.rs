@@ -22,6 +22,29 @@ pub const SEP: char = '|';
 /// Normalize a keyword: trim every level, drop empty levels, keep at most [`MAX_TREE_LEVELS`] levels
 /// (a file's keyword is input: thousands of levels would overflow the tree walks' stack).
 pub fn clean(k: &str) -> String {
+    if !k.contains('>') && k.contains('<') {
+        let parts: Vec<&str> = k.split('<').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            let mut rev = parts;
+            rev.reverse();
+            return rev
+                .into_iter()
+                .flat_map(|seg| seg.split(SEP))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(MAX_TREE_LEVELS)
+                .collect::<Vec<_>>()
+                .join("|");
+        }
+    }
+
+    if !k.contains('<') && k.contains('>') {
+        let parts: Vec<&str> = k.split('>').flat_map(|seg| seg.split(SEP)).map(str::trim).filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 2 {
+            return parts.into_iter().take(MAX_TREE_LEVELS).collect::<Vec<_>>().join("|");
+        }
+    }
+
     k.split(SEP).map(str::trim).filter(|s| !s.is_empty()).take(MAX_TREE_LEVELS).collect::<Vec<_>>().join("|")
 }
 
@@ -881,6 +904,23 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn clean_parses_hierarchical_expressions() {
+        assert_eq!(clean("animal | dog"), "animal|dog");
+        assert_eq!(clean("animal > dog"), "animal|dog");
+        assert_eq!(clean("dog < animal"), "animal|dog");
+        assert_eq!(clean("mammal > animal > dog"), "mammal|animal|dog");
+        assert_eq!(clean("dog < animal < mammal"), "mammal|animal|dog");
+        assert_eq!(clean("  animal   >   dog  "), "animal|dog");
+        assert_eq!(clean("  dog   <   animal  "), "animal|dog");
+        assert_eq!(clean("dog < animal | mammal"), "animal|mammal|dog");
+        assert_eq!(clean("<untitled>"), "<untitled>");
+        assert_eq!(clean(">dog"), ">dog");
+        assert_eq!(clean("<dog"), "<dog");
+        assert_eq!(clean("dog>"), "dog>");
+        assert_eq!(clean("dog<"), "dog<");
     }
 
     #[test]

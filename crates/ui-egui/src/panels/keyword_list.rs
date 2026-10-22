@@ -520,32 +520,48 @@ pub(crate) struct Ticks {
     photos: usize,
     /// Photos with it, by cleaned lower-case keyword.
     counts: std::collections::HashMap<String, usize>,
+    /// Photos with any keyword below it, by cleaned lower-case keyword.
+    descendant_counts: std::collections::HashMap<String, usize>,
 }
 
 impl Ticks {
     pub(crate) fn of(catalog: &Catalog, photos: &[PhotoId]) -> Ticks {
         let photos = super::keywording::distinct(catalog, photos);
         let mut counts: std::collections::HashMap<String, usize> = Default::default();
+        let mut descendant_counts: std::collections::HashMap<String, usize> = Default::default();
         let mut seen = std::collections::HashSet::new();
+        let mut seen_descendants = std::collections::HashSet::new();
         for p in &photos {
             seen.clear();
+            seen_descendants.clear();
             for k in &p.meta.keywords {
                 let key = lcc_catalog::keywords::clean(k).to_lowercase();
                 if seen.insert(key.clone()) {
-                    *counts.entry(key).or_default() += 1;
+                    *counts.entry(key.clone()).or_default() += 1;
+                }
+                let mut current = key.as_str();
+                while let Some((parent, _)) = current.rsplit_once(lcc_catalog::keywords::SEP) {
+                    if seen_descendants.insert(parent.to_string()) {
+                        *descendant_counts.entry(parent.to_string()).or_default() += 1;
+                    }
+                    current = parent;
                 }
             }
         }
-        Ticks { photos: photos.len(), counts }
+        Ticks { photos: photos.len(), counts, descendant_counts }
     }
 
-    /// The tick box of `path`: a photo counts when it has the keyword itself (any case); one with
-    /// only a keyword below it doesn't.
+    /// The tick box of `path`: ticked when every selected photo has the keyword itself; a dash
+    /// when some do or when any selected photo has a keyword below it; empty when none do.
     pub(crate) fn tick(&self, path: &str) -> Tick {
-        match self.counts.get(&lcc_catalog::keywords::clean(path).to_lowercase()).copied().unwrap_or(0) {
-            0 => Tick::No,
-            n if n >= self.photos => Tick::All,
-            _ => Tick::Some,
+        let key = lcc_catalog::keywords::clean(path).to_lowercase();
+        let direct = self.counts.get(&key).copied().unwrap_or(0);
+        if direct >= self.photos && self.photos > 0 {
+            Tick::All
+        } else if direct > 0 || self.descendant_counts.get(&key).copied().unwrap_or(0) > 0 {
+            Tick::Some
+        } else {
+            Tick::No
         }
     }
 }
@@ -617,12 +633,35 @@ mod tests {
         assert_eq!(Ticks::of(&c, &ids[..2]).tick("travel|Italy"), Tick::All, "whatever the case");
         let all = Ticks::of(&c, &ids);
         assert_eq!(all.tick("travel|Italy"), Tick::Some);
-        assert_eq!(all.tick("travel"), Tick::No, "a keyword below doesn't tick its parent");
+        assert_eq!(all.tick("travel"), Tick::Some, "a keyword below ticks its parent as partial");
         assert_eq!(Ticks::of(&c, &[]).tick("beach"), Tick::No);
         assert_eq!(Ticks::of(&c, &ids[2..]).tick("beach"), Tick::No);
         // any letter's case, not only ASCII; a photo with it twice counts once
         let (c, ids) = library(&[&["Ärzte", "ÄRZTE"], &[]]);
         assert_eq!(Ticks::of(&c, &ids).tick("ärzte"), Tick::Some);
+    }
+
+    /// When a child keyword is assigned to a photo, parent keywords show partial selection state (Tick::Some).
+    #[test]
+    fn parent_keywords_show_partial_selection_when_child_is_assigned() {
+        let (c, ids) = library(&[&["animal|dog"], &["animal|cat"]]);
+        // When one photo is selected with animal|dog
+        let one = Ticks::of(&c, &ids[..1]);
+        assert_eq!(one.tick("animal|dog"), Tick::All);
+        assert_eq!(one.tick("animal"), Tick::Some, "parent keyword is partially ticked");
+        assert_eq!(one.tick("animal|cat"), Tick::No);
+
+        // When both photos are selected
+        let both = Ticks::of(&c, &ids);
+        assert_eq!(both.tick("animal|dog"), Tick::Some);
+        assert_eq!(both.tick("animal|cat"), Tick::Some);
+        assert_eq!(both.tick("animal"), Tick::Some, "parent keyword is partially ticked for multiple children");
+
+        // When a photo has the parent directly as well
+        let (c2, ids2) = library(&[&["animal", "animal|dog"]]);
+        let direct = Ticks::of(&c2, &ids2);
+        assert_eq!(direct.tick("animal"), Tick::All, "parent is directly assigned to all selected photos");
+        assert_eq!(direct.tick("animal|dog"), Tick::All);
     }
 
     /// The labels the Keyword List and its dialogs pass to `tr` through variables (out of reach of
