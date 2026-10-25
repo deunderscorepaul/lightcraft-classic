@@ -1338,6 +1338,64 @@ pub fn segmented(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<u
     clicked
 }
 
+/// A single-row segmented control with pill-shaped active selection, subtle borders and dividers
+/// between adjacent inactive items (Camera Raw / modern UI style).
+pub fn segmented_pill(ui: &mut Ui, id: &str, items: &[(&str, &str)], active: Option<usize>) -> Option<usize> {
+    let t = Tokens::get(ui.ctx());
+    let n = items.len().max(1);
+    let finger = crate::dialog_frame::finger_sized(ui);
+    let (h, font) = if finger { (40.0, t.semibold(14.0)) } else { (25.0, t.semibold(11.5)) };
+    let total_w = ui.available_width();
+    let (rect, _resp) = ui.allocate_exact_size(vec2(total_w, h), Sense::hover());
+    let seg_w = total_w / n as f32;
+
+    let p = ui.painter();
+    // Outer pill container
+    p.rect(rect, CornerRadius::same(6), t.button, Stroke::new(1.0, t.button_border), StrokeKind::Inside);
+
+    let mut clicked = None;
+
+    // Draw active segment background
+    if let Some(act) = active
+        && act < n
+    {
+        let seg_rect = Rect::from_min_size(pos2(rect.left() + act as f32 * seg_w, rect.top()), vec2(seg_w, h));
+        p.rect(seg_rect, CornerRadius::same(5), t.pressed, Stroke::new(1.0, t.chrome.gamma_multiply(1.2)), StrokeKind::Inside);
+    }
+
+    // Draw dividers between adjacent inactive items
+    for i in 0..n.saturating_sub(1) {
+        let neither_active = active != Some(i) && active != Some(i + 1);
+        if neither_active {
+            let x = (rect.left() + (i + 1) as f32 * seg_w).round();
+            p.line_segment([pos2(x, rect.top() + 4.0), pos2(x, rect.bottom() - 4.0)], Stroke::new(1.0, t.button_border));
+        }
+    }
+
+    // Interaction & text for each segment
+    for (i, (label, key)) in items.iter().enumerate() {
+        let seg_rect = Rect::from_min_size(pos2(rect.left() + i as f32 * seg_w, rect.top()), vec2(seg_w, h));
+        let item_resp = ui.interact(seg_rect, ui.id().with((id, key)), Sense::click());
+        let is_active = active == Some(i);
+        crate::widgets::announce_selected(&item_resp, crate::i18n::tr(label).to_string(), is_active);
+        register(ui.ctx(), format!("button:{id}-{key}"), seg_rect);
+
+        if !is_active && item_resp.hovered() {
+            p.rect_filled(seg_rect, CornerRadius::same(5), t.hover);
+        }
+
+        let text_color = if is_active || item_resp.hovered() { t.text } else { t.text_dim };
+
+        p.text(seg_rect.center(), Align2::CENTER_CENTER, crate::i18n::tr(label), font.clone(), text_color);
+
+        if item_resp.clicked() {
+            clicked = Some(i);
+        }
+    }
+
+    clicked
+}
+
 /// [`segmented`] with icons: one row of equal icon segments, each with its label as hover text and
 /// accessible name, addressable as `button:{id}-{key}`. Returns the clicked index.
 pub fn icon_segmented(ui: &mut Ui, id: &str, items: &[(Icon, &str, &str)], active: Option<usize>) -> Option<usize> {
