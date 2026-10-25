@@ -115,19 +115,18 @@ pub fn show_controls(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
     if app.ui.soft_proof {
         soft_proofing(app, ui, id);
     }
-    // header: Edit (Reset sits in the bar under the panels, issue #116), then Lightroom Classic's Basic button row:
-    // Auto, B&W | HDR (issue #124)
-    egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 14, bottom: 0 }).show(ui, |ui| {
-        ui.label(egui::RichText::new(crate::i18n::tr("Edit")).font(t.semibold(15.0)).color(t.text));
-    });
-    egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 10, bottom: 14 }).show(ui, |ui| {
+    // header: Edit and the Basic button row (Auto, B&W | HDR) on the same line, as in Camera Raw (issues #124, #530)
+    egui::Frame::NONE.inner_margin(egui::Margin { left: 16, right: 16, top: 12, bottom: 12 }).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(egui::RichText::new(crate::i18n::tr("Edit")).font(t.semibold(15.0)).color(t.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if text_button(ui, "hdr", crate::i18n::tr("HDR"), d.hdr.enabled).on_hover_text(hdr_button_tip(app.hdr_display_sdr)).clicked() {
                     let _ = app.run("develop.hdr", json!({"enabled": !d.hdr.enabled}));
                 }
+                // the separator between the treatment and HDR, as in Camera Raw / Classic
+                let (sep, _) = ui.allocate_exact_size(vec2(1.0, 18.0), Sense::hover());
+                ui.painter().vline(sep.center().x, sep.y_range(), egui::Stroke::new(1.0, t.button_border));
                 let bw = crate::is_bw(&d);
                 if text_button(ui, "treatment-bw", crate::i18n::tr("B&W"), bw).on_hover_text(crate::i18n::tr("Black & White")).clicked() {
                     let _ = app.run("develop.treatment", json!({"bw": !bw}));
