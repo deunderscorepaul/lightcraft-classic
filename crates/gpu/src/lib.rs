@@ -7,7 +7,8 @@
 //! CPU inside the same render (per-stage hybrid); see `docs/gpu-pipeline.md`.
 //!
 //! Which backends wgpu may load (DX12 only on Windows; `{ENV_PREFIX}_GPU_BACKEND`, `WGPU_BACKEND`) and
-//! the crash sentinel around device creation: [`backend`] (issue #136).
+//! the crash sentinel around device creation: [`backend`] (issue #136). Device creation has a time
+//! limit (`{ENV_PREFIX}_GPU_INIT_TIMEOUT`, issue #3068, see `init.rs`).
 //!
 //! Use [`render`]: it returns `None` when the GPU is unavailable, disabled (`{ENV_PREFIX}_GPU=0`,
 //! `{ENV_PREFIX}_GPU_BACKEND=off` or [`set_enabled`]), the render does not fit the device, or the device reported an error, ran out
@@ -31,6 +32,8 @@ use lcc_raster::Rgb32f;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod backend;
+#[cfg(all(feature = "denoise", not(target_arch = "wasm32")))]
+pub mod bm3d;
 #[cfg(not(target_arch = "wasm32"))]
 mod budget;
 #[cfg(not(target_arch = "wasm32"))]
@@ -39,6 +42,8 @@ mod ctx;
 mod exit;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod faces;
+#[cfg(not(target_arch = "wasm32"))]
+mod init;
 #[cfg(all(feature = "denoise", not(target_arch = "wasm32")))]
 pub mod nn;
 #[cfg(not(target_arch = "wasm32"))]
@@ -295,9 +300,10 @@ pub(crate) fn device() -> Option<&'static ctx::Gpu> {
     let _work = exit::enter()?;
     GPU.get_or_init(|| {
         let Some(backends) = backend::compute_backends() else { return Err(format!("disabled by {}=off", lcc_brand::env_var("GPU_BACKEND"))) };
-        let r = backend::with_init_marker(backends, || {
-            std::panic::catch_unwind(|| ctx::Gpu::new(backends)).unwrap_or_else(|_| Err("device creation panicked".into()))
-        });
+        // on a thread of its own (under the crash sentinel, counted as GPU work), waited for at most
+        // `init::limit()`: a driver or display server that never answers leaves the GPU unavailable
+        // instead of every render waiting forever (#3068)
+        let r = init::create(backends, move || ctx::Gpu::new(backends));
         if let Err(why) = &r {
             log::warn!("gpu: rendering on the CPU: {why}");
         }
@@ -471,13 +477,14 @@ pub fn grade_frame(img: &Arc<Rgb32f>, settings: &DevelopSettings, quality: lcc_p
 
 /// Whether the GPU renders requests of this kind at all (a given render can still fall back to
 /// the CPU): the kernel writes 8-bit output or, for HDR renders ([`OutputDepth::F32Hdr`]: HDR
-/// views, HDR exports, gain maps), linear float; 16-bit and SDR float exports and soft proofs render
-/// on the CPU, and so does Visualize HDR, which needs both renditions at once.
+/// views, HDR exports, gain maps), linear float; 16-bit and SDR float exports render on the CPU, and
+/// so do soft proofs against an output-device profile (`device_proof`: its 3D table is CPU-side),
+/// soft proofs of HDR renders, and Visualize HDR, which needs both renditions at once.
 ///
 /// [`OutputDepth::F32Hdr`]: lcc_pipeline::OutputDepth::F32Hdr [`try_render`] follows it,
 /// and the loupe sizes its slider-drag drafts by it (issue #330), so the two can't drift apart.
-pub fn handles(depth: lcc_pipeline::OutputDepth, proofed: bool, overlay: lcc_pipeline::Overlay) -> bool {
-    matches!(depth, lcc_pipeline::OutputDepth::U8 | lcc_pipeline::OutputDepth::F32Hdr) && !proofed && overlay != lcc_pipeline::Overlay::HdrRange
+pub fn handles(depth: lcc_pipeline::OutputDepth, device_proof: bool, overlay: lcc_pipeline::Overlay) -> bool {
+    matches!(depth, lcc_pipeline::OutputDepth::U8 | lcc_pipeline::OutputDepth::F32Hdr) && !device_proof && overlay != lcc_pipeline::Overlay::HdrRange
 }
 
 /// [`render`], reporting why this render made no GPU image: [`Fallback::NotTried`] when the GPU
@@ -491,13 +498,86 @@ pub fn try_render(
     req: &RenderRequest,
     stages: Option<&StageCache>,
 ) -> Result<Rendered, Fallback> {
+    try_render_fitted(src, info, s, req, stages, None)
+}
+
+/// [`try_render`], with the result shrunk on the device to fit `fit` (physical pixels) with
+/// `lcc_raster::resample::fit_rgba8`'s Lanczos filter, when it is larger (the loupe's display fit):
+/// only the fitted image is read back. The histogram stays the full render's. HDR renders,
+/// overlays and windows whose spots grew them come back unfitted, for the caller to fit.
+pub fn try_render_fitted(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+    fit: Option<(usize, usize)>,
+) -> Result<Rendered, Fallback> {
+    try_render_with(src, info, s, req, stages, fit.map(|size| Fit { size, full: None }), None)
+}
+
+/// The display fit asked of a render: the size the image is drawn at, and where to put the
+/// full-size image too when the caller keeps that (left `None` when no fit was made).
+pub(crate) struct Fit<'a> {
+    pub size: (usize, usize),
+    pub full: Option<&'a mut Option<lcc_raster::Rgba8>>,
+}
+
+/// [`try_render_fitted`] that also reads back the full-size render when it fits one: for a view
+/// whose render is kept at its own level (the photo's view preview) while only the fitted image
+/// is drawn. The second value is `None` when nothing was fitted (the render is the full image).
+pub fn try_render_fitted_keeping_full(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+    fit: (usize, usize),
+) -> Result<(Rendered, Option<lcc_raster::Rgba8>), Fallback> {
+    let mut full = None;
+    let r = try_render_with(src, info, s, req, stages, Some(Fit { size: fit, full: Some(&mut full) }), None)?;
+    Ok((r, full))
+}
+
+/// [`try_render`] of an HDR render ([`lcc_pipeline::OutputDepth::F32Hdr`]) for an HDR display:
+/// its floats become the HDR texture's `Rgba16Float` texels for `headroom` on the device, as
+/// `lcc_engine::hdr_texture::encode_rgba16f` makes them, and only those come back with the 8-bit
+/// image and histogram (the result has no `deep` samples). Four halves per pixel.
+pub fn try_render_hdr_texels(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+    headroom: f32,
+) -> Result<(Rendered, Vec<u16>), Fallback> {
+    if req.depth != lcc_pipeline::OutputDepth::F32Hdr {
+        return Err(Fallback::NotTried);
+    }
+    let mut texels = Vec::new();
+    let r = try_render_with(src, info, s, req, stages, None, Some((headroom, &mut texels)))?;
+    Ok((r, texels))
+}
+
+fn try_render_with(
+    src: &Arc<Rgb32f>,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    stages: Option<&StageCache>,
+    mut fit: Option<Fit<'_>>,
+    mut texels: Option<(f32, &mut Vec<u16>)>,
+) -> Result<Rendered, Fallback> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         // sections switched off with their eye render as if at their defaults (issue #316)
         let effective = s.effective();
         let s: &DevelopSettings = &effective;
+        let device_proof = req.proof.is_some_and(|p| lcc_pipeline::proof_profile(p.profile).is_some());
+        // (an HDR render's soft proof is the CPU's: `finish::finish_deep`)
+        let deep_proof = req.proof.is_some() && req.depth == lcc_pipeline::OutputDepth::F32Hdr;
         // pixel-filter plug-ins run in the CPU pipeline
-        if !enabled() || !handles(req.depth, req.proof.is_some(), req.overlay) || lcc_pipeline::plugin_filters::any_active(s) {
+        if !enabled() || !handles(req.depth, device_proof, req.overlay) || deep_proof || lcc_pipeline::plugin_filters::any_active(s) {
             return Err(Fallback::NotTried);
         }
         let s = &*lcc_pipeline::settings_for(s, req);
@@ -522,7 +602,10 @@ pub fn try_render(
             let (r, scoped) = {
                 let _scope = ctx::RenderScope::new(gpu);
                 let errors = ctx::ErrorScopes::push(gpu);
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render::render(gpu, src, info, s, req, ext.as_deref(), fault)));
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let fit = fit.as_mut().map(|f| Fit { size: f.size, full: f.full.as_deref_mut() });
+                    render::render(gpu, src, info, s, req, ext.as_deref(), fault, fit, texels.as_mut().map(|(h, t)| (*h, &mut **t)))
+                }));
                 (r, errors.pop())
             };
             // An error the device raised explains the readback failures that follow it; a buffer
@@ -588,14 +671,37 @@ pub fn try_render(
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (src, info, s, req, stages);
+        let _ = (src, info, s, req, stages, fit, texels);
         Err(Fallback::NotTried)
     }
+}
+
+/// Tests: parse and validate a WGSL module with naga, as wgpu does before it hands a shader to the driver. Needs no
+/// GPU, so kernels that don't build (a duplicate definition after a merge, a type error) fail every test run, not only
+/// the GPU ones.
+#[cfg(test)]
+pub(crate) fn validate_wgsl(name: &str, src: &str) -> Result<(), String> {
+    use wgpu::naga;
+    let module = naga::front::wgsl::parse_str(src).map_err(|e| format!("{name}: {}", e.emit_to_string(src)))?;
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&module)
+        .map(|_| ())
+        .map_err(|e| format!("{name}: {}", e.emit_to_string(src)))
 }
 
 #[cfg(test)]
 mod tests {
     use lcc_pipeline::{OutputDepth, Overlay};
+
+    /// The helper refuses what a driver would: a function defined twice (what an automatic merge of two branches
+    /// touching the same kernel can leave).
+    #[test]
+    fn wgsl_validation_catches_a_duplicate_definition() {
+        let ok = "fn f() -> f32 { return 1.0; }\n@compute @workgroup_size(1) fn main() { _ = f(); }\n";
+        assert_eq!(super::validate_wgsl("ok", ok), Ok(()));
+        let twice = format!("fn f() -> f32 {{ return 2.0; }}\n{ok}");
+        assert!(super::validate_wgsl("twice", &twice).is_err());
+    }
 
     // Given a request the kernel can't draw (16-bit or SDR float, a soft proof, Visualize HDR),
     // the GPU doesn't take it; the loupe, HDR renders and diagnostic overlays stay on the GPU

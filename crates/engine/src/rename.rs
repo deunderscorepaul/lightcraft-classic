@@ -4,7 +4,7 @@
 //! Template tokens (shared with import renaming and export file naming): `{name}` (current name
 //! without extension), `{num}` (the number at the end of the name: `IMG_0042` → `0042`), `{seq}` /
 //! `{seq:3}` (sequence number, zero-padded to 3 digits), `{date}` / `{date:%Y%m%d}` (capture date;
-//! `%Y %y %m %d %H %M %S`), `{folder}` (the original's folder name), `{camera}`, `{lens}`, `{iso}`,
+//! `%Y %y %m %B %b %d %H %M %S`), `{folder}` (the original's folder name), `{camera}`, `{lens}`, `{iso}`,
 //! `{rating}`, `{title}`, `{creator}`, `{ext}` (extension, without the dot). Unknown tokens stay as
 //! typed. Characters that aren't allowed in file names become `-`. The original extension is always
 //! kept.
@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use lcc_catalog::dates::MONTHS;
 use lcc_catalog::{Op, Photo, PhotoId, Source};
 use serde::Serialize;
 
@@ -57,9 +58,12 @@ fn sanitize(s: &str) -> String {
     t.trim().trim_matches('.').trim().to_string()
 }
 
-/// `%Y%m%d`-style formatting of an ISO local time.
+/// `%Y%m%d`-style formatting of an ISO local time. `%B` / `%b` are the English month name
+/// (`January` / `Jan`), the same in every interface language so folder names stay put; a month
+/// that doesn't parse gives nothing.
 fn format_date(iso: &str, fmt: &str) -> String {
     let part = |a: usize, b: usize| iso.get(a..b).unwrap_or("00").to_string();
+    let month = iso.get(5..7).and_then(|m| m.parse::<usize>().ok()).and_then(|m| m.checked_sub(1)).and_then(|i| MONTHS.get(i)).copied().unwrap_or("");
     let mut out = String::new();
     let mut it = fmt.chars();
     while let Some(c) = it.next() {
@@ -71,6 +75,8 @@ fn format_date(iso: &str, fmt: &str) -> String {
             Some('Y') => out.push_str(&part(0, 4)),
             Some('y') => out.push_str(&part(2, 4)),
             Some('m') => out.push_str(&part(5, 7)),
+            Some('B') => out.push_str(month),
+            Some('b') => out.push_str(month.get(..3).unwrap_or(month)),
             Some('d') => out.push_str(&part(8, 10)),
             Some('H') => out.push_str(&part(11, 13)),
             Some('M') => out.push_str(&part(14, 16)),
@@ -120,6 +126,8 @@ pub const DATE_DIRECTIVES: &[(&str, &str)] = &[
     ("%Y", "year, 4 digits"),
     ("%y", "year, 2 digits"),
     ("%m", "month 01–12"),
+    ("%B", "month name (January)"),
+    ("%b", "short month name (Jan)"),
     ("%d", "day 01–31"),
     ("%H", "hour 00–23"),
     ("%M", "minute"),
@@ -457,7 +465,7 @@ impl MoveFs for RealFs {
             let mut from = std::fs::File::open(a)?;
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&partial)?;
             std::io::copy(&mut from, &mut f)?;
-            f.sync_all()
+            lcc_catalog::safe_file::sync_file(&f, false)
         })();
         let placed = copied.and_then(|()| self.rename_no_replace(&partial, b));
         if placed.is_err() {
@@ -491,6 +499,21 @@ fn move_across_volumes(fs: &RealFs, a: &Path, b: &Path) -> std::io::Result<()> {
     if !same_contents(a, b).unwrap_or(false) {
         let _ = std::fs::remove_file(b);
         return Err(std::io::Error::other(format!("the copy at {} did not match the original; the original was kept", b.display())));
+    }
+    // the copy's name in its folder must be on disk before the original goes (issue #1501)
+    // (a bare file name's folder is the current one, as `MoveFs::listed` has it)
+    if let Some(dir) = b.parent()
+        && let Err(e) = crate::import_move::sync_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir })
+    {
+        // (a copy that can't be removed either is named, as it may stay beside the original)
+        let message = match std::fs::remove_file(b) {
+            Ok(()) => format!("could not make {} durable ({e}); the original was kept", b.display()),
+            Err(cleanup) => format!(
+                "could not make {} durable ({e}); the original was kept, and the copy could not be removed ({cleanup}), so it may remain there",
+                b.display()
+            ),
+        };
+        return Err(std::io::Error::other(message));
     }
     std::fs::remove_file(a).inspect_err(|_| {
         // the original stays: drop the copy so the file isn't in two places
@@ -1009,6 +1032,8 @@ impl Session {
 
     /// Complete retained repairs before a file or folder change can stale their exact paths.
     pub(crate) fn repair_sidecars_with(&mut self, fs: &dyn MoveFs) -> Result<()> {
+        // files are about to move: a background sidecar write still queued would land at the old name
+        self.settle_sidecar_writes()?;
         for repair in self.pending_sidecar_repairs.iter().chain(self.undo.iter().chain(&self.redo).flat_map(|e| &e.retry_sidecars)) {
             repair.validate_repair(fs).map_err(EngineError::Other)?;
         }
@@ -1698,6 +1723,8 @@ pub(crate) mod tests {
         let mut p = sample_photo();
         assert_eq!(expand_folder("{date:%Y}/{date:%Y%m%d}", &p, 1), vec!["2026", "20260114"]);
         assert_eq!(expand_folder("{date:%Y}\\{date:%Y-%m}", &p, 1), vec!["2026", "2026-01"], "backslash separates too");
+        assert_eq!(expand_folder("{date:%Y}/{date:%B}", &p, 1), vec!["2026", "January"]);
+        assert_eq!(expand_folder("{date:%Y}/{date:%m %b}", &p, 1), vec!["2026", "01 Jan"]);
         // metadata can't add levels or climb out
         p.meta.camera = "../../etc/x".into();
         p.meta.title = "..".into();
@@ -1738,6 +1765,12 @@ pub(crate) mod tests {
         for (d, _) in DATE_DIRECTIVES {
             let v = format_date("2026-01-14T05:58:48", d);
             assert!(!v.contains('%') || *d == "%%", "{d} is not a known directive");
+        }
+        assert_eq!(format_date("2026-09-30T14:05:00", "%B %b"), "September Sep");
+        assert_eq!(format_date("2026-12-01T00:00:00", "%d %B %Y"), "01 December 2026");
+        // a month that isn't 01–12 gives no name instead of panicking
+        for bad in ["2026-00-01", "2026-13-01", "2026-x", "", "2026-é1-01"] {
+            assert_eq!(format_date(bad, "%B|%b"), "|", "{bad:?}");
         }
         assert_eq!(unknown_tokens("{date}_{camra}-{seq:2}{x}{camra}"), vec!["{camra}".to_string(), "{x}".to_string()]);
         assert!(unknown_tokens("{name}{ext}{date:%Y}").is_empty());

@@ -8,6 +8,8 @@ mod apk;
 mod assets;
 mod bench;
 mod brand;
+mod ci_lock;
+mod ci_quick;
 mod ci_report;
 mod dist;
 mod docs;
@@ -90,7 +92,7 @@ commands:
   web [--serve [port]] [--dev]
                   build the browser app (apps/web) into <target>/web-site/;
                   --serve serves it on http://127.0.0.1:<port> (default 8080)
-  ci [--fast] [--hardware] [--summary-md]
+  ci [--fast] [--hardware] [--summary-md] [--quick [--base REF]]
                   fmt --check, brand check, docs --check, notes --check, clippy -D warnings, heif, test, GPU probe, parity refs,
                   layers, assets, deny, wasm (stops at first failure). Tests run under cargo test (cargo nextest
                   with the quarantine on CI or with XTASK_NEXTEST=1), without examples, then doctests with cargo
@@ -98,12 +100,19 @@ commands:
                   target/ci/report.json (machine, GPU adapters, data, steps, skipped tests) and target/ci/summary.md;
                   --fast (the PR gate) skips the test runs, which run in full before a release (docs/ci.md);
                   --hardware also runs the GPU tests on every backend with a hardware adapter; --summary-md prints
-                  the Markdown summary
+                  the Markdown summary.
+                  --quick: only what the changes since the merge base with origin/main (or REF) can
+                  break: clippy, the changed packages' tests, and heif / parity / wasm when they apply.
+                  One ci runs at a time per machine; others wait (<PREFIX>_CI_SLOTS=N for N at once,
+                  <PREFIX>_CI_LOCK=off to skip the lock)
   corpus [--download]
                   show where test corpora live; --download fetches PngSuite, CC0 raw samples (raw.pixls.us) and public-domain / CC-BY video clips into corpus/ and checks their sha256
+  upstream-review [--ref REF] | --done [REF]
+                  list the upstream commits since the last review (upstream-reviewed.txt), grouped by area, into
+                  target/upstream/upstream-review-YYYYMMDD.md for porting by hand; --done records REF as reviewed
   upstream-merge [--ref REF] [--no-ci]
-                  merge upstream (default upstream/main) on merge/upstream-YYYYMMDD, keep our version of owned
-                  paths (upstream-owned.txt), write target/upstream/review-YYYYMMDD.md, map crate names, run ci
+                  (no longer used: the fork cherry-picks instead, docs/upstream-merge.md) merge upstream on
+                  merge/upstream-YYYYMMDD, keep owned paths, write a review list, map crate names, run ci
   upstream-pr <branch> <commit>...
                   replay commits onto a new branch off upstream/main with upstream crate names (never pushes)
   shared-check [--strict]
@@ -153,6 +162,7 @@ fn main() -> ExitCode {
         Some("corpus") => cmd_corpus(rest.contains(&"--download")),
         Some("upstream-merge") => upstream::merge(&root(), &rest),
         Some("upstream-pr") => upstream::pr(&root(), &rest),
+        Some("upstream-review") => upstream::review(&root(), &rest),
         Some("shared-check") => upstream::shared_check(&root(), &rest, false),
         Some("stats") => stats::run(&root(), rest.contains(&"--exact")),
         Some("update-key") => update_key::run(&root(), &rest),
@@ -234,16 +244,16 @@ fn ci_jobs(available_mb: Option<u64>, cpus: usize) -> usize {
     available_mb.map_or(4, |mb| usize::try_from(mb / 1536).unwrap_or(usize::MAX)).clamp(1, cpus.max(1))
 }
 
-/// RAM the OS could hand out now (free plus reclaimable cache) in MB, if it reports it.
+/// RAM the OS could hand out now (free plus reclaimable cache) in MB, if it reports it. On Linux,
+/// held to the room left under the process's cgroup memory limit (a container, a CI runner, a
+/// systemd scope with `MemoryMax`): `lcc_sysmem::available`.
 fn available_ram_mb() -> Option<u64> {
     let output = |program: &str, args: &[&str]| {
         let out = Command::new(program).args(args).output().ok()?;
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     };
     if cfg!(target_os = "linux") {
-        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb = info.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?.trim().trim_end_matches("kB").trim();
-        Some(kb.parse::<u64>().ok()? / 1024)
+        Some(lcc_sysmem::available()? >> 20)
     } else if cfg!(windows) {
         let cmd = "(Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory).AvailableMBytes";
         output("powershell", &["-NoProfile", "-Command", cmd])?.trim().parse().ok()
@@ -261,12 +271,11 @@ fn available_ram_mb() -> Option<u64> {
 }
 
 /// Installed physical memory in whole GB, if the OS reports it (the fallback when available RAM
-/// can't be read: half of it is assumed available).
+/// can't be read: half of it is assumed available). On Linux, the process's cgroup memory limit
+/// when smaller: `lcc_sysmem::effective_total`.
 fn total_ram_gb() -> Option<u64> {
     let bytes: u64 = if cfg!(target_os = "linux") {
-        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb = info.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().trim_end_matches("kB").trim();
-        kb.parse::<u64>().ok()?.checked_mul(1024)?
+        lcc_sysmem::effective_total()?
     } else {
         let (program, args): (&str, &[&str]) = if cfg!(windows) {
             ("powershell", &["-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
@@ -327,6 +336,60 @@ fn doctests() -> (Command, String) {
     let mut c = cargo();
     c.args(["test", "--workspace", "--doc"]);
     (c, "cargo test --workspace --doc".to_owned())
+}
+
+/// `ci --quick`'s tests: build every workspace test target, then run only the test binaries of
+/// `packages`. Building with `-p` instead would resolve features per selection: different
+/// artifacts from `ci`'s workspace build, so it would recompile ~130 crates. Doc tests are left to
+/// the full `ci`.
+fn test_selected(root: &Path, packages: &std::collections::BTreeSet<String>, skip_log: &Path) -> Result<(), String> {
+    let manifests: std::collections::BTreeMap<String, String> = metadata()?["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| Some((p["manifest_path"].as_str()?.to_owned(), p["name"].as_str()?.to_owned())))
+        .filter(|(_, name)| packages.contains(name))
+        .collect();
+    let what = "cargo test --workspace --no-run --lib --bins --tests";
+    eprintln!("$ {what} (then the test binaries of {})", packages.iter().map(String::as_str).collect::<Vec<_>>().join(", "));
+    let out = cargo()
+        .args(with_test_targets(&["test", "--workspace", "--no-run", "--message-format=json-render-diagnostics"]))
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("{what}: failed to spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{what}: exited with {}", out.status));
+    }
+    let mut binaries = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if msg["reason"] != "compiler-artifact" || msg["profile"]["test"] != true {
+            continue;
+        }
+        let (Some(exe), Some(manifest)) = (msg["executable"].as_str(), msg["manifest_path"].as_str()) else { continue };
+        if let Some(name) = manifests.get(manifest) {
+            binaries.push((name.clone(), manifest.to_owned(), exe.to_owned()));
+        }
+    }
+    if binaries.is_empty() {
+        println!("no test binaries in {}", packages.iter().map(String::as_str).collect::<Vec<_>>().join(", "));
+        return Ok(());
+    }
+    let mut failed = Vec::new();
+    for (name, manifest, exe) in &binaries {
+        let dir = Path::new(manifest).parent().unwrap_or(root);
+        let mut c = Command::new(exe);
+        c.current_dir(dir).env("CARGO_MANIFEST_DIR", dir).env("CARGO_PKG_NAME", name).env(ci_report::skip_log_env(), skip_log);
+        if std::env::var_os("RUST_TEST_THREADS").is_none() {
+            // as the cargo runs of ci (`cargo()`): more threads make the frame-budget tests flaky
+            c.env("RUST_TEST_THREADS", std::thread::available_parallelism().map_or(4, |n| n.get()).min(4).to_string());
+        }
+        let file = Path::new(exe).file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        if run(c, &format!("{name}: {file}")).is_err() {
+            failed.push(format!("{name} ({file})"));
+        }
+    }
+    if failed.is_empty() { Ok(()) } else { Err(format!("tests failed in {}", failed.join(", "))) }
 }
 
 /// The test that prints the messages each language lacks (shown in English); it always passes.
@@ -455,12 +518,17 @@ pub fn check_for_target(target: &str, set: &[String], together: bool, configure:
 }
 
 fn cmd_wasm() -> Result<(), String> {
-    wasm_check(false)
+    wasm_check(false, None)
 }
 
-/// The wasm32 check; `together`: see [`check_for_target`].
-fn wasm_check(together: bool) -> Result<(), String> {
-    let set = wasm_set()?;
+/// The wasm32 check of the wasm-safe crates, or only those of them in `only` (`ci --quick`);
+/// `together`: see [`check_for_target`].
+fn wasm_check(together: bool, only: Option<&std::collections::BTreeSet<String>>) -> Result<(), String> {
+    let set: Vec<String> = wasm_set()?.into_iter().filter(|p| only.is_none_or(|o| o.contains(p))).collect();
+    if set.is_empty() {
+        println!("wasm32-unknown-unknown check: no changed crate builds for wasm32");
+        return Ok(());
+    }
     let results = check_for_target("wasm32-unknown-unknown", &set, together, |_| {});
     println!("\nwasm32-unknown-unknown check:");
     for (p, ok) in &results {
@@ -507,23 +575,64 @@ fn env_name(suffix: &str) -> String {
     brand::Brand::current().ok().and_then(|b| b.get("env_prefix").map(|p| format!("{p}_{suffix}"))).unwrap_or_else(|| suffix.to_string())
 }
 
-/// `cargo xtask ci [--fast] [--hardware] [--summary-md]`.
+/// `cargo xtask ci [--fast] [--hardware] [--summary-md] [--quick [--base REF]]`.
 fn cmd_ci_cli(args: &[&str]) -> Result<(), String> {
-    if let Some(other) = args.iter().find(|a| !matches!(**a, "--fast" | "--hardware" | "--summary-md")) {
+    let quick = args.contains(&"--quick");
+    let base_at = args.iter().position(|a| *a == "--base");
+    let base = base_at.map(|i| args.get(i + 1).copied().ok_or("ci: --base needs a ref")).transpose()?;
+    let unknown = args
+        .iter()
+        .enumerate()
+        .find(|(i, a)| !matches!(**a, "--fast" | "--hardware" | "--summary-md" | "--quick" | "--base") && base_at.is_none_or(|b| *i != b + 1));
+    if let Some((_, other)) = unknown {
         return Err(format!("ci: unknown option `{other}`\n\n{USAGE}"));
     }
-    run_ci(args.contains(&"--fast"), args.contains(&"--hardware"), args.contains(&"--summary-md"), args)
+    if base.is_some() && !quick {
+        return Err("ci: --base only applies to --quick".into());
+    }
+    let opts =
+        CiOptions { fast: args.contains(&"--fast"), quick, base, hardware: args.contains(&"--hardware"), print_md: args.contains(&"--summary-md") };
+    run_ci(&opts, args)
+}
+
+/// How [`run_ci`] runs: `fast` (the PR gate) skips the test runs; `quick` (with `base`) runs only what
+/// the changes since the merge base can break (`ci_quick.rs`); `hardware` also runs the GPU tests on every
+/// backend with a hardware adapter; `print_md` prints the Markdown summary.
+#[derive(Clone, Copy)]
+struct CiOptions<'a> {
+    fast: bool,
+    quick: bool,
+    base: Option<&'a str>,
+    hardware: bool,
+    print_md: bool,
 }
 
 /// `fast`: the PR gate, every check except the test runs (docs/ci.md); the full run is the release gate.
 pub fn cmd_ci(fast: bool) -> Result<(), String> {
-    run_ci(fast, false, false, if fast { &["--fast"] } else { &[] })
+    let opts = CiOptions { fast, quick: false, base: None, hardware: false, print_md: false };
+    run_ci(&opts, if fast { &["--fast"] } else { &[] })
 }
 
-/// [`cmd_ci`]; `hardware` also runs the GPU tests on every backend with a hardware adapter,
-/// `print_md` prints the Markdown summary, `args` is the command line the report records.
-fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(), String> {
+/// [`cmd_ci`] with `opts`; `args` is the command line the report records.
+fn run_ci(opts: &CiOptions, args: &[&str]) -> Result<(), String> {
+    let CiOptions { fast, quick, base, hardware, print_md } = *opts;
     let root = root();
+    let command = std::iter::once("cargo xtask ci").chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
+    // held until ci returns: one run at a time per machine (ci_lock.rs)
+    let _slot = ci_lock::acquire(&root, &command)?;
+    let plan = if quick {
+        let (base, files) = ci_quick::changed_files(&root, base)?;
+        let plan = ci_quick::plan(&files, &ci_quick::packages(&root, &metadata()?), base);
+        let packages: Vec<&str> = plan.packages.iter().map(String::as_str).collect();
+        eprintln!("=== ci --quick: {} changed file(s) since {} ===", plan.files, plan.base);
+        eprintln!("  packages: {}", if packages.is_empty() { "none".to_owned() } else { packages.join(", ") });
+        if plan.workspace_wide {
+            eprintln!("  a workspace-wide file changed: testing every package");
+        }
+        Some(plan)
+    } else {
+        None
+    };
     let report_dir = ci_report::prepare(&root)?;
     let started = std::time::Instant::now();
     let started_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -548,6 +657,16 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
     };
 
     type Step<'a> = (&'static str, Box<dyn Fn() -> Result<(), String> + 'a>);
+    // `--quick`: which steps apply (all of them in a full run) and the packages to test
+    let wants = |step: &str| match &plan {
+        None => true,
+        Some(p) => match step {
+            "clippy" | "test" | "wasm" => p.rust(),
+            "heif" => p.heif,
+            "parity" => p.parity,
+            _ => true,
+        },
+    };
     let mut steps: Vec<Step> = vec![
         (
             "fmt",
@@ -587,6 +706,9 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
         (
             "test",
             Box::new(|| {
+                if let Some(p) = plan.as_ref().filter(|p| !p.workspace_wide) {
+                    return test_selected(&root, &p.packages, &ci_report::skip_log(&root, "test"));
+                }
                 // on CI (`CI=true`): cargo-nextest with retries and the quarantine (ci/quarantine.toml);
                 // locally: strict `cargo test` unless `XTASK_NEXTEST=1` asks for the CI run
                 if std::env::var("CI").is_ok_and(|v| v == "true") || std::env::var_os("XTASK_NEXTEST").is_some() {
@@ -597,9 +719,7 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
             }),
         ),
     ];
-    if fast {
-        steps.retain(|(name, _)| *name != "test");
-    }
+    steps.retain(|(name, _)| wants(name) && !(fast && *name == "test"));
     if hardware {
         steps.push((
             "gpu-backends",
@@ -632,13 +752,19 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
             }),
         ));
     }
-    steps.push(("parity", Box::new(|| parity::run(&root, false))));
-    steps.push(("shared-check", Box::new(|| upstream::shared_check(&root, &[], true))));
+    if wants("parity") {
+        steps.push(("parity", Box::new(|| parity::run(&root, false))));
+    }
+    // (shared-check is no longer a ci step: the fork doesn't merge upstream, so a change to a shared
+    // path needn't go upstream first; `cargo xtask shared-check` still lists them)
     steps.push(("layers", Box::new(cmd_layers)));
     steps.push(("assets", Box::new(|| assets::run(&root))));
     steps.push(("deny", Box::new(cmd_deny)));
     // the fast gate checks each target's crates in one cargo run; the full run checks them one by one
-    steps.push(("wasm", Box::new(move || wasm_check(fast))));
+    if wants("wasm") {
+        let only = plan.as_ref().filter(|p| !p.workspace_wide).map(|p| &p.packages);
+        steps.push(("wasm", Box::new(move || wasm_check(fast, only))));
+    }
     steps.push(("android", Box::new(move || android::check(fast))));
 
     let mut results = Vec::new();
@@ -649,7 +775,7 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
         let r = f();
         let status = if r.is_ok() { "ok" } else { "fail" };
         results.push(serde_json::json!({"name": name, "status": status, "seconds": t.elapsed().as_secs_f64()}));
-        if *name == "test" {
+        if *name == "test" && plan.is_none() {
             // right after the workspace tests, before parity and wasm build other feature sets
             probe();
             translation_gaps();
@@ -660,7 +786,8 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
         }
     }
     if gpu.borrow().is_null() {
-        *gpu.borrow_mut() = serde_json::json!({"error": "not probed: the test step did not run"});
+        let why = if plan.is_some() { "not probed: --quick" } else { "not probed: the test step did not run" };
+        *gpu.borrow_mut() = serde_json::json!({"error": why});
     }
     let done: Vec<&str> = steps.iter().take(results.len()).map(|(n, _)| *n).collect();
     match &failure {
@@ -684,7 +811,8 @@ fn run_ci(fast: bool, hardware: bool, print_md: bool, args: &[&str]) -> Result<(
     let ram_mb = available_ram_mb();
     let report = serde_json::json!({
         "schema": ci_report::SCHEMA,
-        "command": std::iter::once("cargo xtask ci").chain(args.iter().copied()).collect::<Vec<_>>().join(" "),
+        "command": command,
+        "quick": plan.as_ref().map(|p| serde_json::json!({"base": p.base, "files": p.files, "packages": p.packages, "workspace_wide": p.workspace_wide})),
         "result": if failure.is_some() { "fail" } else { "pass" },
         "failed_step": failure.as_ref().map(|(n, _)| *n),
         "started_unix": started_unix,
@@ -3356,6 +3484,47 @@ const RAW_SAMPLES: &[(&str, &str, &str)] = &[
         "https://raw.pixls.us/getfile.php/1791/nice/Canon%20-%20EOS%2030D%20-%20RAW%20%283:2%29.CR2",
         "fb216f8df8d7abca4eb9d9f8dc594c1d2b69d0a6369fb8b4107743343c37144f",
     ),
+    // GoPro GPR (VC-5): one CC0 file per body (crates/raw/tests/it/gpr_corpus.rs)
+    (
+        "gpr-hero5-936.gpr",
+        "https://raw.pixls.us/getfile.php/936/nice/GoPro%20-%20HERO5%20Black%20-%2016bit%20%284:3%29.GPR",
+        "191901b64412083146256ccebeacd954783f6c40a4556ef355a067915136159b",
+    ),
+    (
+        "gpr-hero6-2556.gpr",
+        "https://raw.pixls.us/getfile.php/2556/nice/GoPro%20-%20HERO6%20Black%20-%2016bit%20%284:3%29.GPR",
+        "ca9b79fcdfab1cc071405209063fb736cc0b7169a7a88fe091fceee803f546fb",
+    ),
+    (
+        "gpr-hero7-2786.gpr",
+        "https://raw.pixls.us/getfile.php/2786/nice/GoPro%20-%20HERO7%20Black%20-%2016bit%20%284:3%29.GPR",
+        "0c2003137feb0ca7c9a8adf6cd832bc8fba7ff1b89cf5d77822b22558b9a20fe",
+    ),
+    (
+        "gpr-hero8-3949.gpr",
+        "https://raw.pixls.us/getfile.php/3949/nice/GoPro%20-%20HERO8%20Black%20-%2016bit%20%284:3%29.GPR",
+        "bfd992594af380748f3d46e37814dae595356cb6fce182d4188230ca978e6a9f",
+    ),
+    (
+        "gpr-hero9-4483.gpr",
+        "https://raw.pixls.us/getfile.php/4483/nice/GoPro%20-%20HERO9%20Black%20-%2016bit%20%284:3%29.GPR",
+        "bf6f67d0c7096f347b864310f6d58be35237c3d0e715b47a1b30e650e9d785b1",
+    ),
+    (
+        "gpr-hero10-4883.gpr",
+        "https://raw.pixls.us/getfile.php/4883/nice/GoPro%20-%20HERO10%20Black%20-%2016bit%20%284:3%29.GPR",
+        "f462ea1e695a0491960a496e3998c8806a2a02a2830c9c696c7067c0039a437c",
+    ),
+    (
+        "gpr-hero11-7319.gpr",
+        "https://raw.pixls.us/getfile.php/7319/nice/GoPro%20-%20HERO11%20Black%20-%2016bit%20%285:4%29.GPR",
+        "d7a6be163c847cb8456e6858a99aef3b85dc3d8836bca1da1b8886effe0d43e1",
+    ),
+    (
+        "gpr-fusion-7370.gpr",
+        "https://raw.pixls.us/getfile.php/7370/nice/GoPro%20-%20FUSION%20-%2016bit%20%281:1%29.GPR",
+        "f90535bbb28f8b24093c6112bd982f89c47cb0181bcfaba97471e191861a1e80",
+    ),
 ];
 
 /// Video test clips for M14 (`corpus/video/`), each `(file name, URL, sha256, licence and source)`.
@@ -3477,6 +3646,29 @@ mod ci_jobs_tests {
         assert_eq!(ci_jobs(Some(500), 8), 1, "at least one");
         assert_eq!(ci_jobs(None, 32), 4, "unknown RAM keeps the old default");
         assert_eq!(ci_jobs(None, 2), 2);
+    }
+
+    /// Inside a container or a scope with `MemoryMax`, CI sizes itself from the limit (#3072).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ram_honours_the_cgroup_limit() {
+        let info = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let physical = lcc_sysmem::limits::meminfo_bytes(&info, "MemTotal").unwrap();
+        // the bound total_ram_gb's rounding can't exceed: the cgroup limit when there is one
+        let bound = lcc_sysmem::limits::cgroup_memory().limit.map_or(physical, |limit| limit.min(physical));
+        let gb = super::total_ram_gb().unwrap();
+        assert!(gb <= (bound + (1 << 29)) >> 30, "{gb} GB above the {bound} bytes this process may use");
+        let available = lcc_sysmem::available().unwrap();
+        assert!(available <= bound, "available {available} above the {bound} bytes this process may use");
+    }
+
+    /// What CI would size itself from here; run by hand inside and outside a limited scope.
+    #[test]
+    #[ignore = "diagnostic: prints the RAM and CI jobs this process sees"]
+    fn prints_ci_sizing() {
+        let (total, available) = (super::total_ram_gb(), super::available_ram_mb());
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        println!("ram_total_gb {total:?}, ram_available_mb {available:?}, ci jobs {}", ci_jobs(available, cpus));
     }
 }
 

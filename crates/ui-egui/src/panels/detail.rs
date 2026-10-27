@@ -311,6 +311,20 @@ pub(crate) fn pan_image(app: &mut LccApp, area: Rect, img: Rect, delta: egui::Ve
     let _ = app.run("view.navigate", json!({"pan": pan}));
 }
 
+/// A drag with the middle button (the mouse wheel pressed) pans the zoomed photo whatever tool is
+/// active, so the healing brush, mask brushes and crop never paint or move while you look around;
+/// the hand cursor shows while it does.
+fn middle_pan(app: &mut LccApp, ui: &egui::Ui, resp: &egui::Response, area: Rect, img: Rect) -> bool {
+    if !resp.dragged_by(egui::PointerButton::Middle) {
+        return false;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    if img.width() > area.width() + 1.0 || img.height() > area.height() + 1.0 {
+        pan_image(app, area, img, resp.drag_delta());
+    }
+    true
+}
+
 /// Net vertical notches (up is positive) of unmodified line/page-unit wheel events: a real mouse wheel, not a trackpad.
 fn wheel_notches(events: &[egui::Event]) -> f32 {
     events
@@ -440,7 +454,7 @@ pub(crate) fn focus_pan(app: &LccApp, id: PhotoId) -> Option<(f32, f32)> {
     Some((((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32))
 }
 
-/// Draw the camera's focus box over a photo drawn in `img` (View ▸ Show Focus Point): green corner
+/// Draw the camera's focus box over a photo drawn in `img` (View ▸ Focus Point): green corner
 /// brackets with a dark keyline, the way cameras show their AF frame, never smaller than 14 pt.
 /// `key` names it for tests and the control channel (`canvas:focusPoint`, `compare:focusPoint:<id>`).
 pub(crate) fn draw_focus_point(p: &egui::Painter, img: Rect, photo: &lcc_catalog::Photo, key: &str) {
@@ -472,6 +486,25 @@ fn animated_rect(ctx: &egui::Context, anim: &mut bool, target: Rect) -> Rect {
         *anim = false;
     }
     r
+}
+
+/// View Options' Show Briefly When Photo Changes: note when the loupe changes to photo `id`, and
+/// whether the brief info overlay shows this frame (until [`BRIEF_INFO_SECS`] have passed; a
+/// repaint is asked for then, so it hides without input).
+///
+/// [`BRIEF_INFO_SECS`]: crate::state::BRIEF_INFO_SECS
+fn brief_info(app: &mut LccApp, ctx: &egui::Context, id: PhotoId) {
+    let now = ctx.input(|i| i.time);
+    let brief = &mut app.ui.brief_info;
+    if brief.photo != Some(id) {
+        brief.photo = Some(id);
+        brief.since = now;
+    }
+    let left = crate::state::BRIEF_INFO_SECS - (now - brief.since);
+    brief.shown = app.ui.settings.loupe_info.briefly != crate::state::InfoOverlay::Off && left > 0.0;
+    if brief.shown {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+    }
 }
 
 /// What the tiles of a zoomed view (the loupe, a Compare / Reference photo) need to know about
@@ -512,6 +545,57 @@ pub(crate) struct WindowView {
 
 /// Priority of on-screen tiles (just below the whole-frame render) and of the ring around them.
 const TILE_PRIORITY: u32 = 99;
+
+/// The long edge of the loupe's render at rest: no less than the preview source level, so the
+/// source is copied 1:1 (no resample in the pipeline, whose prefilter and bilinear pass soften
+/// detail near the output's limit) and shrunk once, by the Lanczos display fit. A user's explicit
+/// Preview size below the preview level still caps it.
+fn rest_edge(settings: &crate::state::AppSettings, main_edge: usize, native_long: usize, texture_side: usize) -> usize {
+    let limit = if settings.preview_limit == 0 { usize::MAX } else { settings.preview_limit as usize };
+    let floor = lcc_engine::SourceLevel::Preview.max_edge().min(limit).min(native_long);
+    main_edge.max(floor).min(texture_side.max(crate::state::MIN_TEXTURE_SIDE))
+}
+
+/// The render box of long edge `edge` for a frame of `aspect`. The short side is rounded, not
+/// truncated: a truncated box (2560 x 1706 for a 2560 x 1707 source) made the render a slightly
+/// anisotropic resample of its source, a 2-tap blur along one axis only. A box that matches the
+/// source to rounding is rendered at exactly its size.
+fn render_box(edge: usize, aspect: f32) -> (usize, usize) {
+    let short = |e: usize, a: f32| ((e as f32 / a).round() as usize).max(1);
+    if aspect >= 1.0 { (edge, short(edge, aspect)) } else { (short(edge, 1.0 / aspect), edge) }
+}
+
+/// Photo `id`'s loupe render at rest: `size` (from [`rest_edge`] and [`render_box`]), shrunk to
+/// exactly the `fit` it is drawn at with a Lanczos filter (on the GPU when it renders there), so
+/// the window draws it texel for texel instead of shrinking it with 2-tap sampling. The loupe and
+/// the prefetch of a neighbour build it alike, so the step to that photo finds it ready.
+fn rest_job(
+    app: &mut LccApp,
+    id: PhotoId,
+    size: (usize, usize),
+    fit: [usize; 2],
+    overlay: lcc_pipeline::Overlay,
+    crop_tool: bool,
+) -> Option<lcc_engine::media::RenderJob> {
+    let job = app.session.loupe_job(id, size.0.max(8), size.1.max(8), !crop_tool)?.with_display_fit(fit[0], fit[1]);
+    let job = job.with_overlay(overlay).with_proof(app.ui.soft_proof.then_some(app.ui.proof));
+    Some(job.with_hidden_grading(app.ui.grading_hidden_for(id)))
+}
+
+/// Share of a frame the loupe waits for a slider drag's update to finish so it is drawn in that
+/// frame (`Renderer::wait_for_draft`): a draft, and a full-quality update (high quality adjustment
+/// previews), which takes longer but leaves the rest of the frame as cheap.
+const DRAFT_WAIT_SHARE: f32 = 0.4;
+const FULL_WAIT_SHARE: f32 = 0.6;
+
+/// How long a frame of `frame` seconds (egui's predicted frame time) waits for a slider drag's
+/// update: a draft's share, or a full-quality update's.
+pub(crate) fn wait_budget(frame: f32, drafting: bool) -> std::time::Duration {
+    let frame = frame.clamp(1.0 / 240.0, 1.0 / 30.0);
+    let share = if drafting { DRAFT_WAIT_SHARE } else { FULL_WAIT_SHARE };
+    // (a frame time that is not a number waits for nothing)
+    std::time::Duration::try_from_secs_f32(frame * share).unwrap_or_default()
+}
 const TILE_RING_PRIORITY: u32 = 70;
 
 /// What of a `full` frame drawn in `rect` (points) is inside `visible`, in frame pixels.
@@ -582,8 +666,12 @@ pub(crate) fn request_window(
             app.window_refused = Some((c.id, c.look, frame_edge));
             return None;
         };
-        let geom = crate::render::WindowGeom { photo: c.id, full, window, look: c.look };
-        app.renderer.request_window(v.pane, job, geom, TILE_PRIORITY);
+        // (an HDR window drawn in its place, or on its way, needs no 8-bit draft as well)
+        if matches!(hdr_window(app, c, v, full), HdrPane::Sdr) {
+            let full_quality = job.request.quality == lcc_pipeline::Quality::Full;
+            let geom = crate::render::WindowGeom { photo: c.id, full, window, look: c.look, full_quality };
+            app.renderer.request_window(v.pane, job, geom, TILE_PRIORITY);
+        }
         wanted.push(Slot::Window(v.pane));
         return Some(crate::region::RegionView { photo: c.id, before: v.before, key: look, full, window, settings: look, tile: side });
     }
@@ -597,27 +685,66 @@ pub(crate) fn request_window(
     } else {
         1
     };
-    let placeholder =
-        c.full_preview.as_ref().filter(|p| !v.before && c.overlay == lcc_pipeline::Overlay::None && c.proof.is_none() && (p.width, p.height) == full);
+    // the part of the frame on screen: the tiles that cover it
     let mut cover: Option<(usize, usize, usize, usize)> = None;
+    for rect in tiles.iter().filter(|t| t.1).filter_map(|t| crate::region::tile_rect(full, side, t.0)) {
+        let (x1, y1) = (rect.x + rect.w, rect.y + rect.h);
+        cover = Some(cover.map_or((rect.x, rect.y, x1, y1), |(a, b, cc, d)| (a.min(rect.x), b.min(rect.y), cc.max(x1), d.max(y1))));
+    }
+    let (x0, y0, x1, y1) = cover?;
+    let window = lcc_engine::pipeline::PixelWindow { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    // an HDR edit shown in HDR: its HDR window (or the whole frame's HDR until it comes) is what
+    // shows, so no 8-bit tiles are rendered beside it (they would only hold it up)
+    let sdr = matches!(hdr_window(app, c, v, full), HdrPane::Sdr);
+    if !sdr {
+        budget = 0;
+    }
+    // After an edit here (a slider let go, a preset): the part on screen once more as one window
+    // at full quality, in the pane's own slot, whose stage cache the drag kept warm, in place of a
+    // render for each tile on screen, each from the original with no stage cache (a release took
+    // 0.2-4.9 s). A high quality drag's last update is that window already. The ring of tiles
+    // around it is still prepared for a pan, and a pan past the window tiles as before.
+    let vis = visible_px(full, v.target, v.visible);
+    let mut window_stands_in = false;
+    if sdr && let Some((_, g)) = app.renderer.window_texture(v.pane).filter(|(_, g)| g.photo == c.id && g.full == full) {
+        let covers = |w: lcc_engine::pipeline::PixelWindow| {
+            w.x as f32 <= vis.0.max(0.0)
+                && w.y as f32 <= vis.1.max(0.0)
+                && (w.x + w.w) as f32 >= vis.2.min(full.0 as f32)
+                && (w.y + w.h) as f32 >= vis.3.min(full.1 as f32)
+        };
+        if g.look == c.look && g.full_quality && covers(g.window) {
+            window_stands_in = true;
+        } else if (g.look != c.look || !g.full_quality)
+            && let Some(window) = crate::region::window_for(full.0, full.1, vis, crate::region::max_span(c.texture_side))
+            && let Some(job) = job_for(app, window)
+        {
+            let geom = crate::render::WindowGeom { photo: c.id, full, window, look: c.look, full_quality: true };
+            app.renderer.request_window(v.pane, job, geom, TILE_PRIORITY + 1);
+            // (the tiles on screen wait for it; if it fails, they render)
+            window_stands_in = app.renderer.failure_of(Slot::Window(v.pane), c.id).is_none();
+        }
+        wanted.push(Slot::Window(v.pane));
+    }
+    let placeholder = c
+        .full_preview
+        .as_ref()
+        .filter(|p| budget > 0 && !v.before && c.overlay == lcc_pipeline::Overlay::None && c.proof.is_none() && (p.width, p.height) == full);
     for &(tile, on_screen) in &tiles {
         let Some(rect) = crate::region::tile_rect(full, side, tile) else { continue };
         let key = crate::region::TileKey { photo: c.id, pane: v.pane, full, tile, look };
-        if on_screen {
-            let (x1, y1) = (rect.x + rect.w, rect.y + rect.h);
-            cover = Some(cover.map_or((rect.x, rect.y, x1, y1), |(a, b, cc, d)| (a.min(rect.x), b.min(rect.y), cc.max(x1), d.max(y1))));
-            if let Some(p) = placeholder
-                && !c.interacting
-                && let Some(part) = crate::region::crop_tile(p, lcc_engine::pipeline::PixelWindow { x: 0, y: 0, w: p.width, h: p.height }, rect)
-            {
-                app.renderer.tile_placeholder(ctx, key, &part);
-            }
+        if on_screen
+            && let Some(p) = placeholder
+            && !c.interacting
+            && let Some(part) = crate::region::crop_tile(p, lcc_engine::pipeline::PixelWindow { x: 0, y: 0, w: p.width, h: p.height }, rect)
+        {
+            app.renderer.tile_placeholder(ctx, key, &part);
         }
         if app.renderer.tiles.has_render(&key) {
             continue;
         }
         let slot = Slot::Tile { pane: v.pane, col: tile.col, row: tile.row };
-        if budget == 0 {
+        if budget == 0 || (on_screen && window_stands_in) {
             continue;
         }
         let window = crate::region::tile_render_window(full, rect);
@@ -631,42 +758,33 @@ pub(crate) fn request_window(
         wanted.push(slot);
         app.renderer.request_tile(key, job, window, rect, if on_screen { TILE_PRIORITY } else { TILE_RING_PRIORITY });
     }
-    let (x0, y0, x1, y1) = cover?;
-    let window = lcc_engine::pipeline::PixelWindow { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     Some(crate::region::RegionView { photo: c.id, before: v.before, key: look, full, window, settings: look, tile: side })
 }
 
 /// Draw the tiles of `view` that are on screen over the whole-frame render: each its own render,
 /// or (in a drag) the newest of its place, or its part of the 1:1 preview. The pane's drag window
-/// goes under them while it shows the current settings, and alone while a slider drags.
+/// goes under them while it shows the current settings, and alone while a slider drags. An HDR
+/// edit on an HDR display draws its HDR window ([`hdr_window`]) instead, and nothing while that
+/// is on its way: the whole frame's HDR render under it shows, softer but just as bright.
 pub(crate) fn draw_window(p: &egui::Painter, app: &mut LccApp, c: &WindowCtx, v: &WindowView, view: &crate::region::RegionView) {
-    // Keep the whole-frame HDR underlay visible until the float window is ready.
-    // Painting SDR tiles over it would reintroduce the brightness transition on resize/release.
-    let hdr_view = if v.before {
-        crate::render::HDR_BEFORE
-    } else if v.pane >= crate::render::PANE_COMPARE {
-        crate::render::HDR_COMPARE.saturating_add(v.pane - crate::render::PANE_COMPARE)
-    } else {
-        crate::render::HDR_LOUPE
-    };
-    if hdr_shown(app)
-        && !app.headless_screenshotting
-        && (v.before || (c.overlay == lcc_pipeline::Overlay::None && c.proof.is_none()))
-        && app
-            .session
-            .catalog
-            .photo(c.id)
-            .is_some_and(|photo| if v.before { app.session.before_settings(photo).hdr.enabled } else { photo.develop.hdr.enabled })
-        && app.renderer.hdr_view.get(&hdr_view).is_some_and(|h| h.photo == c.id)
-    {
-        return;
-    }
     let full = view.full;
     let (fw, fh) = (full.0 as f32, full.1 as f32);
     let place = |w: lcc_engine::pipeline::PixelWindow| {
         let at = v.img.min + vec2(w.x as f32 / fw * v.img.width(), w.y as f32 / fh * v.img.height());
         Rect::from_min_size(at, vec2(w.w as f32 / fw * v.img.width(), w.h as f32 / fh * v.img.height()))
     };
+    if view.photo == c.id {
+        match hdr_window(app, c, v, full) {
+            // (an older window, while the new one renders, where it belongs: after a pan only the
+            // part newly on screen is soft)
+            HdrPane::Frame(tex) => {
+                p.image(tex.tex, place(tex.window.unwrap_or(view.window)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                return;
+            }
+            HdrPane::Pending => return,
+            HdrPane::Sdr => {}
+        }
+    }
     let mut drag_drawn = false;
     if let Some((tex, g)) = app.renderer.window_texture(v.pane)
         && g.photo == c.id
@@ -719,6 +837,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
         return;
     };
     let Some(photo) = app.session.catalog.photo(id).cloned() else { return };
+    brief_info(app, ui.ctx(), id);
     let d = (*photo.develop).clone();
     // the full-screen preview shows the photo only: no tool overlays
     let right = if fullscreen { RightPanel::None } else { app.ui.right };
@@ -776,7 +895,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     let mut navigating = false;
     for &view_area in &areas {
         let view_img = in_pane(view_area, img_rect);
-        if navigate_gesture(app, ui, &resp, view_area, view_img, native) {
+        if navigate_gesture(app, ui, &resp, view_area, view_img, native) || middle_pan(app, ui, &resp, view_area, view_img) {
             navigating = true;
             target_rect = fit_rect(main_area, display_aspect, app.ui.zoom, native, ppp, app.ui.pan);
             img_rect = target_rect;
@@ -818,10 +937,18 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     // (a drag that fell back is one drag for `DragScale` across its pauses, so its draft size holds)
     let draft_drag = interacting && (!hq || app.hq_drag.fell_back());
     let overlay = view_overlay(app, &d, ui.input(|i| i.modifiers.alt));
+    // an overlay hidden while a mask slider worked comes back once it rests, input or not
+    if let Some(left) = app.ui.mask_adjusting_until.map(|t| t.saturating_duration_since(std::time::Instant::now())).filter(|d| !d.is_zero()) {
+        ui.ctx().request_repaint_after(left);
+    }
     // a drag drafts at full size where the GPU draws the view (by the GPU's own rule, `handles`;
     // `ready` first: `available` would wait for a device still being created)
     let gpu = draft_drag
-        && lcc_engine::gpu::handles(lcc_pipeline::OutputDepth::U8, app.ui.soft_proof, overlay)
+        && lcc_engine::gpu::handles(
+            lcc_pipeline::OutputDepth::U8,
+            app.ui.soft_proof && lcc_pipeline::proof_profile(app.ui.proof.profile).is_some(),
+            overlay,
+        )
         && lcc_engine::gpu::ready()
         && lcc_engine::gpu::available();
     let shown = app.renderer.textures.get(&Slot::Main).filter(|t| t.photo == id && t.quick.is_none()).map(|t| (t.key, t.ms));
@@ -888,49 +1015,45 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     // copied 1:1 (no resample in the pipeline, whose prefilter and bilinear pass soften detail near
     // the output's limit) and shrunk once, by the Lanczos display fit below.
     // (zoomed in under a window render, the whole frame is hidden: it stays canvas-sized)
-    let want = if drafting || plan.window_edge.is_some() {
-        plan.main_edge
-    } else {
-        // (a user's explicit Preview size below the preview level still caps it)
-        let limit = if app.ui.settings.preview_limit == 0 { usize::MAX } else { app.ui.settings.preview_limit as usize };
-        let floor = lcc_engine::SourceLevel::Preview.max_edge().min(limit).min(native_long);
-        plan.main_edge.max(floor).min(texture_side.max(crate::state::MIN_TEXTURE_SIDE))
-    };
-    // The short side is rounded, not truncated: a truncated box (2560 x 1706 for a 2560 x 1707
-    // source) made the render a slightly anisotropic resample of its source, a 2-tap blur along
-    // one axis only. A box that matches the source to rounding is rendered at exactly its size.
-    let short = |e: usize, a: f32| ((e as f32 / a).round() as usize).max(1);
-    let (rw, rh) = if aspect >= 1.0 { (want, short(want, aspect)) } else { (short(want, 1.0 / aspect), want) };
+    let want =
+        if drafting || plan.window_edge.is_some() { plan.main_edge } else { rest_edge(&app.ui.settings, plan.main_edge, native_long, texture_side) };
+    let (rw, rh) = render_box(want, aspect);
     // hover and before renders are stand-ins: the preview size is plenty and keeps them cheap
-    let se = app.ui.settings.stand_in_edge(want, texture_side);
-    let (sw, sh) = if aspect >= 1.0 { (se, short(se, aspect)) } else { (short(se, 1.0 / aspect), se) };
-    if let Some(job) = app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool) {
-        let job = if drafting { job.draft() } else { job };
-        // at rest the render is shrunk to exactly the size it is drawn at with a Lanczos filter on
-        // the worker, so the window draws it texel for texel instead of shrinking it with 2-tap
-        // sampling (the render is up to a 64 px step larger, or the preview level)
-        let job = if drafting { job } else { job.with_display_fit(fit_px[0], fit_px[1]) };
-        let job = job.with_overlay(overlay).with_proof(app.ui.soft_proof.then_some(app.ui.proof));
-        let job = job.with_hidden_grading(app.ui.grading_hidden_for(id));
-        app.renderer.request(Slot::Main, job, 100);
-        // a drag's draft that renders in a few ms (GPU) is drawn in this frame, not the next (zoomed
-        // in, what changes on screen is the window's draft)
-        // (a high quality update the GPU renders as fast is drawn at once too; a slow one returns
-        // at once: `wait_for_draft` waits only when the last render fits in the budget)
-        #[cfg(not(target_arch = "wasm32"))]
-        if interacting && plan.window_edge.is_none() {
-            let frame = ui.input(|i| i.predicted_dt).clamp(1.0 / 240.0, 1.0 / 30.0);
-            // (a frame time that is not a number waits for nothing)
-            let budget = std::time::Duration::try_from_secs_f32(frame * 0.4).unwrap_or_default();
-            app.renderer.wait_for_draft(ui.ctx(), &mut app.session, budget);
-        }
-    }
+    let (sw, sh) = render_box(app.ui.settings.stand_in_edge(want, texture_side), aspect);
     // an HDR display: an HDR edit's whole frame also as linear float with its highlights above
     // SDR white, including interactive drafts. Overlays and soft proof remain 8-bit views.
     let hdr_key = (overlay == lcc_pipeline::Overlay::None && !app.ui.soft_proof)
         .then(|| app.session.render_job(id, rw.max(8), rh.max(8), false, !crop_tool))
         .flatten()
-        .and_then(|job| request_hdr(app, crate::render::HDR_LOUPE, job.with_hidden_grading(app.ui.grading_hidden_for(id)), 98));
+        .and_then(|job| request_hdr(app, crate::render::HDR_LOUPE, job.with_hidden_grading(app.ui.grading_hidden_for(id)), true, 98));
+    upload_hdr_views(app);
+    // (a drag that shows its HDR frames needs no 8-bit drafts as well: the final render follows
+    // the release)
+    let hdr_drafts = interacting && hdr_texture(app, crate::render::HDR_LOUPE, id, hdr_key).is_some();
+    let main_job = if drafting {
+        app.session.loupe_job(id, rw.max(8), rh.max(8), !crop_tool).map(|job| {
+            let job = job.draft().with_overlay(overlay).with_proof(app.ui.soft_proof.then_some(app.ui.proof));
+            job.with_hidden_grading(app.ui.grading_hidden_for(id))
+        })
+    } else {
+        // (a high quality drag's updates leave their drawn-size image in the view cache: reading the
+        // full render back as well costs each update more than the fit saved; at rest it is kept)
+        rest_job(app, id, (rw, rh), fit_px, overlay, crop_tool).map(|job| if interacting { job.with_drawn_view_cache() } else { job })
+    };
+    if !hdr_drafts && let Some(job) = main_job {
+        app.renderer.request(Slot::Main, job, 100);
+        // a drag's draft that renders in a few ms (GPU) is drawn in this frame, not the next (zoomed
+        // in, what changes on screen is the window's draft)
+        // (a high quality update the GPU renders as fast is drawn at once too; a slow one returns
+        // at once: `wait_for_draft` waits only when the last render fits in the budget). A full-
+        // quality update (its fit done on the GPU, ~5 ms) gets more of the frame than a draft:
+        // the frame around it is cheap, and missing the frame cost every such update one more.
+        #[cfg(not(target_arch = "wasm32"))]
+        if interacting && plan.window_edge.is_none() {
+            let budget = wait_budget(ui.input(|i| i.predicted_dt), drafting);
+            app.renderer.wait_for_draft(ui.ctx(), &mut app.session, budget);
+        }
+    }
     // hovering a preset or profile: the photo with that look, shown instead of the loupe render
     // once it is ready (nothing is committed)
     let hover_key = match app.hover_preview.clone() {
@@ -955,14 +1078,53 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                 let Some(np) = app.session.catalog.photo(nid).cloned() else { continue };
                 let nf = Frame::with_lens(np.width.max(1) as usize, np.height.max(1) as usize, &np.develop, !crop_tool, np.embedded_lens.as_deref());
                 let na = nf.aspect() as f32;
-                let nr = fit_rect(main_area, na, app.ui.zoom, output_px(&nf), ppp, app.ui.pan);
-                let nw =
-                    app.ui.settings.prefetch_edge(nr.width().max(nr.height()) * ppp, output_px(&nf).into_iter().max().unwrap_or(1), texture_side);
-                let (w, h) = if na >= 1.0 { (nw, (nw as f32 / na) as usize) } else { ((nw as f32 * na) as usize, nw) };
-                if let Some(job) = app.session.loupe_job(nid, w.max(8), h.max(8), !crop_tool) {
+                let nnative = output_px(&nf);
+                let nlong = nnative[0].max(nnative[1]);
+                let nr = fit_rect(main_area, na, app.ui.zoom, nnative, ppp, app.ui.pan);
+                let nplan = crate::region::plan(
+                    &app.ui.settings,
+                    crate::region::ViewSizes { drawn_long: nr.width().max(nr.height()) * ppp, native_long: nlong, draft: None, ..sizes },
+                );
+                // at the whole-frame view: the very render the loupe asks for once that photo is
+                // shown, which it adopts at the step (`Renderer::prefetch`); zoomed in, its source
+                let job = if nplan.window_edge.is_none() {
+                    let fit = [drawn_px(nr.width()), drawn_px(nr.height())];
+                    let size = render_box(rest_edge(&app.ui.settings, nplan.main_edge, nlong, texture_side), na);
+                    rest_job(app, nid, size, fit, lcc_pipeline::Overlay::None, crop_tool)
+                } else {
+                    let (w, h) = render_box(app.ui.settings.prefetch_edge(nr.width().max(nr.height()) * ppp, nlong, texture_side), na);
+                    app.session.loupe_job(nid, w.max(8), h.max(8), !crop_tool)
+                };
+                if let Some(job) = job {
                     app.renderer.prefetch(Slot::Prefetch(n as u8), job, PREFETCH_PRIORITY);
                 }
             }
+        }
+    }
+    // After a short look at the whole photo, its full-resolution source, decoded in the background
+    // below the neighbours when nothing else is waiting, so a zoom to 1:1 (to check focus) starts
+    // from it instead of decoding first (0.2-2.7 s). The engine keeps one such source.
+    let whole = !interacting && plan.window_edge.is_none() && app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.photo == id);
+    if !whole {
+        app.whole_since = None;
+    } else {
+        let since = match app.whole_since {
+            Some((p, t)) if p == id => t,
+            _ => {
+                app.whole_since = Some((id, now));
+                now
+            }
+        };
+        if now - since >= WARM_FULL_AFTER_S
+            && native_long > lcc_engine::SourceLevel::Preview.max_edge()
+            && !app.session.media.has_source(id, lcc_engine::SourceLevel::Full)
+            && app.renderer.queued() == 0
+            && let Some(job) =
+                app.session.region_job(id, native[0], native[1], lcc_engine::pipeline::PixelWindow { x: 0, y: 0, w: 1, h: 1 }, !crop_tool)
+        {
+            app.renderer.prefetch(Slot::Prefetch(2), job, PREFETCH_PRIORITY - 1);
+        } else if now - since < WARM_FULL_AFTER_S {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((WARM_FULL_AFTER_S - (now - since)).max(0.05)));
         }
     }
     // until the loupe has this photo: show its cached render / embedded preview / a thumbnail
@@ -978,8 +1140,11 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     {
         // (the same display fit as the After view, so both panes are the same texture size)
         let job = if drafting { job } else { job.with_display_fit(fit_px[0], fit_px[1]) };
-        // (the Before is the photo without its edits: HDR only when those settings are HDR)
-        hdr_before_key = request_hdr(app, crate::render::HDR_BEFORE, job.clone(), 88);
+        // (the Before is the photo without its edits: HDR only when those settings are HDR. A drag
+        // doesn't change it: its HDR frame from before the drag stays, not rendered again at the
+        // drag's size and once more at the release)
+        let held = app.renderer.hdr_view.get(&crate::render::HDR_BEFORE).filter(|h| interacting && hdr_shown(app) && h.photo == id).map(|h| h.key);
+        hdr_before_key = held.or_else(|| request_hdr(app, crate::render::HDR_BEFORE, job.clone(), false, 88));
         app.renderer.request(Slot::Before, job, 90);
     }
     upload_hdr_views(app);
@@ -1172,9 +1337,10 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
                     );
                     p.text(canvas.center() + vec2(0.0, 12.0), Align2::CENTER_CENTER, e, t.font(12.0), t.text_dim);
                 }
-                None => {
+                None if app.ui.settings.loupe_messages => {
                     p.text(canvas.center(), Align2::CENTER_CENTER, crate::i18n::tr("Rendering…"), t.font(13.0), t.text_dim);
                 }
+                None => {}
             }
         }
     }
@@ -1223,7 +1389,6 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
         let mode = if show_before { BeforeAfter::Original } else { app.ui.before_after };
         let clip = crate::region::window_clip(mode, v.before, v.visible, canvas, img_rect);
         draw_window(&p.with_clip_rect(clip), app, &window_ctx, v, view);
-        draw_hdr_window(&p.with_clip_rect(clip), app, &window_ctx, v, view);
     }
     if let Some((bg, g)) = before_badge {
         p.rect_filled(bg, 4.0, Color32::from_black_alpha(160));
@@ -1348,13 +1513,17 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
         let over = if over.is_positive() { over } else { canvas };
         match failed {
             Some(e) => failed_pill(ui, app, &photo, canvas, over, nav, "loupe:renderFailed", e),
-            None => {
+            // View Options' Show message when loading or rendering photos
+            None if app.ui.settings.loupe_messages => {
                 loupe_pill(ui, canvas, over, nav, "loupe:rendering", crate::i18n::tr("Rendering…"), false);
             }
+            None => {}
         }
     }
     if let Some(why) = photo.preview_only.as_deref().filter(|_| !fullscreen) {
-        preview_only_pill(ui, canvas, why);
+        // (the Modern layout's buttons float over the canvas' top: below them)
+        let top = if crate::modern::on(app) { crate::modern::chrome_top(app) } else { 12.0 };
+        preview_only_pill(ui, canvas, why, top);
     }
     crate::widgets::context_menu(&resp, |ui| {
         if app.ui.right == RightPanel::Remove
@@ -1395,7 +1564,7 @@ fn label_badge_rect(photo: Rect, pane: Rect, text: egui::Vec2, top_inset: f32) -
 fn info_overlay(app: &LccApp, p: &egui::Painter, canvas: Rect, photo: &lcc_catalog::Photo, pill: Option<Rect>) {
     let Some(lines) = info_overlay_lines(app, photo) else { return };
     let t = Tokens::get(p.ctx());
-    let mut y = pill.map_or(canvas.top() + INFO_OVERLAY_TOP, |r| r.bottom() + INFO_OVERLAY_BELOW_PILL);
+    let mut y = pill.map_or(canvas.top() + info_overlay_top(app, &t), |r| r.bottom() + INFO_OVERLAY_BELOW_PILL);
     let start_y = pill.map_or(canvas.top(), |r| r.bottom() + 2.0);
     for (i, l) in lines.iter().enumerate() {
         // laid out uncoloured: `galley` only fills placeholder text with its colour, so a white
@@ -1407,10 +1576,12 @@ fn info_overlay(app: &LccApp, p: &egui::Painter, canvas: Rect, photo: &lcc_catal
         p.galley(at, g.clone(), Color32::WHITE);
         y += g.size().y + INFO_OVERLAY_GAP;
     }
+    y = overlay_badges(p, &t, pos2(canvas.left() + 14.0, y), photo);
     register(p.ctx(), "canvas:infoOverlay", Rect::from_min_max(pos2(canvas.left(), start_y), pos2(canvas.left() + 320.0, y)));
 }
 
-/// Where the info overlay's text starts below the canvas' top, and the gap after each line.
+/// Where the info overlay's text starts below the canvas' top (without window controls over it),
+/// and the gap after each line.
 const INFO_OVERLAY_TOP: f32 = 12.0;
 const INFO_OVERLAY_GAP: f32 = 3.0;
 /// Where the info overlay's text starts below the filter pill, when the pill shows (#266).
@@ -1421,20 +1592,31 @@ fn info_overlay_font(t: &Tokens, i: usize) -> egui::FontId {
     if i == 0 { t.semibold(15.0) } else { t.font(12.5) }
 }
 
-/// How far below the canvas' top the info overlay's text reaches (0 when it is off), so a label
-/// drawn in that corner can sit below it.
+/// How far below the canvas' top the info overlay's text and badges reach (0 when it is off), so a
+/// label drawn in that corner can sit below it.
 fn info_overlay_extent(app: &LccApp, p: &egui::Painter, photo: &lcc_catalog::Photo) -> f32 {
     let Some(lines) = info_overlay_lines(app, photo) else { return 0.0 };
     let t = Tokens::get(p.ctx());
-    lines.iter().enumerate().fold(INFO_OVERLAY_TOP, |y, (i, l)| {
+    let text = lines.iter().enumerate().fold(info_overlay_top(app, &t), |y, (i, l)| {
         y + p.layout_no_wrap(l.clone(), info_overlay_font(&t, i), Color32::PLACEHOLDER).size().y + INFO_OVERLAY_GAP
-    })
+    });
+    text + if has_overlay_badges(photo) { OVERLAY_BADGES_H } else { 0.0 }
+}
+
+/// Where the info overlay's text starts below the canvas' top: the full-screen preview has no top
+/// bar, so on macOS it starts below the window controls that sit over the photo there (#2460).
+fn info_overlay_top(app: &LccApp, t: &Tokens) -> f32 {
+    let controls = app.ui.fullscreen && app.integrated_titlebar && !app.window_is_fullscreen;
+    if controls { t.top_bar_h } else { INFO_OVERLAY_TOP }
 }
 
 /// The info overlay's lines for `photo`, or `None` when it is off.
 fn info_overlay_lines(app: &LccApp, photo: &lcc_catalog::Photo) -> Option<Vec<String>> {
     use crate::state::InfoOverlay;
-    let fields = match app.ui.info_overlay {
+    // with the overlay off, Show Briefly When Photo Changes shows its Info for a moment
+    let brief = app.ui.info_overlay == InfoOverlay::Off && app.ui.brief_info.shown;
+    let mode = if brief { app.ui.settings.loupe_info.briefly } else { app.ui.info_overlay };
+    let fields = match mode {
         InfoOverlay::Off => return None,
         InfoOverlay::Basic => &app.ui.settings.loupe_info.info1,
         InfoOverlay::Exposure => &app.ui.settings.loupe_info.info2,
@@ -1444,6 +1626,45 @@ fn info_overlay_lines(app: &LccApp, photo: &lcc_catalog::Photo) -> Option<Vec<St
         return None;
     }
     Some(lines)
+}
+
+/// The height of the info overlay's rating and flag row.
+const OVERLAY_BADGES_H: f32 = 17.0;
+
+fn has_overlay_badges(photo: &lcc_catalog::Photo) -> bool {
+    photo.rating > 0 || photo.flag != lcc_catalog::Flag::None
+}
+
+/// The star rating and flag under the info overlay's lines, when the photo has either; returns
+/// the y below them.
+fn overlay_badges(p: &egui::Painter, t: &Tokens, at: Pos2, photo: &lcc_catalog::Photo) -> f32 {
+    use crate::icons::{Icon, paint};
+    use lcc_catalog::Flag;
+    let flag = match photo.flag {
+        Flag::Pick => Some((Icon::FlagPickFilled, Color32::WHITE)),
+        Flag::Reject => Some((Icon::FlagReject, t.reject)),
+        Flag::None => None,
+    };
+    if !has_overlay_badges(photo) {
+        return at.y;
+    }
+    let stars = photo.rating.min(5);
+    let mut icons: Vec<(Icon, Color32)> = vec![(Icon::StarFilled, Color32::WHITE); stars as usize];
+    icons.extend(flag);
+    let side = 12.0;
+    let mut x = at.x;
+    for (i, (icon, color)) in icons.into_iter().enumerate() {
+        // the flag stands a little apart from the stars
+        if i > 0 && i == stars as usize {
+            x += 5.0;
+        }
+        let r = Rect::from_min_size(pos2(x, at.y + 1.0), vec2(side, side));
+        paint(p, r.translate(vec2(1.0, 1.0)), icon, Color32::from_black_alpha(200));
+        paint(p, r, icon, color);
+        x += side + 2.0;
+    }
+    register(p.ctx(), "canvas:infoOverlayBadges", Rect::from_min_max(at, pos2(x, at.y + side + 2.0)));
+    at.y + OVERLAY_BADGES_H
 }
 
 /// What the user did to a face box this frame.
@@ -1663,13 +1884,13 @@ fn filter_pill(app: &mut LccApp, ui: &mut egui::Ui, canvas: Rect) -> Option<Rect
 
 /// A raw shown from its embedded JPEG (issue #10): a pill at the canvas' top centre saying so;
 /// hovering it explains (registered as `notice:previewOnly:loupe`).
-fn preview_only_pill(ui: &mut egui::Ui, canvas: Rect, reason: &str) {
+fn preview_only_pill(ui: &mut egui::Ui, canvas: Rect, reason: &str, top: f32) {
     let t = Tokens::get(ui.ctx());
     let p = ui.painter_at(canvas);
     let text = crate::i18n::tr_format!("Preview only — editing the camera's embedded JPEG ({})", crate::widgets::preview_only_variant(reason));
     let g = p.layout_no_wrap(text, t.font(12.0), Color32::WHITE);
     let size = vec2(g.size().x + 40.0, 26.0);
-    let r = Rect::from_min_size(pos2(canvas.center().x - size.x / 2.0, canvas.top() + 12.0), size);
+    let r = Rect::from_min_size(pos2(canvas.center().x - size.x / 2.0, canvas.top().max(ui.ctx().content_rect().top()) + top), size);
     p.rect_filled(r, 13.0, Color32::from_black_alpha(185));
     crate::icons::paint(&p, Rect::from_center_size(pos2(r.left() + 16.0, r.center().y), vec2(15.0, 15.0)), crate::icons::Icon::Info, t.caution);
     p.galley(pos2(r.left() + 29.0, r.center().y - g.size().y / 2.0), g, Color32::WHITE);
@@ -1741,7 +1962,7 @@ fn navigator(app: &mut LccApp, ui: &mut egui::Ui, canvas: Rect, img: Rect, id: P
     p.rect_filled(frame.expand(5.0), 4.0, Color32::from_black_alpha(190));
     match tex {
         Some(t) => p.image(t.tex.id(), frame, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE),
-        None => p.rect_filled(frame, 0.0, Color32::from_gray(40)),
+        None => p.rect_filled(frame, 0.0, Tokens::get(ui.ctx()).skeleton),
     };
     // the visible part of the photo, in normalized image coordinates
     let vis = canvas.intersect(img);
@@ -1767,6 +1988,10 @@ fn navigator(app: &mut LccApp, ui: &mut egui::Ui, canvas: Rect, img: Rect, id: P
 
 /// Neighbour prefetch: below on-screen thumbnails, above background thumbnail refreshes.
 const PREFETCH_PRIORITY: u32 = 4;
+
+/// How long (s) the whole photo is shown before its full-resolution source is decoded in the
+/// background (a photographer stepping through photos doesn't decode each).
+pub(crate) const WARM_FULL_AFTER_S: f64 = 1.5;
 
 /// How long a render may be on its way, with nothing new on screen, before the loupe says
 /// "Rendering…" (s): as long as the activity stack waits before it shows a task.
@@ -1902,6 +2127,12 @@ pub(crate) fn hdr_shown(app: &LccApp) -> bool {
     app.hdr_headroom.is_some() && app.ui.hdr_preview
 }
 
+/// Whether photo `id`'s develop settings are being edited now (a slider drag): the views that
+/// show them draft, the others (its Before, other photos) keep their renders.
+pub(crate) fn editing(app: &LccApp, id: PhotoId) -> bool {
+    app.session.interaction.as_ref().is_some_and(|i| i.photo == id)
+}
+
 /// Whether a slider drag's renders are drafts now: always with high quality adjustment previews
 /// off; with them on, only while a drag that was too slow at full quality is moving
 /// ([`crate::region::HqDrag`], decided by the loupe each frame). `false` without a drag.
@@ -1911,20 +2142,28 @@ pub(crate) fn adjust_drafts(app: &LccApp) -> bool {
 }
 
 /// Ask for view `view`'s HDR render of `job` ([`hdr_view_job`]) when HDR edits show in HDR and
-/// `job` is one. Returns a key enabling [`hdr_texture`] while this view is HDR.
-pub(crate) fn request_hdr(app: &mut LccApp, view: u8, job: lcc_engine::media::RenderJob, priority: u32) -> Option<u64> {
+/// `job` is one, as a draft while `job` shows the settings being edited (`edited`: the job has
+/// the photo's own settings, not its Before). Returns the HDR job's key, which [`hdr_texture`]
+/// matches.
+pub(crate) fn request_hdr(app: &mut LccApp, view: u8, job: lcc_engine::media::RenderJob, edited: bool, priority: u32) -> Option<u64> {
     if !hdr_shown(app) || !job.settings.hdr.enabled {
         return None;
     }
     let headroom = app.services.hdr_output.as_mut().and_then(|o| o.headroom());
+    app.renderer.set_hdr_headroom(headroom);
     // (an extended-linear surface takes sRGB: no monitor profile conversion)
     if let Some(o) = app.services.hdr_output.as_ref() {
         app.renderer.set_surface_extended_linear(o.extended());
     }
-    let job = if adjust_drafts(app) { job.draft() } else { job };
-    let job = hdr_view_job(job, headroom);
+    let job = if edited && editing(app, job.photo) && adjust_drafts(app) { job.draft() } else { job };
+    let mut job = hdr_view_job(job, headroom);
+    // (on the GPU its texture's texels are made there, for the headroom the output uploads with)
+    job.hdr_texels = app.services.hdr_output.as_ref().and_then(|o| o.texel_headroom());
     app.renderer.prepare_hdr_view(view, &job);
     let key = job.key;
+    if app.renderer.hdr_view.get(&view).is_some_and(|v| v.key != key) && app.renderer.reuse_hdr(view, key) {
+        return Some(key);
+    }
     if app.renderer.hdr_view.get(&view).is_none_or(|v| v.key != key) || app.renderer.wanted(Slot::HdrView(view)).is_some_and(|pending| pending != key)
     {
         app.renderer.request(Slot::HdrView(view), job, priority);
@@ -1932,14 +2171,15 @@ pub(crate) fn request_hdr(app: &mut LccApp, view: u8, job: lcc_engine::media::Re
     Some(key)
 }
 
-/// Keep the last compatible HDR frame while the requested update renders (none in
-/// headless screenshots: the texture lives on the GPU only, so they show the 8-bit render).
+/// View `view`'s HDR texture of photo `photo` for the render `key` asked for, or the frame
+/// before it while that renders ([`crate::render::Renderer::hdr_frame`]; none in headless
+/// screenshots: the texture lives on the GPU only, so they show the 8-bit render).
 pub(crate) fn hdr_texture(app: &LccApp, view: u8, photo: PhotoId, key: Option<u64>) -> Option<crate::render::HdrView> {
-    key?;
+    let key = key?;
     if app.headless_screenshotting {
         return None;
     }
-    app.renderer.hdr_view.get(&view).copied().filter(|v| v.photo == photo)
+    app.renderer.hdr_frame(view, photo, key)
 }
 
 /// Hand the finished [`Slot::HdrView`] renders to the window's HDR output, each as its view's texture.
@@ -1949,60 +2189,122 @@ pub(crate) fn upload_hdr_views(app: &mut LccApp) {
     }
     let results = std::mem::take(&mut app.renderer.hdr_view_result);
     let Some(out) = app.services.hdr_output.as_mut() else { return };
-    for (view, (photo, key, deep)) in results {
-        let lcc_pipeline::DeepSamples::F32(rgb) = &deep.samples else { continue };
-        match out.upload(view, deep.width, deep.height, rgb) {
+    for (view, crate::render::HdrResult { photo, key, size, deep, window, texels }) in results {
+        let slot = app.renderer.hdr_upload_slot(view, window);
+        // (texels the worker or the GPU made, when they are for the headroom the output uploads
+        // with; else the floats)
+        let ready = texels.and_then(|(t, h)| out.upload_texels(slot, size[0], size[1], &t, h));
+        let uploaded = match (ready, deep.as_ref().map(|d| &d.samples)) {
+            (Some(r), _) => r,
+            (None, Some(lcc_pipeline::DeepSamples::F32(rgb))) => out.upload(slot, size[0], size[1], rgb),
+            // (the GPU's texels, for a headroom the output no longer uploads with: the view keeps
+            // the frame it has until its next render)
+            _ => {
+                log::debug!("HDR view {view}: texels for another headroom and no floats; kept the frame before");
+                continue;
+            }
+        };
+        match uploaded {
             Ok(tex) => {
-                app.renderer.hdr_view.insert(view, crate::render::HdrView { photo, key, tex, size: [deep.width, deep.height] });
+                app.renderer.adopt_hdr(view, crate::render::HdrView { photo, key, tex, size, window, slot });
             }
             Err(e) => log::warn!("HDR view texture: {e}"),
         }
     }
 }
 
-/// A zoomed view of an HDR edit on an HDR display: the part of the frame on screen
-/// (`view.window`, at the zoomed scale) rendered once more as linear float and drawn over its
-/// 8-bit tiles, including during slider drags. Overlays and soft proof remain 8-bit views.
-pub(crate) fn draw_hdr_window(p: &egui::Painter, app: &mut LccApp, c: &WindowCtx, v: &WindowView, view: &crate::region::RegionView) {
-    if !hdr_shown(app) || c.holding || view.photo != c.id {
-        return;
+/// What a zoomed pane of an HDR edit shows on an HDR display ([`hdr_window`]).
+pub(crate) enum HdrPane {
+    /// Its HDR window, or while that updates the one before it (drawn at its own place).
+    Frame(crate::render::HdrView),
+    /// Its HDR window is on its way: meanwhile the whole frame's HDR render under it shows
+    /// (softer, never an 8-bit frame of another brightness).
+    Pending,
+    /// Not in HDR (an 8-bit view, HDR Preview off, an SDR edit, a pinch, a failed render, no HDR
+    /// whole frame under it yet): its 8-bit tiles.
+    Sdr,
+}
+
+/// A zoomed view of an HDR edit on an HDR display: the part of the `full` frame on screen (the
+/// window a drag renders, [`crate::region::window_for`]: the same at rest and in a drag, and no
+/// bigger, since each update is a texture the UI thread copies to the GPU) rendered once more as
+/// linear float, drawn in place of its 8-bit tiles so highlights go above SDR white zoomed in
+/// too, including during slider drags. A window it showed before comes back at once
+/// ([`Renderer::reuse_hdr`]).
+///
+/// [`Renderer::reuse_hdr`]: crate::render::Renderer::reuse_hdr
+pub(crate) fn hdr_window(app: &mut LccApp, c: &WindowCtx, v: &WindowView, full: (usize, usize)) -> HdrPane {
+    if !hdr_shown(app) || c.holding || app.headless_screenshotting {
+        return HdrPane::Sdr;
     }
     if !v.before && (c.overlay != lcc_pipeline::Overlay::None || c.proof.is_some()) {
-        return;
+        return HdrPane::Sdr;
     }
-    let win = view.window;
+    let Some(win) = crate::region::window_for(full.0, full.1, visible_px(full, v.target, v.visible), crate::region::max_span(c.texture_side)) else {
+        return HdrPane::Sdr;
+    };
     // (one texture: no bigger than the GPU takes)
     if win.w == 0 || win.h == 0 || win.w.max(win.h) > c.texture_side {
-        return;
+        return HdrPane::Sdr;
     }
     let job = if v.before {
-        app.session.region_job_before(c.id, view.full.0, view.full.1, win, !c.crop_tool)
+        app.session.region_job_before(c.id, full.0, full.1, win, !c.crop_tool)
     } else {
-        app.session.region_job(c.id, view.full.0, view.full.1, win, !c.crop_tool).map(|j| j.with_hidden_grading(app.ui.grading_hidden_for(c.id)))
+        app.session.region_job(c.id, full.0, full.1, win, !c.crop_tool).map(|j| j.with_hidden_grading(app.ui.grading_hidden_for(c.id)))
     };
-    let Some(job) = job else { return };
+    let Some(job) = job else { return HdrPane::Sdr };
     let hdr_view = crate::render::HDR_ZOOMED.saturating_add(v.pane);
-    let key = request_hdr(app, hdr_view, job, TILE_PRIORITY.saturating_sub(1));
+    // (above the tiles: it is what shows)
+    let Some(key) = request_hdr(app, hdr_view, job, !v.before, TILE_PRIORITY.saturating_add(1)) else { return HdrPane::Sdr };
     upload_hdr_views(app);
-    let Some(tex) = hdr_texture(app, hdr_view, c.id, key) else { return };
-    let (fw, fh) = (view.full.0.max(1) as f32, view.full.1.max(1) as f32);
-    let at = v.img.min + vec2(win.x as f32 / fw * v.img.width(), win.y as f32 / fh * v.img.height());
-    let r = Rect::from_min_size(at, vec2(win.w as f32 / fw * v.img.width(), win.h as f32 / fh * v.img.height()));
-    p.image(tex.tex, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    if let Some(frame) = hdr_texture(app, hdr_view, c.id, Some(key)) {
+        return HdrPane::Frame(frame);
+    }
+    let slot = Slot::HdrView(hdr_view);
+    // the whole frame's HDR render this pane is drawn over
+    let under = match v.pane {
+        crate::render::PANE_AFTER => crate::render::HDR_LOUPE,
+        crate::render::PANE_BEFORE => crate::render::HDR_BEFORE,
+        pane => crate::render::HDR_COMPARE.saturating_add(pane.saturating_sub(crate::render::PANE_COMPARE)),
+    };
+    let underlay = app.renderer.hdr_view.get(&under).is_some_and(|h| h.photo == c.id);
+    if underlay && app.renderer.is_pending(slot) && app.renderer.failed_key(slot) != Some(key) { HdrPane::Pending } else { HdrPane::Sdr }
 }
 
 /// The diagnostic overlay the loupe shows (the selected mask, Point Color's visualized range,
 /// Visualize Spots, Visualize HDR, and the clipping overlay: J's per-pixel red/blue tint, or the
 /// black/white clipping mask while ⌥/Alt-dragging a global tone slider).
+/// Whether a mask has settings: an effect on the photo to judge. A mask without any shows its
+/// overlay by itself, so what it selects can be seen (upstream PR 2920's overlay rule).
+pub(crate) fn mask_has_settings(m: &lcc_develop::Mask) -> bool {
+    m.adjust != lcc_develop::LocalAdjustments::default() || !m.curve.is_identity()
+}
+
 pub(crate) fn view_overlay(app: &LccApp, d: &DevelopSettings, alt_held: bool) -> lcc_pipeline::Overlay {
     use lcc_pipeline::{MaskView, Overlay};
     if app.ui.fullscreen {
+        return Overlay::None;
+    }
+    // While a mask slider is at work nothing covers the photo: its effect is what is being judged.
+    if app.ui.right == RightPanel::Masking && app.ui.mask_adjusting_until.is_some_and(|t| std::time::Instant::now() < t) {
         return Overlay::None;
     }
     // Show every visible mask's region at once (Ctrl+Shift+O / Cmd+Shift+O), ahead of the selected-mask overlay
     // so the shortcut is not shadowed by the always-on single-mask overlay.
     if app.ui.right == RightPanel::Masking && app.ui.mask_overlay_all && d.masks.iter().any(|m| m.visible && !m.components.is_empty()) {
         return Overlay::AllMasks {
+            view: MaskView::parse(&app.ui.mask_overlay_mode).unwrap_or_default(),
+            color: app.ui.mask_overlay_color,
+            opacity: app.ui.mask_overlay_opacity.clamp(0.0, 100.0).round() as u8,
+        };
+    }
+    // the pointer on a mask's row in the list shows what that mask selects
+    if app.ui.right == RightPanel::Masking
+        && let Some(m) = app.ui.mask_hover.and_then(|id| d.masks.iter().find(|m| m.id == id))
+        && !m.components.is_empty()
+    {
+        return Overlay::Mask {
+            id: m.id.min(u16::MAX as u32) as u16,
             view: MaskView::parse(&app.ui.mask_overlay_mode).unwrap_or_default(),
             color: app.ui.mask_overlay_color,
             opacity: app.ui.mask_overlay_opacity.clamp(0.0, 100.0).round() as u8,
@@ -3725,7 +4027,7 @@ fn eye_overlay(app: &mut LccApp, ui: &mut egui::Ui, resp: &egui::Response, map: 
     let o = map.screen(Point::new(0.0, 0.0));
     let (sx, sy) = (map.screen(Point::new(1.0, 0.0)).distance(o), map.screen(Point::new(0.0, 1.0)).distance(o));
     let per_long = sx.max(sy);
-    let p = ui.painter();
+    let p = ui.painter().clone();
     for (i, e) in d.red_eye.iter().enumerate() {
         let c = map.screen(e.center);
         let r = vec2(e.rx as f32 * per_long, e.ry as f32 * per_long);
@@ -3734,6 +4036,9 @@ fn eye_overlay(app: &mut LccApp, ui: &mut egui::Ui, resp: &egui::Response, map: 
         p.add(egui::Shape::ellipse_stroke(c, r, Stroke::new(if sel { 1.5 } else { 1.0 }, col)));
         p.line_segment([c - vec2(4.0, 0.0), c + vec2(4.0, 0.0)], Stroke::new(1.0, col));
         p.line_segment([c - vec2(0.0, 4.0), c + vec2(0.0, 4.0)], Stroke::new(1.0, col));
+    }
+    if eye_keys(app, ui, map, d, per_long) {
+        return;
     }
     if resp.hover_pos().is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -3773,6 +4078,69 @@ fn eye_overlay(app: &mut LccApp, ui: &mut egui::Ui, resp: &egui::Response, map: 
     {
         app.ui.eye = i;
     }
+}
+
+/// Keyboard stand-ins for the Red Eye tool: each correction's centre (the arrows move it), its
+/// right edge (left / right change its width) and bottom edge (up / down its height), one undo
+/// step a press; focusing one selects it, so Delete removes it. A placement point that the arrows
+/// move turns into a new correction of the default size on Return. True when one was added.
+fn eye_keys(app: &mut LccApp, ui: &mut egui::Ui, map: &CanvasMap, d: &DevelopSettings, per_long: f32) -> bool {
+    for (i, e) in d.red_eye.iter().enumerate() {
+        let c = map.screen(e.center);
+        let name = format!("{} {}", crate::i18n::tr(if e.pet { "Pet Eye" } else { "Red Eye" }), i + 1);
+        let value = format!(
+            "{}, {} {:.0}%, {} {:.0}%",
+            crate::canvas_keys::position_text(e.center.x, e.center.y),
+            crate::i18n::tr("width"),
+            e.rx * 200.0,
+            crate::i18n::tr("height"),
+            e.ry * 200.0
+        );
+        let parts = [
+            ("", format!("eye:{i}"), c),
+            ("right edge", format!("eye:{i}:width"), c + vec2(e.rx as f32 * per_long, 0.0)),
+            ("bottom edge", format!("eye:{i}:height"), c + vec2(0.0, e.ry as f32 * per_long)),
+        ];
+        for (k, (part, key, at)) in parts.into_iter().enumerate() {
+            let label = if part.is_empty() { name.clone() } else { format!("{name} {}", crate::i18n::tr(part)) };
+            let keys = crate::canvas_keys::handle(ui, &key, &label, value.clone(), at);
+            if ui.memory(|m| m.has_focus(crate::canvas_keys::id(&key))) {
+                app.ui.eye = i;
+            }
+            let Some((dx, dy)) = keys.delta else { continue };
+            let params = match k {
+                0 => json!({"index": i, "move": [dx, dy]}),
+                1 => json!({"index": i, "rx": e.rx + dx}),
+                _ => json!({"index": i, "ry": e.ry + dy}),
+            };
+            let _ = app.run("develop.beginInteraction", json!({"label": "Edit Red Eye"}));
+            let _ = app.run("redeye.update", params);
+            let _ = app.run("develop.endInteraction", json!({}));
+        }
+    }
+    // where a new correction goes: the photo's centre at first, then wherever the arrows took it
+    let key = egui::Id::new("lc-eye-placement");
+    let place: (f64, f64) = ui.data(|m| m.get_temp(key)).unwrap_or((0.5, 0.5));
+    let q = map.screen(Point::new(place.0, place.1));
+    let keys = crate::canvas_keys::handle(
+        ui,
+        "eye:new",
+        crate::i18n::tr("New red eye correction (Return adds it here)"),
+        crate::canvas_keys::position_text(place.0, place.1),
+        q,
+    );
+    if let Some((dx, dy)) = keys.delta {
+        let moved = ((place.0 + dx).clamp(0.0, 1.0), (place.1 + dy).clamp(0.0, 1.0));
+        ui.data_mut(|m| m.insert_temp(key, moved));
+    }
+    if keys.activated {
+        let r = app.run("redeye.add", json!({"center": [place.0, place.1], "pet": app.ui.eye_pet}));
+        if let Ok(v) = r {
+            app.ui.eye = v["index"].as_u64().unwrap_or(0) as usize;
+        }
+        return true;
+    }
+    false
 }
 
 // ------------------------------------------------------------------------ filmstrip
@@ -3902,7 +4270,8 @@ pub(crate) fn filmstrip(app: &mut LccApp, ui: &mut egui::Ui, r: Rect) {
             // in a regular album they are dragged along the strip to put them in Custom Order
             let reorder = !map && super::grid::custom_order_album(app).is_some();
             let resp = ui.interact(cr, egui::Id::new(("film", id.0)), if map || reorder { Sense::click_and_drag() } else { Sense::click() });
-            crate::widgets::announce(&resp, app.session.catalog.photo(*id).map(|p| p.file_name.clone()).unwrap_or_default());
+            let failed = app.renderer.thumb(*id).is_none() && app.renderer.failure(Slot::Thumb(*id)).is_some();
+            crate::widgets::announce(&resp, film_spoken(app.session.catalog.photo(*id).map_or("", |p| p.file_name.as_str()), failed));
             if (map || reorder) && resp.drag_started() {
                 if !app.session.selection.contains(*id) {
                     let _ = app.run("library.select", json!({"ids": [id.0]}));
@@ -3913,7 +4282,6 @@ pub(crate) fn filmstrip(app: &mut LccApp, ui: &mut egui::Ui, r: Rect) {
             }
             register(ui.ctx(), format!("film:{}", id.0), cr);
             let state = app.session.selection.state_of(*id);
-            let sel = state == lcc_engine::SelectionState::Active;
             let p = ui.painter();
             let label = app.session.catalog.photo(*id).and_then(|ph| ph.label);
             let selected = state != lcc_engine::SelectionState::NotSelected;
@@ -3933,16 +4301,19 @@ pub(crate) fn filmstrip(app: &mut LccApp, ui: &mut egui::Ui, r: Rect) {
             }
             let img_area = Rect::from_min_max(cr.min + vec2(10.0, 22.0), cr.max - vec2(10.0, 8.0));
             super::grid::request_thumb(app, *id, (256.0 * ppp.min(2.0) / 2.0) as usize * 2, 8);
-            if let Some(tex) = app.renderer.thumb(*id) {
+            let thumb = app.renderer.thumb(*id);
+            if thumb.is_none() {
+                p.rect_filled(img_area, 0.0, t.skeleton);
+                if failed {
+                    p.text(img_area.center(), Align2::CENTER_CENTER, "!", t.semibold(14.0), t.text);
+                }
+            }
+            if let Some(tex) = thumb {
                 let [tw, th] = tex.size;
                 let s = (img_area.width() / tw as f32).min(img_area.height() / th as f32);
                 let fr = Rect::from_center_size(img_area.center(), vec2(tw as f32 * s, th as f32 * s));
                 p.image(tex.tex.id(), fr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                if sel {
-                    p.rect_stroke(fr, 0.0, Stroke::new(1.5, Color32::WHITE), StrokeKind::Outside);
-                } else if state == lcc_engine::SelectionState::Selected {
-                    p.rect_stroke(fr, 0.0, Stroke::new(1.5, Color32::from_gray(170)), StrokeKind::Outside);
-                }
+                super::grid::selection_ring(p, &t, fr, state);
                 if app.ui.settings.film_badges
                     && let Some(ph) = app.session.catalog.photo(*id)
                 {
@@ -4001,6 +4372,17 @@ pub(crate) fn filmstrip(app: &mut LccApp, ui: &mut egui::Ui, r: Rect) {
     });
 }
 
+/// What a screen reader says for a filmstrip thumbnail: the file, and why there is no picture
+/// when the thumbnail failed (the painted `!` has no name of its own). The name is empty when the
+/// catalog no longer has the photo (or its file name is blank); the reason then stands alone.
+pub(crate) fn film_spoken(file_name: &str, failed: bool) -> String {
+    match (file_name.is_empty(), failed) {
+        (_, false) => file_name.to_string(),
+        (true, true) => crate::i18n::tr("This photo can't be opened").to_string(),
+        (false, true) => format!("{file_name}, {}", crate::i18n::tr("This photo can't be opened")),
+    }
+}
+
 /// Rating, flag and edited badges along a filmstrip thumbnail's bottom edge (Settings → Interface).
 fn film_badges(p: &egui::Painter, t: &Tokens, fr: Rect, ph: &lcc_catalog::Photo) {
     use crate::icons::{Icon, paint};
@@ -4013,10 +4395,7 @@ fn film_badges(p: &egui::Painter, t: &Tokens, fr: Rect, ph: &lcc_catalog::Photo)
     p.rect_filled(bar, 0.0, Color32::from_black_alpha(130));
     let y = bar.center().y;
     let mut x = bar.left() + 3.0;
-    for i in 0..ph.rating {
-        paint(p, Rect::from_min_size(pos2(x + i as f32 * 9.0, y - 4.0), vec2(8.0, 8.0)), Icon::StarFilled, t.star);
-    }
-    x += ph.rating as f32 * 9.0 + 2.0;
+    x += crate::rating::paint_rating(p, pos2(x, y), ph.rating, crate::rating::RatingSize::Small, t.star) + 2.0;
     match ph.flag {
         Flag::Pick => paint(p, Rect::from_min_size(pos2(x, y - 5.0), vec2(10.0, 10.0)), Icon::FlagPickFilled, t.pick),
         Flag::Reject => paint(p, Rect::from_min_size(pos2(x, y - 5.0), vec2(10.0, 10.0)), Icon::FlagReject, t.reject),
@@ -4428,6 +4807,7 @@ mod tests {
     fn hdr_view_job_key_includes_headroom() {
         // A headroom change must produce a different render key so the texture is re-uploaded (P2-4).
         let base = lcc_engine::media::RenderJob {
+            drawn_view_cache: false,
             cache_generation: 0,
             request_id: 1,
             source_key: None,
@@ -4445,6 +4825,7 @@ mod tests {
             origin: lcc_catalog::Source::File { path: "/tmp/test.jpg".to_string() },
             info: Default::default(),
             display_fit: None,
+            hdr_texels: None,
             settings: Default::default(),
             request: lcc_pipeline::RenderRequest {
                 max_w: 100,
@@ -4457,6 +4838,8 @@ mod tests {
                 proof: None,
                 window: None,
                 display: None,
+                downscale: Default::default(),
+                alpha: false,
             },
             key: 0,
             cache: None,
@@ -4628,6 +5011,38 @@ mod info_overlay_tests {
         assert!(copies[0].r() < 64 && copies[0].a() > 0, "the shadow under it is dark: {:?}", copies[0]);
     }
 
+    /// View Options' Show Briefly When Photo Changes: with the overlay off, the chosen Info shows
+    /// for `BRIEF_INFO_SECS` after the loupe changes photo, then hides; an overlay that is on stays.
+    #[test]
+    fn show_briefly_shows_the_info_after_the_photo_changes() {
+        use crate::state::{BRIEF_INFO_SECS, InfoOverlay};
+        let mut app = LccApp::new(lcc_engine::Session::with_demo(), crate::Services { png: None, ..Default::default() });
+        let photos: Vec<lcc_catalog::Photo> = app.session.catalog.photos().take(2).map(|p| (**p).clone()).collect();
+        assert_eq!(photos.len(), 2, "the demo catalog has two photos");
+        let ctx = egui::Context::default();
+        // the loupe shows photo `i` at `time`: the lines the overlay paints then
+        let at = |app: &mut LccApp, i: usize, time: f64| {
+            let raw = crate::headless::HeadlessView::raw_input(vec2(1000.0, 700.0), 1.0, time, vec![]);
+            let mut out = ctx.run_ui(raw, |ui| brief_info(app, ui.ctx(), photos[i].id));
+            out.textures_delta.clear();
+            painted_lines(app, &photos[i])
+        };
+        let name = |i: usize| photos[i].file_name.clone();
+        assert!(at(&mut app, 0, 1.0).is_empty(), "off by default");
+        app.ui.settings.loupe_info.briefly = InfoOverlay::Exposure;
+        let info2 = at(&mut app, 1, 2.0);
+        assert_eq!(info2.first(), Some(&name(1)), "Info 2 shows when the photo changes: {info2:?}");
+        assert!(!at(&mut app, 1, 2.0 + BRIEF_INFO_SECS - 0.5).is_empty(), "still up");
+        assert!(at(&mut app, 1, 2.0 + BRIEF_INFO_SECS + 0.1).is_empty(), "then hidden");
+        assert_eq!(at(&mut app, 0, 10.0).first(), Some(&name(0)), "and shown again for the next photo");
+        app.ui.settings.loupe_info.briefly = InfoOverlay::Basic;
+        let info1 = at(&mut app, 1, 20.0);
+        assert_eq!(info1.len(), 3, "Info 1's three lines: {info1:?}");
+        assert_ne!(info1, info2, "Info 1, not Info 2");
+        app.ui.info_overlay = InfoOverlay::Exposure;
+        assert_eq!(at(&mut app, 1, 30.0), info2, "an overlay that is on shows its own Info, and stays");
+    }
+
     /// Issue #266: when filters are active in the loupe, the filter pill and the info overlay
     /// box do not collide/superimpose; the info overlay renders cleanly below the filter pill.
     #[test]
@@ -4714,5 +5129,83 @@ mod info_overlay_tests {
         app.ui.settings.loupe_info.info1 = [F::None; 3];
         app.ui.info_overlay = InfoOverlay::Basic;
         assert_eq!(painted_lines(&app, &photo), Vec::<String>::new(), "nothing chosen, nothing shown");
+    }
+
+    fn demo_app() -> (LccApp, lcc_catalog::Photo) {
+        let mut app = LccApp::new(lcc_engine::Session::with_demo(), crate::Services { png: None, ..Default::default() });
+        app.ui.info_overlay = crate::state::InfoOverlay::Basic;
+        let photo = app.session.catalog.photos().next().map(|p| (**p).clone()).expect("the demo catalog has photos");
+        (app, photo)
+    }
+
+    /// The overlay's text shapes and the rects it registered, painted on a canvas at the window's corner.
+    fn paint_overlay(app: &LccApp, photo: &lcc_catalog::Photo) -> (Vec<egui::epaint::TextShape>, Vec<(String, Rect)>) {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let canvas = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 700.0));
+        let raw = crate::headless::HeadlessView::raw_input(vec2(1000.0, 700.0), 1.0, 0.0, vec![]);
+        let mut out = ctx.run_ui(raw, |ui| info_overlay(app, ui.painter(), canvas, photo, None));
+        out.textures_delta.clear();
+        fn texts(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::TextShape>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push(t.clone()),
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let mut all = Vec::new();
+        out.shapes.iter().for_each(|c| texts(&c.shape, &mut all));
+        (all, crate::widgets::take_registry(&ctx))
+    }
+
+    fn name_top(app: &LccApp, photo: &lcc_catalog::Photo) -> f32 {
+        let (texts, _) = paint_overlay(app, photo);
+        texts.iter().filter(|t| t.galley.job.text == photo.file_name).map(|t| t.pos.y).fold(f32::INFINITY, f32::min)
+    }
+
+    /// #2460: in the full-screen preview on macOS the window controls stay at the top-left, so the
+    /// file name starts below them; in macOS full screen they are gone and it keeps the corner.
+    #[test]
+    fn the_file_name_clears_the_macos_window_controls_in_the_full_screen_preview() {
+        let (mut app, photo) = demo_app();
+        app.ui.fullscreen = true;
+        assert_eq!(name_top(&app, &photo), 12.0, "no window controls over the photo");
+        app.integrated_titlebar = true;
+        let bar = Tokens::get(&egui::Context::default()).top_bar_h;
+        assert!(name_top(&app, &photo) >= bar, "below the window controls");
+        app.window_is_fullscreen = true;
+        assert_eq!(name_top(&app, &photo), 12.0, "macOS full screen hides the window controls");
+        app.window_is_fullscreen = false;
+        app.ui.fullscreen = false;
+        assert_eq!(name_top(&app, &photo), 12.0, "the loupe's canvas starts below the top bar");
+    }
+
+    /// #2460: a rated or flagged photo shows its stars and flag under the date and size.
+    #[test]
+    fn the_info_overlay_shows_the_rating_and_flag_under_the_date() {
+        let (_, mut photo) = demo_app();
+        let (app, _) = demo_app();
+        photo.rating = 0;
+        photo.flag = lcc_catalog::Flag::None;
+        let badges =
+            |photo: &lcc_catalog::Photo| paint_overlay(&app, photo).1.into_iter().find(|(id, _)| id == "canvas:infoOverlayBadges").map(|(_, r)| r);
+        assert_eq!(badges(&photo), None, "nothing to show");
+        photo.rating = 3;
+        let stars = badges(&photo).expect("three stars");
+        photo.flag = lcc_catalog::Flag::Pick;
+        let flagged = badges(&photo).expect("three stars and a flag");
+        assert!(flagged.width() > stars.width(), "the flag follows the stars: {stars:?} {flagged:?}");
+        let (texts, _) = paint_overlay(&app, &photo);
+        let date_bottom = texts.iter().map(|t| t.pos.y + t.galley.size().y).fold(0.0, f32::max);
+        assert!(flagged.top() >= date_bottom, "under the date and size: {flagged:?}, text ends at {date_bottom}");
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let raw = crate::headless::HeadlessView::raw_input(vec2(1000.0, 700.0), 1.0, 0.0, vec![]);
+        let mut extent = 0.0;
+        ctx.run_ui(raw, |ui| extent = info_overlay_extent(&app, ui.painter(), &photo)).textures_delta.clear();
+        assert!(extent >= flagged.bottom(), "a label below the overlay clears the badges: {extent} < {flagged:?}");
+        photo.rating = 0;
+        photo.flag = lcc_catalog::Flag::Reject;
+        assert!(badges(&photo).is_some(), "a rejected photo shows its flag alone");
     }
 }

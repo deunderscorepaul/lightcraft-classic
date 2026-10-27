@@ -75,6 +75,59 @@ fn directional_sliders() {
     assert!(at("effects.dehaze", -100.0) != base);
 }
 
+/// Dehaze crushed dark regions next to bright ones to black: the dark channel is a blur, not a
+/// patch minimum, so near the boundary it credited the dark pixels with the bright side's veil and
+/// the subtraction went past zero (#2504). The veil credited to a pixel is now bounded by its own
+/// minimum channel, so a uniform dark region renders uniformly under dehaze.
+#[test]
+fn dehaze_does_not_crush_dark_regions_next_to_bright_ones() {
+    // a dark field against a bright hazy sky; the blur bleeds the sky's dark channel ~10 px into
+    // the field, which is where the blotches formed
+    let src = Rgb32f::from_fn(240, 160, |x, _| if x < 120 { [0.02, 0.03, 0.012] } else { [0.45, 0.5, 0.55] });
+    let mut s = DevelopSettings::default();
+    s.effects.dehaze = 80.0;
+    let r = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(240, 160)).image;
+    for ch in 0..3 {
+        let mut v: Vec<u8> = Vec::with_capacity(160 * 100);
+        for y in 0..160 {
+            for x in 0..100 {
+                v.push(r.get(x, y)[ch]);
+            }
+        }
+        v.sort_unstable();
+        let mid = v[v.len() / 2] as i32;
+        // a field rendered all black would pass the comparison below vacuously
+        assert!(mid > 2, "the dark field itself is crushed in ch {ch}: level {mid}");
+        for y in 0..160 {
+            for x in 0..120 {
+                let p = r.get(x, y)[ch] as i32;
+                assert!(p >= mid - 2, "crushed at {x},{y} ch {ch}: {p} vs field level {mid}");
+            }
+        }
+    }
+}
+
+/// An export's sharp downscale (#2970) keeps more of the fine detail a smaller output can hold
+/// than a preview's smooth one, and changes nothing when the output is the source's own size.
+#[test]
+fn sharp_downscale_keeps_detail() {
+    use crate::Downscale;
+    // fine stripes: a period of 5 source pixels, 3 output pixels at 600 → 360
+    let src = Rgb32f::from_fn(600, 400, |x, _| [0.18 * (1.0 + 0.8 * (x as f32 * std::f32::consts::TAU / 5.0).sin()); 3]);
+    let swing = |down: Downscale, edge: usize| {
+        let r =
+            render(&src, &SourceInfo::default(), &DevelopSettings::default(), &RenderRequest { downscale: down, ..RenderRequest::fit(edge, edge) });
+        let row: Vec<f32> = (40..r.image.width - 40).map(|x| r.image.data[(r.image.height / 2) * r.image.width + x][1] as f32).collect();
+        let m = row.iter().sum::<f32>() / row.len() as f32;
+        (row.iter().map(|v| (v - m).abs()).sum::<f32>() / row.len() as f32, r.image)
+    };
+    let ((smooth, _), (sharp, _)) = (swing(Downscale::Smooth, 360), swing(Downscale::Sharp, 360));
+    assert!(sharp > smooth * 1.25, "sharp {sharp} vs smooth {smooth}");
+    let ((_, a), (_, b)) = (swing(Downscale::Smooth, 600), swing(Downscale::Sharp, 600));
+    assert_eq!((b.width, b.height), (600, 400));
+    assert_eq!(a.data, b.data, "no resize, no difference");
+}
+
 #[test]
 fn resolution_independence_of_local_contrast() {
     // Clarity at two preview sizes should give similar results after downscaling.

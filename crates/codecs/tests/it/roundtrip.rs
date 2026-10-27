@@ -307,7 +307,7 @@ fn ifd_tiff(entries: &[(u16, u16, u32)], data: &[u8]) -> Vec<u8> {
 /// 32 bytes per allowed pixel. Fixtures from AlexChambers' review of #1989.
 #[test]
 fn tiff_small_pixel_budget_reads_headers_and_padded_tiles() {
-    let opts = |max_pixels| DecodeOptions { max_size: None, max_pixels };
+    let opts = |max_pixels| DecodeOptions { max_size: None, max_pixels, ..Default::default() };
 
     // 1 × 1 gray, one JPEG-compressed strip (~400 bytes for one pixel), with a one-pixel budget.
     let mut jpeg = Vec::new();
@@ -419,6 +419,53 @@ fn tiff_samples_narrower_than_a_byte() {
 
     // A strip shorter than its rows is an error, never a panic.
     assert!(decode(&packed_tiff(10, 2, 1, 1, &rows[..3]), DecodeOptions::default()).is_err());
+}
+
+/// PlanarConfiguration 2 stores each sample in its own plane (all reds, then all greens, then all
+/// blues). Only the first plane used to be read, so these files failed with "sample buffer too short"
+/// (#2462).
+#[test]
+fn tiff_planar_reads_every_plane() {
+    // 2 × 2 RGB, 16 bits, one uncompressed strip per plane. Pixel i has R = 1000 i, G = 20000 + 1000 i,
+    // B = 40000 + 1000 i.
+    let (w, h) = (2u32, 2u32);
+    let planes: Vec<Vec<u8>> = (0..3u16).map(|c| (0..4u16).flat_map(|i| (20000 * c + 1000 * i).to_le_bytes()).collect()).collect();
+    const N: u32 = 10;
+    let arrays = 8 + 2 + N * 12 + 4;
+    let (bits_at, offsets_at, counts_at) = (arrays, arrays + 6, arrays + 18);
+    let data_at = arrays + 30;
+    let plane_len = planes[0].len() as u32;
+    let entry =
+        |tag: u16, ty: u16, count: u32, value: u32| [&tag.to_le_bytes()[..], &ty.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()].concat();
+    let mut b = b"II*\0".to_vec();
+    b.extend(8u32.to_le_bytes());
+    b.extend((N as u16).to_le_bytes());
+    b.extend(entry(256, 4, 1, w));
+    b.extend(entry(257, 4, 1, h));
+    b.extend(entry(258, 3, 3, bits_at));
+    b.extend(entry(259, 3, 1, 1));
+    b.extend(entry(262, 3, 1, 2));
+    b.extend(entry(273, 4, 3, offsets_at));
+    b.extend(entry(277, 3, 1, 3));
+    b.extend(entry(278, 4, 1, h));
+    b.extend(entry(279, 4, 3, counts_at));
+    b.extend(entry(284, 3, 1, 2));
+    b.extend(0u32.to_le_bytes());
+    b.extend([16u16; 3].iter().flat_map(|v| v.to_le_bytes()));
+    b.extend((0..3).flat_map(|c| (data_at + c * plane_len).to_le_bytes()));
+    b.extend([plane_len; 3].iter().flat_map(|v| v.to_le_bytes()));
+    assert_eq!(b.len(), data_at as usize);
+    b.extend(planes.concat());
+
+    let d = decode(&b, DecodeOptions::default()).unwrap();
+    assert_eq!((d.image.width, d.image.height, d.bit_depth), (2, 2, 16));
+    for i in 0..4usize {
+        let px = d.image.get(i % 2, i / 2);
+        for c in 0..3 {
+            let want = srgb_to_linear((20000 * c + 1000 * i) as f32 / 65535.0);
+            assert!((px[c] - want).abs() < 1e-4, "pixel {i} channel {c}: {} vs {want}", px[c]);
+        }
+    }
 }
 
 #[test]
@@ -932,4 +979,61 @@ fn jxl_bad_input_is_an_error() {
     let b =
         encode_jxl(&EncodeImage::new(1, 1, 3, Samples::U8(&one)), &JxlOptions { quality: 1, ..Default::default() }, &EncodeMeta::default()).unwrap();
     assert_eq!(decode(&b, DecodeOptions::default()).unwrap().width, 1);
+}
+
+/// Issue #2976: an associated-alpha TIFF (8 and 16 bits) stores premultiplied colour with
+/// `ExtraSamples` = 1 and decodes back to the straight colour; without alpha it is a plain TIFF.
+#[test]
+fn associated_alpha_tiff_round_trips() {
+    let (w, h) = (16usize, 4usize);
+    let px: Vec<[u8; 4]> = (0..w * h).map(|i| [200, (i * 9 % 256) as u8, 30, if i % 4 == 0 { 255 } else { (i * 13 % 256) as u8 }]).collect();
+    let flat: Vec<u8> = px.iter().flatten().copied().collect();
+    let tiff =
+        encode_tiff_associated(&EncodeImage::new(w as u32, h as u32, 4, Samples::U8(&flat)), TiffCompression::Lzw, &Default::default()).unwrap();
+    assert!(tiff.windows(10).any(|win| win == [0x52, 0x01, 3, 0, 1, 0, 0, 0, 1, 0]), "ExtraSamples = 1");
+    let d = decode(&tiff, Default::default()).unwrap();
+    let back = d.to_srgb8();
+    for (i, (p, q)) in px.iter().zip(&back.data).enumerate() {
+        assert_eq!(p[3], q[3], "alpha at {i}");
+        if p[3] >= 64 {
+            // (premultiplied 8-bit colour loses a little precision where alpha is low)
+            for c in 0..3 {
+                assert!(p[c].abs_diff(q[c]) <= 4, "colour at {i}: {p:?} vs {q:?}");
+            }
+        }
+    }
+    let wide: Vec<u16> = flat.iter().map(|&v| v as u16 * 257).collect();
+    let tiff16 =
+        encode_tiff_associated(&EncodeImage::new(w as u32, h as u32, 4, Samples::U16(&wide)), TiffCompression::None, &Default::default()).unwrap();
+    let d16 = decode(&tiff16, Default::default()).unwrap();
+    assert_eq!(d16.bit_depth, 16);
+    let back16 = d16.to_srgb8();
+    for (p, q) in px.iter().zip(&back16.data).filter(|(p, _)| p[3] > 0) {
+        assert!(p.iter().zip(q).all(|(a, b)| a.abs_diff(*b) <= 1), "{p:?} vs {q:?}");
+    }
+    let rgb: Vec<u8> = px.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let plain =
+        encode_tiff_associated(&EncodeImage::new(w as u32, h as u32, 3, Samples::U8(&rgb)), TiffCompression::None, &Default::default()).unwrap();
+    assert!(!decode(&plain, Default::default()).unwrap().has_alpha);
+}
+
+/// `unflatten` undoes `to_working`'s flatten onto white, and leaves pixels with no alpha white.
+#[test]
+fn unflatten_inverts_the_flatten_onto_white() {
+    let img = lcc_raster::Rgba8::from_fn(8, 8, |x, y| [(x * 30) as u8, (y * 30) as u8, 77, ((x + y) * 18) as u8]);
+    let png = encode_png(&EncodeImage::rgba8(&img), &Default::default()).unwrap();
+    let d = decode(&png, Default::default()).unwrap();
+    let alpha = d.alpha.clone().unwrap();
+    let flat = d.to_working();
+    let straight = lcc_codecs::unflatten(&flat, &alpha).unwrap();
+    let unflattened = lcc_codecs::Decoded { alpha: None, ..d.clone() };
+    let want = unflattened.to_working();
+    for (i, ((s, w), &a)) in straight.data.iter().zip(&want.data).zip(&alpha.data).enumerate() {
+        if a >= 1.0 / 1024.0 {
+            assert!(s.iter().zip(w).all(|(p, q)| (p - q).abs() < 1e-4), "pixel {i}: {s:?} vs {w:?}");
+        } else {
+            assert_eq!(*s, [1.0; 3], "no alpha: the white stays at {i}");
+        }
+    }
+    assert!(lcc_codecs::unflatten(&flat, &lcc_raster::Plane::new(3, 3)).is_none(), "a plane of another size");
 }

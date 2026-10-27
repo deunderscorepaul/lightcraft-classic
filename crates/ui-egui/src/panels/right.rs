@@ -113,6 +113,19 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Only the open tool's own controls (Crop, Remove / Heal, Masking), without the histogram, the
+/// tool row or the Previous / Sync bar around them: the Modern layout's tool card.
+pub(crate) fn tool_only(app: &mut LccApp, ui: &mut egui::Ui) {
+    let Some(id) = app.session.active() else { return };
+    ui.spacing_mut().item_spacing.y = 0.0;
+    match app.ui.right {
+        RightPanel::Crop => classic_crop::show(app, ui, id),
+        RightPanel::Remove => remove(app, ui, id),
+        RightPanel::Masking => super::masking::show(app, ui, id),
+        _ => {}
+    }
+}
+
 /// Height of the Previous / Sync… bar under the Edit panel.
 const SYNC_BAR_H: f32 = 44.0;
 
@@ -1359,6 +1372,13 @@ enum HistoryRow {
     Done,
     Current,
     Undone,
+}
+
+/// Upright that found nothing to correct says why, as a note over the photo.
+pub(crate) fn upright_note(app: &mut LccApp, ctx: &egui::Context, result: Option<&serde_json::Value>) {
+    if let Some(note) = result.and_then(|r| r.get("note")).and_then(serde_json::Value::as_str) {
+        app.toast_for(ctx, note.to_string(), 8.0);
+    }
 }
 
 fn history_row(i: usize, cursor: Option<usize>) -> HistoryRow {

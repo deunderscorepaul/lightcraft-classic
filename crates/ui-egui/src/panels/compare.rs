@@ -2,7 +2,7 @@
 //! pan) and **Survey** (the selected photos tiled). Rating, flag and label keys act on the active
 //! photo only here, and with Auto Advance on they move to the next candidate / photo.
 
-use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use lcc_catalog::{Flag, PhotoId};
 use serde_json::{Value, json};
 
@@ -164,11 +164,13 @@ pub fn survey_step(app: &mut LccApp, d: isize) -> Result<Value, String> {
 }
 
 /// After rating/flagging with Auto Advance: next candidate (Compare), next photo in the survey,
-/// else the next photo in the view.
-pub fn advance(app: &mut LccApp) {
+/// else the next photo in the view. `was` is the active photo before the rating: a rating that took
+/// it out of the view made the photo after it active already, and that is the next one (#2312).
+pub fn advance(app: &mut LccApp, was: Option<PhotoId>) {
     let _ = match app.ui.view {
         ViewMode::Compare => compare_step(app, 1),
         ViewMode::Survey => survey_step(app, 1),
+        _ if app.session.active() != was => Ok(Value::Null),
         _ => app.session.execute("library.next", &json!({})).map_err(|e| e.to_string()),
     };
 }
@@ -235,11 +237,17 @@ fn photo_tile(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, slot: Slot, area
     };
     let mut hdr_key = None;
     if let Some(job) = app.session.render_job(id, rw.max(8), rh.max(8), false, true) {
-        // Keep adjustment drafts on the same HDR output path.
+        // an HDR edit on an HDR display: also its HDR render, drawn over the 8-bit one (not in a
+        // pinch; in a slider drag, a draft only for the photo being edited)
         if !gesturing {
-            hdr_key = super::detail::request_hdr(app, hdr_view, job.clone(), 58);
+            hdr_key = super::detail::request_hdr(app, hdr_view, job.clone(), true, 58);
         }
-        app.renderer.request(slot, job, 60);
+        super::detail::upload_hdr_views(app);
+        // (while a drag shows its HDR frames here, no 8-bit render of each step under them)
+        let hdr_drafts = super::detail::editing(app, id) && super::detail::hdr_texture(app, hdr_view, id, hdr_key).is_some();
+        if !hdr_drafts || app.renderer.textures.get(&slot).is_none_or(|t| t.photo != id) {
+            app.renderer.request(slot, job, 60);
+        }
     }
     super::detail::upload_hdr_views(app);
     if let Some(job) = app.session.thumb_job(id, 256) {
@@ -262,7 +270,7 @@ fn photo_tile(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, slot: Slot, area
         display = super::detail::fit_rect(img_area, texture_aspect, zoom, native, ppp, app.ui.pan);
         p.image(tex.tex.id(), display, uv, Color32::WHITE);
     } else {
-        p.rect_filled(img.intersect(img_area), 0.0, Color32::from_gray(38));
+        p.rect_filled(img.intersect(img_area), 0.0, t.skeleton);
     }
     // zoomed in: the tiles on screen at up to 100 %, sharp like the loupe's (Compare, Reference)
     if side_by_side && let Slot::Compare(i) = slot {
@@ -277,7 +285,7 @@ fn photo_tile(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, slot: Slot, area
     }
     let active = app.session.selection.active == Some(id);
     if active {
-        p.rect_stroke(display.intersect(img_area.shrink(1.0)), 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
+        super::grid::selection_ring(&p, &t, display.intersect(img_area.shrink(3.0)), lcc_engine::SelectionState::Active);
     }
     // Compare and Reference are where sharpness is judged: as in the loupe, say when what is on
     // screen isn't the render on its way (a thumbnail, the last render after an edit, a magnified
@@ -332,7 +340,7 @@ fn photo_tile(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId, slot: Slot, area
         let filled = i < photo.rating;
         let r = Rect::from_min_size(pos2(x + i as f32 * 13.0, cap.center().y - 6.0), vec2(12.0, 12.0));
         if r.right() < cap.right() {
-            paint(pt, r, if filled { Icon::StarFilled } else { Icon::Star }, if filled { t.star } else { t.icon.gamma_multiply(0.6) });
+            crate::rating::paint_star(pt, r, filled, if filled { t.star } else { t.icon.gamma_multiply(0.6) });
         }
     }
     x += 5.0 * 13.0 + 4.0;
@@ -490,7 +498,12 @@ pub fn show_reference(app: &mut LccApp, ui: &mut egui::Ui) {
     let canvas = area_and_filmstrip(app, ui);
     let reference = app.ui.reference.map(PhotoId).filter(|r| live(app, *r));
     let (Some(r), Some(active)) = (reference, app.session.active()) else {
-        super::empty_message(ui, canvas, "No reference photo", "Right-click a photo ▸ Set as Reference Photo, then View → Reference View (Shift+R)");
+        super::empty_message(
+            ui,
+            canvas,
+            "No reference photo",
+            "Right-click a photo and choose Set as Reference Photo, then View → Reference View (Shift+R)",
+        );
         return;
     };
     let area = canvas.shrink(18.0);
@@ -571,7 +584,6 @@ fn zoomed_tiles(
         Some(view) => {
             ctx.data_mut(|d| d.insert_temp(memory_id, view));
             super::detail::draw_window(p, app, &c, &v, &view);
-            super::detail::draw_hdr_window(p, app, &c, &v, &view);
         }
         None => {
             ctx.data_mut(|d| d.remove::<crate::region::RegionView>(memory_id));

@@ -70,7 +70,7 @@ fn diff(a: &Rgba8, b: &Rgba8) -> (f64, u8, f64) {
 
 fn check(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) -> (f64, u8) {
     let cpu = render(src, info, s, req).image;
-    let gpu = lcc_gpu::render(src, info, s, req, None).expect("gpu render");
+    let gpu = lcc_gpu::render(src, info, s, req, None).unwrap_or_else(|| panic!("gpu render ({:?})", lcc_gpu::last_fallback()));
     let (mean, max, over) = diff(&cpu, &gpu.image);
     eprintln!("{name:<28} {}x{}  mean {mean:.4}  max {max}  >1: {:.4}%", cpu.width, cpu.height, over * 100.0);
     assert!(mean < MEAN_LSB && max <= MAX_LSB, "{name}: mean {mean:.4} LSB, max {max} LSB");
@@ -80,10 +80,23 @@ fn check(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, 
 /// [`check`] for a healed spot: a few pixels may differ by up to 8 LSB, the mean must stay tiny.
 fn check_spot(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) {
     let cpu = render(src, info, s, req).image;
-    let gpu = lcc_gpu::render(src, info, s, req, None).expect("gpu render");
+    let gpu = lcc_gpu::render(src, info, s, req, None).unwrap_or_else(|| panic!("gpu render ({:?})", lcc_gpu::last_fallback()));
     let (mean, max, over) = diff(&cpu, &gpu.image);
     eprintln!("{name:<28} {}x{}  mean {mean:.4}  max {max}  >1: {:.4}%", cpu.width, cpu.height, over * 100.0);
     assert!(mean < MEAN_LSB / 10.0 && max <= 8, "{name}: mean {mean:.4} LSB, max {max} LSB");
+}
+
+/// [`check`] for gamut-warning renders: a warning is a hard decision at the gamut boundary, so a
+/// pixel sitting exactly on it may be painted by one renderer and not the other (float rounding).
+/// Such flips are allowed for at most 0.01 % of the pixels; everything else is held to [`check`]'s bounds.
+fn check_warned(name: &str, src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) {
+    let cpu = render(src, info, s, req).image;
+    let gpu = lcc_gpu::render(src, info, s, req, None).unwrap_or_else(|| panic!("gpu render ({:?})", lcc_gpu::last_fallback()));
+    let (mean, _, over) = diff(&cpu, &gpu.image);
+    let flips = cpu.data.iter().zip(&gpu.image.data).filter(|(p, q)| (0..3).any(|c| p[c].abs_diff(q[c]) > MAX_LSB)).count();
+    let share = flips as f64 / cpu.data.len() as f64;
+    eprintln!("{name:<28} {}x{}  mean {mean:.4}  >1: {:.4}%  boundary flips {flips}", cpu.width, cpu.height, over * 100.0);
+    assert!(mean < MEAN_LSB && share <= 1e-4, "{name}: mean {mean:.4} LSB, {flips} pixels differ by more than {MAX_LSB} LSB");
 }
 
 type Edit = fn(&mut DevelopSettings);
@@ -406,6 +419,24 @@ fn cases() -> Vec<(&'static str, Edit)> {
                 },
             ];
         }),
+        ("masks (inverted, add and subtract)", |s| {
+            let radial = |x: f64| MaskShape::Radial { center: Point::new(x, 0.5), rx: 0.15, ry: 0.15, angle: 0.0, feather: 30.0, invert: false };
+            let comp = |op, x| MaskComponent { name: None, op, invert: false, shape: radial(x) };
+            s.masks = vec![
+                Mask {
+                    components: vec![comp(MaskOp::Add, 0.3), comp(MaskOp::Add, 0.7), comp(MaskOp::Subtract, 0.3)],
+                    adjust: lcc_develop::LocalAdjustments { exposure: 0.5, ..Default::default() },
+                    invert: true,
+                    ..Default::default()
+                },
+                Mask {
+                    components: vec![comp(MaskOp::Add, 0.3), comp(MaskOp::Intersect, 0.5)],
+                    adjust: lcc_develop::LocalAdjustments { exposure: -0.5, ..Default::default() },
+                    invert: true,
+                    ..Default::default()
+                },
+            ];
+        }),
         ("masks (local noise, moiré, defringe)", |s| {
             let radial = MaskShape::Radial { center: Point::new(0.4, 0.6), rx: 0.3, ry: 0.25, angle: 0.0, feather: 50.0, invert: false };
             let linear = MaskShape::Linear { start: Point::new(0.5, 0.0), end: Point::new(0.5, 0.7) };
@@ -581,6 +612,34 @@ fn clipped_highlights_stay_neutral_on_both() {
             let p = img.get(90, 120);
             assert!(p[1] < 250 && p[0].max(p[1]).max(p[2]) - p[0].min(p[1]).min(p[2]) <= 1, "{name} {who}: clipped light {p:?}");
         }
+    }
+}
+
+/// Black pixels have no hue. The GPU's `atan2(0, 0)` is undefined (NaN on some GPUs), which made
+/// every exactly black pixel NaN once a colour tool ran, and a lightening vignette then showed it:
+/// the CPU lifted the black corners, the GPU left them black.
+#[test]
+fn black_pixels_match_under_colour_tools_and_a_light_vignette() {
+    if !gpu() {
+        return;
+    }
+    let base = scene(0, 320, 240);
+    // black bars across the frame, reaching into the corners the vignette lightens
+    let src = Arc::new(Rgb32f::from_fn(320, 240, |x, y| if y % 40 < 8 || x % 64 < 6 { [0.0; 3] } else { base.get(x, y) }));
+    let info = SourceInfo { raw: true, ..Default::default() };
+    let req = RenderRequest::fit(320, 240);
+    for (name, f) in [
+        ("black, light vignette + saturation", (|s: &mut DevelopSettings| s.color.saturation = 40.0) as fn(&mut DevelopSettings)),
+        ("black, light vignette + vibrance", |s| s.color.vibrance = 30.0),
+        ("black, light vignette + mixer", |s| s.mixer.yellow.hue = 30.0),
+    ] {
+        let mut s = DevelopSettings::default();
+        s.vignette.amount = 25.0;
+        s.vignette.style = VignetteStyle::HighlightPriority;
+        f(&mut s);
+        check(name, &src, &info, &s, &req);
+        let gpu = lcc_gpu::render(&src, &info, &s, &req, None).expect("gpu render").image;
+        assert!(gpu.get(0, 0)[1] > 0, "{name}: the black corner is not lightened on the GPU");
     }
 }
 
@@ -1147,5 +1206,114 @@ fn negative_channels_match_cpu() {
         edit(&mut s);
         s.light.exposure += 4.0;
         check(&format!("negatives +4 EV, {name}"), &src, &info, &s, &req);
+    }
+}
+
+#[test]
+fn soft_proofs_match() {
+    if !gpu() {
+        return;
+    }
+    // Soft proofing against an output space (matrix proofs): into the proof gamut, back to the
+    // output space, with the destination and display gamut warnings painted alike on both renderers.
+    // Saturated edits put plenty of colours outside the smaller proof spaces.
+    use lcc_pipeline::{OutputSpace, Proof};
+    let src = scene(0, 900, 600);
+    let raw = SourceInfo { raw: true, ..Default::default() };
+    for space in [OutputSpace::Srgb, OutputSpace::AdobeRgb, OutputSpace::DisplayP3] {
+        for (dest_warning, display_warning) in [(false, false), (true, false), (false, true), (true, true)] {
+            for out in [OutputSpace::Srgb, OutputSpace::Rec2020] {
+                let mut s = DevelopSettings::default();
+                saturated(&mut s);
+                let proof = Some(Proof { space, dest_warning, display_warning, profile: 0 });
+                let req = RenderRequest { space: out, proof, ..RenderRequest::fit(640, 640) };
+                let name = format!("proof {space:?} → {out:?} warn {dest_warning}/{display_warning}");
+                if dest_warning || display_warning {
+                    check_warned(&name, &src, &raw, &s, &req);
+                } else {
+                    check(&name, &src, &raw, &s, &req);
+                }
+            }
+        }
+    }
+    // the case is meaningful: proofing sRGB from Rec. 2020 output warns on some pixels, and the GPU paints the same ones
+    let mut s = DevelopSettings::default();
+    saturated(&mut s);
+    let req = RenderRequest {
+        space: OutputSpace::Rec2020,
+        proof: Some(Proof { space: OutputSpace::Srgb, dest_warning: true, display_warning: false, profile: 0 }),
+        ..RenderRequest::fit(640, 640)
+    };
+    let warned = |i: &Rgba8| i.data.iter().filter(|p| p[1] == 0 && p[2] == 0 && p[0] > 200).count();
+    let (cpu, gpu) = (render(&src, &raw, &s, &req).image, lcc_gpu::render(&src, &raw, &s, &req, None).expect("gpu render").image);
+    assert!(warned(&cpu) > 100, "{} warned pixels", warned(&cpu));
+    let (a, b) = (warned(&cpu), warned(&gpu));
+    assert!(a.abs_diff(b) as f64 <= 1e-4 * cpu.data.len() as f64, "warned pixels: CPU {a}, GPU {b}");
+    // an output-device profile (a 3D table) stays on the CPU
+    let n = 2;
+    let lut = lcc_pipeline::ProofLut::new(n, vec![[0.5, 0.5, 0.5, 0.0]; n * n * n]).unwrap();
+    let id = lcc_pipeline::register_proof_profile(0x5eed_9f00, lut);
+    let req = RenderRequest {
+        proof: Some(Proof { space: OutputSpace::Srgb, dest_warning: true, display_warning: false, profile: id }),
+        ..RenderRequest::fit(64, 64)
+    };
+    assert!(lcc_gpu::render(&src, &raw, &DevelopSettings::default(), &req, None).is_none(), "declined: the CPU renders it");
+}
+
+/// Colours pushed past white (process V5 keeps their hue, older processes move them toward their luminance) match
+/// the CPU's on every process.
+#[test]
+fn overrange_colours_match_on_every_process() {
+    if !gpu() {
+        return;
+    }
+    let raw = SourceInfo { raw: true, ..Default::default() };
+    let src = scene(0, 900, 600);
+    let req = RenderRequest::fit(640, 640);
+    for p in Process::ALL {
+        let mut s = DevelopSettings { process: p.version(), ..DevelopSettings::default() };
+        s.light.exposure = 2.5;
+        s.color.saturation = 40.0;
+        check(&format!("{p:?} pushed past white"), &src, &raw, &s, &req);
+    }
+}
+
+/// The loupe's display fit done on the device (`try_render_fitted`) gives the pixels the CPU's
+/// `fit_rgba8` gives the same render (it rounds alike; only an FMA's last bit may differ), and the
+/// histogram of the whole render, not of the fitted image. A fit that shrinks nothing, an overlay
+/// and an HDR render come back unfitted, for the caller.
+#[test]
+fn the_display_fit_on_the_device_matches_the_cpus() {
+    if !gpu() {
+        return;
+    }
+    let src = scene(1, 1280, 853);
+    let info = SourceInfo::default();
+    let mut s = DevelopSettings::default();
+    typical(&mut s);
+    let req = RenderRequest::fit(1280, 1280);
+    let whole = lcc_gpu::try_render(&src, &info, &s, &req, None).expect("gpu render");
+    for fit in [(853, 853), (640, 480), (1001, 667), (97, 64)] {
+        let on_device = lcc_gpu::try_render_fitted(&src, &info, &s, &req, None, Some(fit)).expect("gpu render");
+        let on_cpu = lcc_raster::resample::fit_rgba8(&whole.image, fit.0, fit.1, lcc_raster::resample::Filter::Lanczos3);
+        let (mean, max, _) = diff(&on_device.image, &on_cpu);
+        eprintln!("display fit {fit:?}: {}x{}  mean {mean:.4}  max {max}", on_cpu.width, on_cpu.height);
+        assert!(max <= 1 && mean < 0.01, "{fit:?}: mean {mean:.4} LSB, max {max} LSB");
+        assert!(on_device.image.data.iter().all(|p| p[3] == 255), "opaque");
+        assert_eq!(on_device.histogram.total, whole.histogram.total, "{fit:?}: the whole render's histogram");
+        assert_eq!(on_device.histogram.luma, whole.histogram.luma, "{fit:?}");
+    }
+    // kept for a view cache: the fitted image as above, and the full render as it is
+    let (fitted, full) = lcc_gpu::try_render_fitted_keeping_full(&src, &info, &s, &req, None, (640, 480)).expect("gpu render");
+    let alone = lcc_gpu::try_render_fitted(&src, &info, &s, &req, None, Some((640, 480))).expect("gpu render");
+    assert_eq!(fitted.image, alone.image, "the same fitted image");
+    assert_eq!(full.as_ref(), Some(&whole.image), "the full render read back with it");
+    let (_, none) = lcc_gpu::try_render_fitted_keeping_full(&src, &info, &s, &req, None, (4000, 4000)).expect("gpu render");
+    assert!(none.is_none(), "nothing fitted: the render is the full image");
+    let larger = lcc_gpu::try_render_fitted(&src, &info, &s, &req, None, Some((4000, 4000))).expect("gpu render");
+    assert_eq!((larger.image.width, larger.image.height), (whole.image.width, whole.image.height), "never enlarged");
+    let overlay = RenderRequest { overlay: lcc_pipeline::Overlay::Spots(50), ..req };
+    if let Ok(r) = lcc_gpu::try_render_fitted(&src, &info, &s, &overlay, None, Some((640, 480))) {
+        assert_eq!(r.image.width, whole.image.width, "an overlay is drawn on the CPU, after the fit there");
     }
 }

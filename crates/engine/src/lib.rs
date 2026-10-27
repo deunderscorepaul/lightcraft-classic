@@ -21,6 +21,7 @@ pub mod availability;
 pub(crate) mod camera_preview;
 pub mod camera_profiles;
 pub mod cmd;
+pub mod colour_export;
 pub mod config;
 pub mod contact_sheet;
 pub mod control_auth;
@@ -51,6 +52,7 @@ mod focus_scan;
 pub mod folder_watch;
 pub mod fonts;
 pub mod guard;
+pub mod hdr_texture;
 pub mod history_groups;
 pub mod import;
 mod import_move;
@@ -69,6 +71,7 @@ pub mod logging;
 pub mod media;
 pub mod memory;
 pub mod merge;
+pub mod midi;
 mod model_download;
 pub mod open_path;
 pub mod originals;
@@ -91,6 +94,8 @@ pub mod rename;
 pub mod render_dng;
 pub mod segment;
 pub mod sidecar;
+#[cfg(not(target_arch = "wasm32"))]
+mod sidecar_writer;
 pub mod slide;
 pub mod slide_overlay;
 pub mod slide_template;
@@ -221,6 +226,31 @@ pub struct Interaction {
 /// The most photos an edit may touch for the view to follow it photo by photo; a larger edit is worked out whole.
 const MAX_FOLLOWED: usize = 256;
 
+/// The established clock precision for relative-date views and sidebar counts.
+fn clock_minute(now: &str) -> &str {
+    now.get(..16).unwrap_or(now)
+}
+
+/// Whether a query can change membership without a catalog edit, including the smart albums it tests.
+fn filter_depends_on_clock(filter: &Filter, catalog: &Catalog) -> bool {
+    if filter.depends_on_now() {
+        return true;
+    }
+    let mut pending = filter.albums_tested();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(smart) = catalog.album(id).and_then(|album| album.smart.as_deref()) else { continue };
+        if smart.depends_on_now() {
+            return true;
+        }
+        pending.extend(smart.albums_tested());
+    }
+    false
+}
+
 /// Source of [`Session::visible_shared`] generations (process-wide, so two sessions never share one).
 static VISIBLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static LIBRARY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -244,6 +274,8 @@ pub struct Session {
     /// Shared, so frontends can hold it across frames without copying ([`Session::visible_shared`]).
     visible: Arc<[PhotoId]>,
     visible_key: Option<(u64, String)>,
+    /// The minute used for a cached view whose rules depend on the session clock.
+    visible_clock_minute: Option<String>,
     /// A view holds the photos it shows until it is refreshed (`library.holdView`): an edit that makes a photo stop
     /// matching a smart album's rules, Picks or the filter bar leaves it where it is. Off: the photo goes at once.
     pub hold_view: bool,
@@ -263,7 +295,7 @@ pub struct Session {
     /// is recomputed, so frontends can key their per-view caches on it instead of hashing the ids.
     visible_gen: u64,
     /// Photos in the current source with no filter on (cached like `visible`).
-    total: Option<((u64, String), usize)>,
+    total: Option<((u64, String), usize, Option<String>)>,
     pub undo: Vec<UndoEntry>,
     /// Undo steps committed in this session, ever (the history drops its oldest past 1000, so
     /// its length can't tell how many steps a command just made; see [`Session::commits`]).
@@ -275,11 +307,19 @@ pub struct Session {
     /// Set by a command whose change must not rewrite the photo's XMP sidecar even with auto-write on
     /// (a catalog-only edit of data the sidecar writer does not emit); consumed when the command ends.
     pub(crate) skip_auto_write: bool,
+    /// The folder metadata save or read waiting for `folder.metadataPump` ([`cmd::folder_metadata`]); dropped when another library opens.
+    pub(crate) folder_metadata: Option<cmd::folder_metadata::FolderMetadataJob>,
     /// The order of Reload from Disk runs, so an older one finishing late is dropped ([`cmd::reload`]).
     pub(crate) reload_tickets: cmd::reload::Tickets,
     /// Photos whose automatic XMP sidecar write failed (their folder offline, read-only or full), written again by
     /// [`Session::retry_unsaved_sidecars`] once their file is reachable.
     pub(crate) unsaved_sidecars: std::collections::BTreeSet<PhotoId>,
+    /// The background sidecar writer, when the host turned it on ([`Session::set_background_sidecar_writes`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) sidecar_writer: Option<sidecar_writer::Writer>,
+    /// How long a file operation waits for the background sidecar writes queued before it ([`Session::settle_sidecar_writes`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) sidecar_flush_limit: std::time::Duration,
     /// AI denoise: the model in use, the photos that have their picture and the work in progress.
     pub(crate) denoise: denoise::State,
     /// Plug-in filter measurements (`develop.pluginFilter.analyze`) running in the background.
@@ -294,6 +334,8 @@ pub struct Session {
     pub(crate) lens_seen: std::collections::HashMap<PhotoId, u64>,
     /// Whether each photo looked up this session carries its file\'s own lens correction (not a database profile).
     pub(crate) lens_from_file: std::collections::HashMap<PhotoId, bool>,
+    /// The lens picked for each photo ([`lcc_develop::Optics::lens`]) when its lens data was last looked up.
+    pub(crate) lens_chosen_seen: std::collections::HashMap<PhotoId, Option<lcc_develop::ChosenLens>>,
     /// Reverse geocoding: the parsed place names and their download (`metadata.*PlaceNames`).
     pub place_names: cmd::geocode::PlaceNames,
     /// The user's own list of models to download (`catalog.json` in the models folder), as last read.
@@ -333,6 +375,8 @@ pub struct Session {
     pub copy_groups: Vec<lcc_develop::SettingsGroup>,
     /// Built-in then user presets; its generation tells savers and caches when it changed.
     pub presets: presets::PresetList,
+    /// User-created preset folders (subfolders separated by `/`); empty ones stay until deleted.
+    pub preset_folders: Vec<String>,
     /// Favourite profile ids (persisted with the library, like preset favourites).
     pub profile_favorites: Vec<String>,
     /// Recently applied profile ids, newest first (at most [`presets::RECENT_PROFILES`]).
@@ -407,8 +451,8 @@ pub struct Session {
     pub keyword_sets: Vec<cmd::keywords::KeywordSet>,
     pub keyword_set: Option<String>,
     pub recent_keywords: Vec<String>,
-    /// The keyword ⇧K toggles on the selected photos (Keywording ▸ keyword shortcut).
-    pub keyword_shortcut: Option<String>,
+    /// The keywords ⇧K adds to or removes from the selected photos (Set Keyword Shortcut…).
+    pub keyword_shortcut: Vec<String>,
     /// Keyword attributes (synonyms, export options, person) and keywords created before any
     /// photo has them, by keyword path (Keyword List).
     /// Before/After: the "before" settings chosen per photo (this session; default: the photo's
@@ -521,6 +565,7 @@ impl Session {
             selection: Selection::default(),
             visible: Vec::new().into(),
             visible_key: None,
+            visible_clock_minute: None,
             hold_view: false,
             base: None,
             view_followed: 0,
@@ -535,8 +580,13 @@ impl Session {
             pending_sidecar_repairs: Vec::new(),
             interaction: None,
             skip_auto_write: false,
+            folder_metadata: None,
             reload_tickets: Default::default(),
             unsaved_sidecars: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            sidecar_writer: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            sidecar_flush_limit: std::time::Duration::from_secs(30),
             denoise: Default::default(),
             filter_analyses: Default::default(),
             face_models_dir: None,
@@ -544,6 +594,7 @@ impl Session {
             lens_db: Default::default(),
             lens_seen: Default::default(),
             lens_from_file: Default::default(),
+            lens_chosen_seen: Default::default(),
             place_names: Default::default(),
             face_catalog: Default::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -565,6 +616,7 @@ impl Session {
             previous_active: None,
             copy_groups: lcc_develop::SettingsGroup::default_copy(),
             presets: presets::PresetList::new(presets::builtin()),
+            preset_folders: Vec::new(),
             profile_favorites: Vec::new(),
             profile_recent: Vec::new(),
             journal: Vec::new(),
@@ -600,7 +652,7 @@ impl Session {
             keyword_sets: Vec::new(),
             keyword_set: None,
             recent_keywords: Vec::new(),
-            keyword_shortcut: None,
+            keyword_shortcut: Vec::new(),
             before: Default::default(),
             import_probes: Default::default(),
             folder_changes: None,
@@ -721,10 +773,12 @@ impl Session {
 
     // ---------------------------------------------------------------- ops, undo
 
-    /// Apply an op as one undoable step.
+    /// Apply an op as one undoable step. A new edit: one that would make a smart album include
+    /// itself is refused here, whichever command, task or caller asked ([`Catalog::apply_new`]);
+    /// undo, redo and opening a library bring back what was and are not held to that.
     pub fn commit(&mut self, label: &str, op: Op) -> Result<()> {
         let fwd = op.clone();
-        let inv = self.apply_catalog(op)?;
+        let inv = self.apply_through(op, Catalog::apply_new)?;
         self.pending_log.push(fwd);
         self.undo.push(UndoEntry { label: label.to_string(), op: inv, folder: None, retry_inverse: Vec::new(), retry_sidecars: Vec::new() });
         self.commits = self.commits.wrapping_add(1);
@@ -738,7 +792,18 @@ impl Session {
         Ok(())
     }
 
+    /// [`Catalog::apply`] for what brings back what was (an undo or a redo).
     fn apply_catalog(&mut self, op: Op) -> Result<Op> {
+        self.apply_through(op, Catalog::apply)
+    }
+
+    /// Apply `op` with `apply` (the catalog's way in for a new edit or for bringing back what
+    /// was), then forget what the session cached of the photos it replaced.
+    fn apply_through(&mut self, op: Op, apply: fn(&mut Catalog, Op) -> std::result::Result<Op, lcc_catalog::CatalogError>) -> Result<Op> {
+        // a sidecar write still queued for a photo whose file moves, goes or changes would land at the old place
+        if op_moves_files(&op) {
+            self.settle_sidecar_writes()?;
+        }
         // Retain only cache IDs while the catalog consumes the operation. Cloning an import
         // batch here also cloned every photo, although commit already keeps the journal copy.
         let mut invalidated = Vec::new();
@@ -759,7 +824,7 @@ impl Session {
                 _ => {}
             }
         }
-        let inv = self.catalog.apply(op)?;
+        let inv = apply(&mut self.catalog, op)?;
         for id in invalidated {
             self.media.forget(id);
         }
@@ -1240,12 +1305,20 @@ impl Session {
         };
         let view = format!("{}|{rules}", key.1);
         if self.source == LibrarySource::Missing && self.media.availability.is_background() {
-            // the view fills in as the background checks find files gone
-            key.1.push_str(&format!("|{}", self.media.availability.generation()));
+            // the view fills in as the background checks find files gone (a file found there at
+            // its first check changes nothing it shows)
+            key.1.push_str(&format!("|{}", self.media.availability.gone_generation()));
         }
-        if self.visible_key.as_ref() != Some(&key) {
-            // "in the last N days" rules count back from the session's clock
-            lcc_catalog::rules::set_now(Some((self.clock)()));
+        let key_changed = self.visible_key.as_ref() != Some(&key);
+        // A time-dependent cache needs one clock read to test its minute stamp. A new view also
+        // needs one value for the query, even when its previous cached view did not use the clock.
+        let current_now = (key_changed || self.visible_clock_minute.is_some()).then(|| (self.clock)());
+        let current_minute = current_now.as_deref().map(clock_minute);
+        let clock_changed = self.visible_clock_minute.as_deref().is_some_and(|cached| current_minute != Some(cached));
+        if key_changed || clock_changed {
+            // Use this same value to evaluate relative rules and stamp the result.
+            let now = current_now.unwrap_or_else(|| (self.clock)());
+            lcc_catalog::rules::set_now(Some(now.clone()));
             let f = self.view_filter(self.source, &self.filter);
             // A held view keeps the photos it shows that stopped matching what is asked of them (a smart album's
             // rules, a flag, the filter bar), as long as they are still where the view looks: in the library for
@@ -1272,8 +1345,7 @@ impl Session {
             let whole = own_order || matches!(self.source, LibrarySource::RecentlyAdded | LibrarySource::Missing);
             // A view that asks about "the last N days" (itself, or through a smart album it looks into) changes
             // with the clock as well as with edits: a photo nobody touched can stop matching. It is asked whole.
-            let clocked = f.depends_on_now()
-                || (!f.albums_tested().is_empty() && self.catalog.albums().any(|al| al.smart.as_deref().is_some_and(Filter::depends_on_now)));
+            let clocked = filter_depends_on_clock(&f, &self.catalog);
             let base = self.base.take().filter(|(of, _, _)| *of == view);
             // A small edit to the same view: the photos it touched are taken out, asked about again, and put back
             // at their place in the order. The others neither stopped matching nor moved.
@@ -1365,6 +1437,7 @@ impl Session {
             self.visible = visible.into();
             self.visible_gen = VISIBLE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.visible_key = Some(key);
+            self.visible_clock_minute = clocked.then(|| clock_minute(&now).to_owned());
         }
         &self.visible
     }
@@ -1416,12 +1489,20 @@ impl Session {
     /// view, so a list followed many times over is compared, not only one followed once.
     #[cfg(test)]
     pub(crate) fn visible_in_full(&mut self) -> Vec<PhotoId> {
-        let kept = (self.base.clone(), self.visible_key.clone(), self.visible.clone(), self.visible_gen, self.view_followed, self.view_worked_out);
+        let kept = (
+            self.base.clone(),
+            self.visible_key.clone(),
+            self.visible_clock_minute.clone(),
+            self.visible.clone(),
+            self.visible_gen,
+            self.view_followed,
+            self.view_worked_out,
+        );
         self.never_follow = true;
         self.visible_key = None;
         let whole = self.visible().to_vec();
         self.never_follow = false;
-        (self.base, self.visible_key, self.visible, self.visible_gen, self.view_followed, self.view_worked_out) = kept;
+        (self.base, self.visible_key, self.visible_clock_minute, self.visible, self.visible_gen, self.view_followed, self.view_worked_out) = kept;
         whole
     }
 
@@ -1449,7 +1530,15 @@ impl Session {
             }
         }
         let key = (self.catalog.revision, format!("{:?}|{:?}|{:?}", self.source, self.browse, self.library_folder));
-        if self.total.as_ref().map(|t| &t.0) != Some(&key) {
+        let key_changed = self.total.as_ref().map(|total| &total.0) != Some(&key);
+        let cached_minute = self.total.as_ref().and_then(|total| total.2.as_deref());
+        let current_now = cached_minute.map(|_| (self.clock)());
+        let current_minute = current_now.as_deref().map(clock_minute);
+        let clock_changed = cached_minute.is_some_and(|cached| current_minute != Some(cached));
+        if key_changed || clock_changed {
+            // The source count can be requested before `visible`; bind it to the session's clock itself.
+            let now = current_now.unwrap_or_else(|| (self.clock)());
+            lcc_catalog::rules::set_now(Some(now.clone()));
             let mut f = self.source.to_filter(&Filter::default(), &self.catalog);
             if self.source == LibrarySource::Folder {
                 let b = self.browse.clone().unwrap_or_default();
@@ -1463,8 +1552,10 @@ impl Session {
                 f.only = self.previous_export_filter();
                 f.only_none = false;
             }
-            let n = self.catalog.query(&f, &self.sort).len();
-            self.total = Some((key, n));
+            // (how many, not which: nothing to put in order)
+            let n = self.catalog.count(&f);
+            let clocked = filter_depends_on_clock(&f, &self.catalog);
+            self.total = Some((key, n, clocked.then(|| clock_minute(&now).to_owned())));
         }
         self.total.as_ref().map(|t| t.1)
     }
@@ -1509,6 +1600,16 @@ impl Session {
     pub fn visible_shared(&mut self) -> (u64, Arc<[PhotoId]>) {
         self.visible();
         (self.visible_gen, self.visible.clone())
+    }
+
+    /// The photos a Develop slider changes: the active photo, and with Auto Sync on every selected
+    /// photo (the active one first).
+    pub fn slider_targets(&self) -> Vec<PhotoId> {
+        let Some(active) = self.active() else { return Vec::new() };
+        if !self.auto_sync || self.selection.ids.len() < 2 || !self.selection.contains(active) {
+            return vec![active];
+        }
+        std::iter::once(active).chain(self.selection.ids.iter().copied().filter(|x| *x != active)).collect()
     }
 
     /// Targets of photo commands: the explicit `ids` (photo ids) or `id` (a photo id) param, else [`Self::selected`].
@@ -1585,8 +1686,27 @@ pub fn json_delta(old: &Value, new: &Value) -> Option<Value> {
     }
 }
 
+/// Whether `op` changes where a photo's file is, or removes or replaces it.
+fn op_moves_files(op: &Op) -> bool {
+    let mut pending = vec![op];
+    while let Some(op) = pending.pop() {
+        match op {
+            Op::SetFile { .. } | Op::Relink { .. } | Op::RemovePhoto { .. } | Op::SetContent { .. } => return true,
+            Op::Batch { ops } => pending.extend(ops),
+            _ => {}
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod lightroom_fixture;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_album_loops;
+#[cfg(test)]
+mod tests_album_missing;
 #[cfg(test)]
 mod tests_album_order;
 #[cfg(test)]
@@ -1633,6 +1753,8 @@ mod tests_facets;
 mod tests_filesystem_history;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests_focus_scan;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests_folder_metadata;
 #[cfg(test)]
 mod tests_folder_watch;
 #[cfg(test)]
@@ -1669,6 +1791,8 @@ mod tests_libops;
 mod tests_library;
 #[cfg(test)]
 mod tests_lightroom_folder;
+#[cfg(test)]
+mod tests_lightroom_history;
 #[cfg(test)]
 mod tests_mask_effects;
 #[cfg(test)]

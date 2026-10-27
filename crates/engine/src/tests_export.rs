@@ -6,6 +6,14 @@ use crate::Session;
 use crate::export::{ExportFormat, ExportOptions, export_photo};
 use crate::tests_xmp::{synthetic_dng_with, synthetic_psd_with_metadata, temp_dir};
 
+fn jpeg_with_xmp(metadata: &lcc_meta::Metadata) -> Vec<u8> {
+    let pixels = [96u8; 12];
+    let image = lcc_codecs::EncodeImage::new(2, 2, 3, lcc_codecs::Samples::U8(&pixels));
+    let xmp = lcc_meta::write_xmp(metadata, None);
+    let encoded = lcc_codecs::EncodeMeta { xmp: Some(&xmp), ..Default::default() };
+    lcc_codecs::encode_jpeg(&image, 90, lcc_codecs::ChromaSubsampling::S444, &encoded).unwrap()
+}
+
 #[test]
 fn full_size_export_of_a_cropped_photo_is_not_upscaled() {
     let mut s = Session::with_demo();
@@ -312,6 +320,8 @@ fn library_with_jpeg(tag: &str) -> (Session, lcc_catalog::PhotoId, std::path::Pa
 
 fn preset_export_preserves_originals(command: &str, selection: serde_json::Value, tag: &str) {
     let (mut s, _, dir, src, original) = library_with_jpeg(tag);
+    // something for mask.exportEffects to write (the other commands ignore it)
+    s.mask_effects.push(crate::cmd::mask_effects::MaskEffect { name: "Glow".into(), ..Default::default() });
     let sidecar = src.with_extension("xmp");
     let appended_sidecar = dir.join("IMG_1.jpg.xmp");
     std::fs::write(&sidecar, b"existing sidecar").unwrap();
@@ -350,13 +360,60 @@ fn curve_preset_export_never_overwrites_originals_or_sidecars() {
     preset_export_preserves_originals("curve.exportPresets", json!({"names": ["Linear"]}), "curve-export-guard");
 }
 
+/// A new file named like a photo's sidecar, in the photo's folder, would be read back as that
+/// photo's edits: refused even though nothing is there yet.
+#[test]
+fn preset_export_never_creates_a_photos_sidecar() {
+    let (mut s, _, dir, _, _) = library_with_jpeg("preset-export-new-sidecar");
+    std::fs::create_dir_all(dir.join("presets")).unwrap();
+    for name in ["IMG_1.xmp", "IMG_1.jpg.xmp", "presets/../IMG_1.xmp"] {
+        let path = dir.join(name);
+        assert!(!path.exists(), "{name} isn't there before the export");
+        let error = s.execute("preset.export", &json!({"ids": ["lc.warm-glow"], "path": path.to_string_lossy()})).unwrap_err().to_string();
+        assert!(error.contains("XMP sidecar of IMG_1.jpg"), "{error}");
+        assert!(!path.exists(), "{name} was not created");
+    }
+    // the same name in another folder is an ordinary preset file
+    let elsewhere = dir.join("presets/IMG_1.xmp");
+    s.execute("preset.export", &json!({"ids": ["lc.warm-glow"], "path": elsewhere.to_string_lossy()})).unwrap();
+    assert!(elsewhere.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// #1944: Export Keywords went straight to `std::fs::write`, replacing a library original.
+#[test]
+fn keyword_export_never_overwrites_originals_or_sidecars() {
+    preset_export_preserves_originals("keyword.export", json!({}), "keyword-export-guard");
+}
+
+#[test]
+fn keyword_export_preserves_the_previous_file_on_write_failure() {
+    let dir = temp_dir("keyword-export-failure");
+    let mut s = Session::with_demo();
+    let path = dir.join("keywords.txt");
+    let params = json!({"path": path.to_string_lossy()});
+    s.execute("keyword.export", &params).unwrap();
+    let previous = std::fs::read(&path).unwrap();
+    {
+        let _fault = lcc_catalog::safe_file::fail_writes_after(4);
+        assert!(s.execute("keyword.export", &params).is_err(), "keyword.export must report the failed write");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), previous, "the prior export is kept");
+    s.execute("keyword.export", &params).unwrap();
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary files remain");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn preset_exports_preserve_previous_files_on_write_failure() {
     let dir = temp_dir("preset-export-failure");
     let mut s = Session::new();
-    for (command, selection, file) in
-        [("preset.export", json!({"ids": ["lc.warm-glow"]}), "look.lcpreset"), ("curve.exportPresets", json!({"names": ["Linear"]}), "curve.lccurve")]
-    {
+    s.mask_effects.push(crate::cmd::mask_effects::MaskEffect { name: "Glow".into(), ..Default::default() });
+    for (command, selection, file) in [
+        ("preset.export", json!({"ids": ["lc.warm-glow"]}), "look.lcpreset"),
+        ("curve.exportPresets", json!({"names": ["Linear"]}), "curve.lccurve"),
+        ("mask.exportEffects", json!({"names": ["Glow"]}), "effects.lceffect"),
+    ] {
         let path = dir.join(file);
         let mut params = selection;
         params["path"] = json!(path.to_string_lossy());
@@ -369,8 +426,14 @@ fn preset_exports_preserve_previous_files_on_write_failure() {
         assert_eq!(std::fs::read(&path).unwrap(), previous, "{command} preserves the prior export");
         assert_eq!(s.execute(command, &params).unwrap()["count"], 1, "replacement still succeeds");
     }
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temporary files remain");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "no temporary files remain");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Issue #2564: mask.exportEffects wrote anywhere, over an original or its sidecar too.
+#[test]
+fn mask_effect_export_never_overwrites_originals_or_sidecars() {
+    preset_export_preserves_originals("mask.exportEffects", json!({"names": ["Glow"]}), "effect-export-guard");
 }
 
 fn disk_batch(
@@ -692,6 +755,168 @@ fn remove_location_holds_for_original_and_dng_exports() {
     let err = export_photo(&mut s, jid, &opts("original", true), 1).err().unwrap();
     assert!(err.contains("can't remove the location") && err.contains("export as JPEG"), "{err}");
     assert!(!err.contains("DNG"), "a JPEG can't be exported as DNG: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remove_location_refuses_original_with_embedded_place_names() {
+    let dir = temp_dir("export-noloc-place-fields");
+    let value = "Embedded Place";
+    let cases = [
+        ("sublocation", lcc_meta::Metadata { sublocation: Some(value.into()), ..Default::default() }),
+        ("city", lcc_meta::Metadata { city: Some(value.into()), ..Default::default() }),
+        ("state", lcc_meta::Metadata { state: Some(value.into()), ..Default::default() }),
+        ("country", lcc_meta::Metadata { country: Some(value.into()), ..Default::default() }),
+    ];
+    let mut paths = Vec::new();
+    for (name, metadata) in &cases {
+        let path = dir.join(format!("{name}.jpg"));
+        std::fs::write(&path, jpeg_with_xmp(metadata)).unwrap();
+        paths.push(path.to_string_lossy().to_string());
+    }
+
+    let mut session = Session::new().with_fs();
+    session.execute("library.import", &json!({"paths": paths})).unwrap();
+    let options = ExportOptions { format: ExportFormat::Original, remove_location: true, ..Default::default() };
+    for (name, _) in cases {
+        let photo_id = session.catalog.photos().find(|p| p.file_name == format!("{name}.jpg")).unwrap().id;
+        let original = std::fs::read(dir.join(format!("{name}.jpg"))).unwrap();
+        let embedded = lcc_meta::try_extract(&original).unwrap();
+        assert!(embedded.gps.is_none(), "{name} fixture should isolate place names");
+        let place_name = match name {
+            "sublocation" => embedded.sublocation.as_deref(),
+            "city" => embedded.city.as_deref(),
+            "state" => embedded.state.as_deref(),
+            "country" => embedded.country.as_deref(),
+            _ => None,
+        };
+        assert_eq!(place_name, Some(value), "{name} fixture should be parsed");
+        let error = export_photo(&mut session, photo_id, &options, 1).err().expect("embedded place name should refuse Original export");
+        assert!(error.contains("place names") && error.contains("export as JPEG or TIFF"), "{name}: {error}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remove_location_refuses_original_with_unreadable_non_psd_xmp() {
+    let dir = temp_dir("export-noloc-malformed-xmp");
+    let path = dir.join("Unreadable.jpg");
+    let pixels = [96u8; 12];
+    let image = lcc_codecs::EncodeImage::new(2, 2, 3, lcc_codecs::Samples::U8(&pixels));
+    let xmp = "<x:xmpmeta><broken";
+    let encoded = lcc_codecs::EncodeMeta { xmp: Some(xmp), ..Default::default() };
+    let bytes = lcc_codecs::encode_jpeg(&image, 90, lcc_codecs::ChromaSubsampling::S444, &encoded).unwrap();
+    assert!(lcc_meta::parse_xmp(xmp).is_err(), "fixture XMP should be malformed");
+    let metadata = lcc_meta::try_extract(&bytes).unwrap();
+    assert!(metadata.gps.is_none() && metadata.city.is_none(), "best-effort extraction omits malformed XMP");
+    std::fs::write(&path, bytes).unwrap();
+
+    let mut session = Session::new().with_fs();
+    session.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+    let id = session.catalog.photos().next().unwrap().id;
+    let options = ExportOptions { format: ExportFormat::Original, remove_location: true, ..Default::default() };
+    let error = export_photo(&mut session, id, &options, 1).err().expect("unreadable XMP must not pass location removal");
+    assert!(error.contains("can't verify location metadata") && error.contains("malformed embedded XMP"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remove_location_original_place_refusal_writes_no_files() {
+    use crate::export::{Destination, prepare_batch, run_batch};
+
+    let dir = temp_dir("export-noloc-place-no-write");
+    let source = dir.join("City.jpg");
+    let original = jpeg_with_xmp(&lcc_meta::Metadata { city: Some("Embedded Place".into()), ..Default::default() });
+    std::fs::write(&source, &original).unwrap();
+    let output = dir.join("out");
+    std::fs::create_dir_all(&output).unwrap();
+
+    let mut session = Session::new().with_fs();
+    session.execute("library.import", &json!({"paths": [source.to_string_lossy()]})).unwrap();
+    let id = session.catalog.photos().next().unwrap().id;
+    let options = ExportOptions { format: ExportFormat::Original, remove_location: true, ..Default::default() };
+    let items = prepare_batch(&mut session, &[id], &options).unwrap();
+    let destination = Destination { dir: output.to_string_lossy().to_string(), exact: None };
+    let mut writes = Vec::new();
+    let mut write = |path: &str, bytes: &[u8]| -> Result<(), String> {
+        writes.push(path.to_string());
+        std::fs::write(path, bytes).map_err(|error| error.to_string())
+    };
+    let exists = |path: &str| std::path::Path::new(path).exists();
+    let result = run_batch(items, &options, &destination, &mut write, &exists, true, &mut |_, _| true);
+
+    let error = result.unwrap_err();
+    assert!(error.contains("place names"), "{error}");
+    assert!(writes.is_empty(), "refused export called the writer: {writes:?}");
+    assert!(!output.join("City.jpg").exists());
+    assert!(!output.join("City.xmp").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remove_location_checks_embedded_places_after_catalog_clear() {
+    let dir = temp_dir("export-noloc-place-catalog-clear");
+    let source = dir.join("City.jpg");
+    let original = jpeg_with_xmp(&lcc_meta::Metadata { city: Some("Embedded Place".into()), ..Default::default() });
+    std::fs::write(&source, &original).unwrap();
+
+    let mut session = Session::new().with_fs();
+    session.execute("library.import", &json!({"paths": [source.to_string_lossy()]})).unwrap();
+    let id = session.catalog.photos().next().unwrap().id;
+    assert_eq!(session.catalog.photo(id).unwrap().meta.city, "Embedded Place");
+    session.execute("photo.setMeta", &json!({"ids": [id.0], "city": ""})).unwrap();
+    assert!(session.catalog.photo(id).unwrap().meta.city.is_empty());
+    assert_eq!(lcc_meta::try_extract(&std::fs::read(&source).unwrap()).unwrap().city.as_deref(), Some("Embedded Place"));
+
+    let options = ExportOptions { format: ExportFormat::Original, remove_location: true, ..Default::default() };
+    let error = export_photo(&mut session, id, &options, 1).err().expect("embedded place name should refuse Original export");
+    assert!(error.contains("place names"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remove_location_allows_original_without_embedded_location() {
+    let dir = temp_dir("export-noloc-place-controls");
+    let embedded_path = dir.join("Embedded.jpg");
+    let no_location_path = dir.join("NoLocation.jpg");
+    let blank_path = dir.join("Blank.jpg");
+    let embedded = jpeg_with_xmp(&lcc_meta::Metadata { city: Some("Embedded Place".into()), ..Default::default() });
+    let no_location = jpeg_with_xmp(&Default::default());
+    let blank = jpeg_with_xmp(&lcc_meta::Metadata { city: Some("  \t".into()), ..Default::default() });
+    std::fs::write(&embedded_path, &embedded).unwrap();
+    std::fs::write(&no_location_path, &no_location).unwrap();
+    std::fs::write(&blank_path, &blank).unwrap();
+    assert!(lcc_meta::try_extract(&blank).unwrap().city.is_none(), "whitespace-only XMP place names are blank");
+
+    let mut session = Session::new().with_fs();
+    session
+        .execute(
+            "library.import",
+            &json!({"paths": [embedded_path.to_string_lossy(), no_location_path.to_string_lossy(), blank_path.to_string_lossy()]}),
+        )
+        .unwrap();
+    let photo_id = |name: &str| session.catalog.photos().find(|p| p.file_name == name).unwrap().id;
+    let embedded_id = photo_id("Embedded.jpg");
+    let no_location_id = photo_id("NoLocation.jpg");
+    let blank_id = photo_id("Blank.jpg");
+
+    let keep = ExportOptions { format: ExportFormat::Original, ..Default::default() };
+    let kept = export_photo(&mut session, embedded_id, &keep, 1).unwrap();
+    assert_eq!(kept.bytes, embedded, "removeLocation=false still copies the source byte for byte");
+    assert_eq!(lcc_meta::try_extract(&kept.bytes).unwrap().city.as_deref(), Some("Embedded Place"));
+
+    let remove = ExportOptions { format: ExportFormat::Original, remove_location: true, ..Default::default() };
+    for (id, source) in [(no_location_id, &no_location), (blank_id, &blank)] {
+        let exported = export_photo(&mut session, id, &remove, 1).unwrap();
+        assert_eq!(&exported.bytes, source);
+    }
+
+    session.execute("photo.setMeta", &json!({"ids": [no_location_id.0], "city": "Catalog-only Place"})).unwrap();
+    let catalog_only = export_photo(&mut session, no_location_id, &remove, 1).unwrap();
+    let sidecar = catalog_only.sidecars.first().unwrap().1.as_slice();
+    let packet = std::str::from_utf8(sidecar).unwrap();
+    assert!(lcc_meta::parse_xmp(packet).unwrap().metadata.city.is_none(), "catalog-only place name is removed from the sidecar");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1370,5 +1595,174 @@ fn overwrite_never_clobbers_a_file_of_the_same_batch() {
     assert!(paths[1].ends_with("IMG_1-2.jpg"), "{files:?}");
     assert_ne!(std::fs::read(out.join("IMG_1.jpg")).unwrap(), b"an earlier run", "the earlier run's file is replaced");
     assert!(out.join("IMG_1-2.jpg").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A library with one 300 × 200 PNG: transparent, with an opaque red 150 × 100 rectangle in the middle.
+fn library_with_transparent_png(tag: &str) -> (Session, lcc_catalog::PhotoId, std::path::PathBuf) {
+    let dir = temp_dir(tag);
+    let src = dir.join("logo.png");
+    let img =
+        lcc_raster::Rgba8::from_fn(300, 200, |x, y| if (75..225).contains(&x) && (50..150).contains(&y) { [200, 40, 30, 255] } else { [0, 0, 0, 0] });
+    let png = lcc_codecs::encode_png(&lcc_codecs::EncodeImage::rgba8(&img), &Default::default()).unwrap();
+    std::fs::write(&src, png).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.catalog.photos().next().unwrap().id;
+    (s, id, dir)
+}
+
+/// Issue #2976: PNG, TIFF and WebP exports of a transparent source keep its alpha, at 8 and 16 bits,
+/// with the colour of the opaque part as it was (no white mixed in); TIFF stores it associated.
+#[test]
+fn transparent_sources_keep_their_alpha_in_png_tiff_and_webp() {
+    let (mut s, id, dir) = library_with_transparent_png("export-alpha");
+    for (format, depth) in [("png", 8), ("png", 16), ("tiff", 8), ("tiff", 16), ("tiff", 32), ("webp", 8)] {
+        let o = ExportOptions::from_json(&json!({"format": format, "bitDepth": depth}));
+        let e = export_photo(&mut s, id, &o, 1).unwrap();
+        let d = lcc_codecs::decode(&e.bytes, Default::default()).unwrap();
+        assert!(d.has_alpha, "{format} {depth}-bit keeps alpha");
+        assert_eq!((d.width, d.height), (300, 200), "{format} {depth}-bit");
+        let a = d.alpha.as_ref().unwrap();
+        for (x, y) in [(2, 2), (297, 197), (74, 100), (150, 49)] {
+            assert!(a.get(x, y) < 1e-3, "{format} {depth}-bit: transparent at ({x}, {y})");
+        }
+        for (x, y) in [(75, 100), (150, 100), (224, 149)] {
+            assert!(a.get(x, y) > 0.999, "{format} {depth}-bit: opaque at ({x}, {y})");
+        }
+        let edge = d.to_srgb8().get(75, 100);
+        assert!(edge[0].abs_diff(200) <= 2 && edge[1].abs_diff(40) <= 2 && edge[2].abs_diff(30) <= 2, "{format} {depth}-bit edge {edge:?}");
+        if format == "tiff" {
+            // ExtraSamples (338), SHORT, count 1, value 1: associated alpha
+            assert!(e.bytes.windows(10).any(|w| w == [0x52, 0x01, 3, 0, 1, 0, 0, 0, 1, 0]), "{depth}-bit TIFF alpha is associated");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// JPEG (and the other formats without alpha in this export) composites a transparent source onto
+/// white as before; an opaque PNG source still exports as RGB (#1670).
+#[test]
+fn transparency_stays_on_white_where_it_is_not_kept() {
+    let (mut s, id, dir) = library_with_transparent_png("export-alpha-white");
+    // (AVIF is left out: it composites onto white too, but this build can't decode one to check)
+    for format in ["jpeg", "psd", "jxl"] {
+        let e = export_photo(&mut s, id, &ExportOptions::from_json(&json!({"format": format})), 1).unwrap();
+        let d = lcc_codecs::decode(&e.bytes, Default::default()).unwrap();
+        assert!(!d.has_alpha, "{format}");
+        let corner = d.to_srgb8().get(2, 2);
+        assert!(corner.iter().take(3).all(|&c| c >= 250), "{format} corner on white: {corner:?}");
+    }
+    let src = dir.join("opaque.png");
+    let img = lcc_raster::Rgba8::from_fn(64, 48, |x, y| [(x * 3) as u8, (y * 5) as u8, 90, 255]);
+    std::fs::write(&src, lcc_codecs::encode_png(&lcc_codecs::EncodeImage::rgba8(&img), &Default::default()).unwrap()).unwrap();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let opaque = s.catalog.photos().map(|p| p.id).find(|&p| p != id).unwrap();
+    let e = export_photo(&mut s, opaque, &ExportOptions::from_json(&json!({"format": "png"})), 1).unwrap();
+    assert_eq!(e.bytes[25], 2, "PNG IHDR declares RGB");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The alpha follows the pixels through rotation, crop and resize.
+#[test]
+fn exported_alpha_follows_rotate_crop_and_resize() {
+    let (mut s, id, dir) = library_with_transparent_png("export-alpha-geometry");
+    // turned right: 200 × 300 with the rectangle at x 50..150, y 75..225; its left half: 100 × 300;
+    // fitted to 150 px: 50 × 150, the rectangle at x 25..50, y 37.5..112.5
+    s.execute("photo.rotateRight", &json!({})).unwrap();
+    s.execute("crop.set", &json!({"rect": [0.0, 0.0, 0.5, 1.0]})).unwrap();
+    let e = export_photo(&mut s, id, &ExportOptions::from_json(&json!({"format": "png", "longEdge": 150})), 1).unwrap();
+    let d = lcc_codecs::decode(&e.bytes, Default::default()).unwrap();
+    assert_eq!((d.width, d.height), (50, 150));
+    let px = d.to_srgb8();
+    for (x, y) in [(30, 75), (45, 40), (45, 110)] {
+        let p = px.get(x, y);
+        assert_eq!(p[3], 255, "opaque at ({x}, {y})");
+        assert!(p[0] > 150 && p[1] < 80, "red at ({x}, {y}): {p:?}");
+    }
+    for (x, y) in [(10, 75), (30, 20), (30, 130)] {
+        assert_eq!(px.get(x, y)[3], 0, "transparent at ({x}, {y})");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #2976: a source without transparency (no alpha channel, or one opaque everywhere) exports
+/// exactly as before, byte for byte, through the PNG/TIFF/WebP path too: the grey a Transform brings
+/// in around the photo stays grey and no alpha is written.
+#[test]
+fn opaque_sources_export_exactly_as_before() {
+    let dir = temp_dir("export-alpha-opaque");
+    let mut s = Session::new().with_fs();
+    let img = lcc_raster::Rgba8::from_fn(96, 64, |x, y| [(x * 2) as u8, (y * 3) as u8, 90, 255]);
+    let rgba = dir.join("rgba.png");
+    std::fs::write(&rgba, lcc_codecs::encode_png(&lcc_codecs::EncodeImage::rgba8(&img), &Default::default()).unwrap()).unwrap();
+    let rgb = dir.join("rgb.png");
+    let flat: Vec<u8> = img.data.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb_png = lcc_codecs::encode_png(&lcc_codecs::EncodeImage::new(96, 64, 3, lcc_codecs::Samples::U8(&flat)), &Default::default());
+    std::fs::write(&rgb, rgb_png.unwrap()).unwrap();
+    s.execute("library.import", &json!({"paths": [rgba.to_string_lossy(), rgb.to_string_lossy()]})).unwrap();
+    let ids: Vec<_> = s.catalog.photos().map(|p| p.id).collect();
+    assert_eq!(ids.len(), 2);
+    for id in ids {
+        s.execute("develop.set", &json!({"ids": [id.0], "control": "geometry.vertical", "value": -60})).unwrap();
+        for (format, depth) in [("png", 8), ("png", 16), ("tiff", 8), ("webp", 8)] {
+            let o = ExportOptions::from_json(&json!({"format": format, "bitDepth": depth}));
+            let e = export_photo(&mut s, id, &o, 1).unwrap();
+            // the same render without the transparency path, as before #2976
+            let (w, h) = crate::export::output_size(s.catalog.photo(id).unwrap(), &o);
+            let meta = crate::export::export_metadata(s.catalog.photo(id).unwrap(), &s.catalog, &o);
+            let job = s.export_job(id, w, h, o.effective_space(), o.effective_depth()).unwrap();
+            let before = crate::export::encode_rendered(&job.run().rendered.unwrap(), &o, meta.as_ref()).unwrap();
+            assert!(e.bytes == before, "{format} {depth}-bit: identical to the render without transparency");
+            let d = lcc_codecs::decode(&e.bytes, Default::default()).unwrap();
+            assert!(!d.has_alpha, "{format} {depth}-bit: no alpha");
+            if (format, depth) == ("png", 8) {
+                // the keystone brings in the light grey outside the photo at the bottom corners
+                let corner = d.to_srgb8().get(1, d.height as usize - 2);
+                assert!(corner[0] == corner[1] && corner[1] == corner[2] && corner[0] > 150, "grey corner: {corner:?}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #2976, end to end: a logo with soft, semi-transparent edges keeps them through a crop, a
+/// 10° straighten and an exposure change, with the colour of its opaque part (no white fringe) and
+/// transparent corners, in PNG, TIFF and WebP.
+#[test]
+fn soft_edges_keep_their_colour_through_crop_straighten_and_exposure() {
+    let dir = temp_dir("export-alpha-soft");
+    let src = dir.join("soft.png");
+    // a blue disc of radius 90 with a 24 px soft edge
+    let img = lcc_raster::Rgba8::from_fn(400, 300, |x, y| {
+        let d = ((x as f32 + 0.5 - 200.0).powi(2) + (y as f32 + 0.5 - 150.0).powi(2)).sqrt();
+        let a = ((90.0 - d) / 24.0 + 0.5).clamp(0.0, 1.0);
+        if a > 0.0 { [30, 120, 200, (a * 255.0).round() as u8] } else { [0, 0, 0, 0] }
+    });
+    std::fs::write(&src, lcc_codecs::encode_png(&lcc_codecs::EncodeImage::rgba8(&img), &Default::default()).unwrap()).unwrap();
+    let mut s = Session::new().with_fs();
+    s.execute("library.import", &json!({"paths": [src.to_string_lossy()]})).unwrap();
+    let id = s.catalog.photos().next().unwrap().id;
+    s.execute("crop.set", &json!({"rect": [0.1, 0.1, 0.9, 0.9]})).unwrap();
+    s.execute("crop.set", &json!({"angle": 10.0})).unwrap();
+    s.execute("develop.set", &json!({"ids": [id.0], "control": "light.exposure", "value": 0.7})).unwrap();
+    for format in ["png", "tiff", "webp"] {
+        let e = export_photo(&mut s, id, &ExportOptions::from_json(&json!({"format": format})), 1).unwrap();
+        let d = lcc_codecs::decode(&e.bytes, Default::default()).unwrap();
+        assert!(d.has_alpha, "{format}");
+        let px = d.to_srgb8();
+        let (w, h) = (px.width, px.height);
+        assert_eq!(px.get(1, 1)[3], 0, "{format}: transparent corner");
+        let centre = px.get(w / 2, h / 2);
+        assert_eq!(centre[3], 255, "{format}: opaque centre");
+        assert!(centre[2] > 200, "{format}: the exposure brightened the disc: {centre:?}");
+        // every soft-edge pixel has the colour of the opaque part
+        let soft: Vec<[u8; 4]> = px.data.iter().copied().filter(|p| (24..=232).contains(&p[3])).collect();
+        assert!(soft.len() > 500, "{format}: the soft edge survives ({} pixels)", soft.len());
+        let tolerance = if format == "tiff" { 6 } else { 3 };
+        for p in &soft {
+            assert!((0..3).all(|c| p[c].abs_diff(centre[c]) <= tolerance), "{format}: soft-edge colour {p:?} vs the disc's {centre:?}");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -108,6 +108,27 @@ fn a_key_given_to_a_command_overrides_a_fixed_key() {
     assert_eq!(before, after, "the rating key must not fire too");
 }
 
+/// A declared key that yields to another command's saved key can be taken back with ↺.
+#[test]
+fn restore_takes_back_a_declared_key_another_command_holds() {
+    use crate::shortcuts::shortcut_of;
+    let mut h = demo();
+    h.app.ui.settings.keymap.insert("photo.increaseRating".into(), "P".into());
+    assert_eq!(shortcut_of(&h.app.ui.settings.keymap, "photo.pick"), None);
+    h.app.run("app.shortcuts", json!({})).unwrap();
+    h.step();
+    h.step();
+    click(&mut h, "check:shortcuts.showAll");
+    click(&mut h, "field:shortcutsSearch");
+    assert_eq!(h.request("ui.text", json!({"text": "flag as pick"}), T)["ok"], true);
+    h.step();
+    h.step();
+    click(&mut h, "button:shortcutReset-photo.pick");
+    assert_eq!(shortcut_of(&h.app.ui.settings.keymap, "photo.pick"), Some("P"));
+    assert_eq!(shortcut_of(&h.app.ui.settings.keymap, "photo.increaseRating"), None);
+    assert!(h.app.ui.settings.keymap.is_empty(), "{:?}", h.app.ui.settings.keymap);
+}
+
 /// Open the editor, filtered to `search`, and start recording for `id`.
 fn record(h: &mut Headless, search: &str, id: &str) {
     if h.app.ui.dialog.is_none() {
@@ -372,6 +393,51 @@ fn shift_insert_pastes_plainly() {
     assert_eq!(h.app.ui.dialog, None, "no Paste Selected Settings");
     assert_eq!(h.app.session.undo.len(), undo + 1, "the settings were pasted");
 }
+
+/// ⌘⌥⇧C / ⌘⌥⇧V (Ctrl+Alt+Shift+C / V) copy and paste metadata, as in Lightroom Classic's Library,
+/// both as key presses and as the clipboard events Windows and Linux turn them into; the edit
+/// settings clipboard is left alone.
+#[test]
+fn cmd_alt_shift_c_and_v_copy_and_paste_metadata() {
+    let mut h = demo();
+    let ids: Vec<_> = h.app.session.visible().iter().copied().take(2).collect();
+    let (a, b) = (ids[0], ids[1]);
+    let title = |h: &Headless, id| h.app.session.catalog.photo(id).unwrap().meta.title.clone();
+    h.app.run("library.select", json!({"ids": [a.0]})).unwrap();
+    h.app.run("photo.setMeta", json!({"title": "Dawn", "creator": "Me"})).unwrap();
+    h.app.run("library.select", json!({"ids": [b.0]})).unwrap();
+    h.app.run("photo.setMeta", json!({"title": "Other"})).unwrap();
+    let chord = json!({"cmd": true, "alt": true, "shift": true});
+    let press = |h: &mut Headless, k: &str| {
+        let mut p = chord.clone();
+        p["key"] = json!(k);
+        let r = h.request("ui.key", p, T);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+    };
+
+    h.app.run("library.select", json!({"ids": [a.0]})).unwrap();
+    press(&mut h, "C");
+    assert_eq!(h.app.session.meta_clipboard.as_ref().map(|m| m["title"].clone()), Some(json!("Dawn")), "the key copied the metadata");
+    h.app.run("library.select", json!({"ids": [b.0]})).unwrap();
+    press(&mut h, "V");
+    assert_eq!(title(&h, b), "Dawn", "the key pasted the metadata");
+    assert_eq!(h.app.session.catalog.photo(b).unwrap().meta.creator, "Me");
+
+    h.app.session.meta_clipboard = None;
+    h.app.run("photo.setMeta", json!({"title": "Other"})).unwrap();
+    let all = egui::Modifiers::COMMAND | egui::Modifiers::ALT | egui::Modifiers::SHIFT;
+    h.app.run("library.select", json!({"ids": [a.0]})).unwrap();
+    h.events.extend([egui::Event::ModifiersChanged(all), egui::Event::Copy]);
+    h.settle(SETTLE);
+    assert!(h.app.session.meta_clipboard.is_some(), "the Copy event with ⌥⇧ held copied the metadata");
+    h.app.run("library.select", json!({"ids": [b.0]})).unwrap();
+    h.events.extend([egui::Event::ModifiersChanged(all), egui::Event::Paste("text".into())]);
+    h.settle(SETTLE);
+    assert_eq!(title(&h, b), "Dawn", "the Paste event with ⌥⇧ held pasted the metadata");
+    assert!(h.app.session.clipboard.is_none(), "no edit settings were copied");
+    assert_eq!(h.app.ui.dialog, None, "no Paste Selected Settings");
+}
 /// The opening release can carry both physical shortcut keys and the replacement text.
 #[test]
 fn opening_numeric_release_keeps_keys_in_the_editor() {
@@ -603,6 +669,80 @@ fn navigation_open_library_and_hdr_keys_wait_for_a_text_field() {
     assert!(h.app.ui.dialog.is_none());
 }
 
+/// Shift+Up / Shift+Down in a grid add every photo from the active one to the cell above / below it
+/// (the cell plain Up / Down move to) and make that cell active; the top and bottom rows do nothing,
+/// and the loupe has no such key.
+#[test]
+fn shift_up_down_extend_the_grid_selection_by_a_row() {
+    let (mut h, vis, middle) = grid_demo();
+    let at = vis.iter().position(|p| *p == middle).unwrap();
+
+    press(&mut h, "Down", &["shift"]);
+    let reached = h.app.session.active().unwrap();
+    let to = vis.iter().position(|p| *p == reached).unwrap();
+    assert!(to > at, "the active photo moved down the grid: {at} -> {to}");
+    let mut got = h.app.session.selection.ids.clone();
+    got.sort_by_key(|p| p.0);
+    let mut want = vis[at..=to].to_vec();
+    want.sort_by_key(|p| p.0);
+    assert_eq!(got, want, "everything from the active photo to the cell below is selected");
+
+    // Shift+Up from there reaches the row the selection began on again: nothing is deselected
+    let before = h.app.session.selection.ids.len();
+    press(&mut h, "Up", &["shift"]);
+    assert!(h.app.session.selection.ids.len() >= before, "Shift+Up never removes photos");
+    for p in &vis[at..=to] {
+        assert!(h.app.session.selection.contains(*p), "{p:?} stays selected");
+    }
+
+    // the first row has no row above, the last none below: the selection stays as it is
+    select(&mut h, vis[0]);
+    press(&mut h, "Up", &["shift"]);
+    assert_eq!(h.app.session.selection.ids, vec![vis[0]], "Shift+Up in the first row is a no-op");
+    let last = *vis.last().unwrap();
+    select(&mut h, last);
+    press(&mut h, "Down", &["shift"]);
+    assert_eq!(h.app.session.selection.ids, vec![last], "Shift+Down in the last row is a no-op");
+
+    // outside a grid it is not the extension key
+    select(&mut h, middle);
+    view(&mut h, json!({ "view": "detail" }));
+    press(&mut h, "Down", &["shift"]);
+    assert_eq!(h.app.session.selection.ids, vec![middle], "the loupe has no grid extension key");
+}
+
+/// Ctrl+Shift+arrows extend the grid selection like Shift+arrows and keep a scattered selection:
+/// the photos selected earlier stay, wherever they are.
+#[test]
+fn ctrl_shift_arrows_extend_the_grid_selection_and_keep_the_rest() {
+    let (mut h, vis, middle) = grid_demo();
+    let at = vis.iter().position(|p| *p == middle).unwrap();
+    let (previous, next) = (vis[at - 1], vis[at + 1]);
+
+    press(&mut h, "Right", &["cmd", "shift"]);
+    assert_eq!(h.app.session.selection.ids, vec![middle, next], "Ctrl+Shift+Right adds the next photo");
+    assert_eq!(h.app.session.active(), Some(next));
+    press(&mut h, "Left", &["cmd", "shift"]);
+    press(&mut h, "Left", &["cmd", "shift"]);
+    assert_eq!(h.app.session.selection.ids, vec![middle, next, previous], "Ctrl+Shift+Left adds the previous photo");
+
+    // a photo far away, selected earlier, stays selected
+    let far = vis[0];
+    let r = h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [far.0], "mode": "add"}}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    press(&mut h, "Right", &["cmd", "shift"]);
+    assert!(h.app.session.selection.contains(far), "the photo selected earlier stays");
+    assert!(h.app.session.selection.contains(middle) && h.app.session.selection.contains(next));
+
+    // downwards it adds the row, as Shift+Down does
+    select(&mut h, middle);
+    press(&mut h, "Down", &["cmd", "shift"]);
+    let reached = h.app.session.active().unwrap();
+    assert_ne!(reached, middle, "Ctrl+Shift+Down moved the active photo");
+    assert!(h.app.session.selection.contains(middle), "the start of the selection stays");
+    assert!(h.app.session.selection.ids.len() >= 2);
+}
+
 /// Shift+Left / Shift+Right belong to the grid: while the full-screen preview covers it they leave
 /// the selection alone. (Home / End are Library module keys in the Classic set and step to the
 /// first / last photo there too.)
@@ -700,4 +840,52 @@ fn keymap_export_refuses_to_overwrite_an_original_or_its_sidecar() {
     }
     assert!(h.app.run("app.keymapExport", json!({"path": dir.join("keys.json").to_str().unwrap()})).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The crop aspect lock is a first-class row of Help - Keyboard Shortcuts: A, listed in the
+/// editor like any other command, sharing the key with Visualize Spots as a contextual pair.
+#[test]
+fn lock_aspect_ratio_is_a_listed_row_on_a() {
+    use crate::shortcuts::{CONTEXTUAL, Keymap, bindable, shortcut_of};
+    let b = bindable().iter().find(|b| b.id == "crop.lockAspect").expect("crop.lockAspect is mappable");
+    assert_eq!(b.label, "Lock Aspect Ratio");
+    assert_eq!(b.default, Some("A"));
+    assert_eq!(shortcut_of(&Keymap::new(), "crop.lockAspect"), Some("A"));
+    assert!(CONTEXTUAL.contains(&("view.visualizeSpots", "crop.lockAspect")), "A is disambiguated by context");
+    // the editor lists it: the row is on screen and records keys for it
+    let mut h = demo();
+    record(&mut h, "lock", "crop.lockAspect");
+    key(&mut h, "Escape", false);
+    assert_eq!(shortcut_of(&h.app.ui.settings.keymap, "crop.lockAspect"), Some("A"), "Esc cancels the recording: A stays");
+    key(&mut h, "Escape", false);
+    assert!(h.app.ui.dialog.is_none());
+}
+
+/// A is the aspect lock while the Crop panel is open — Visualize Spots, the other A, must not take
+/// the panel or turn its view on — and outside the panel A opens Visualize Spots as usual. The lock
+/// is the tool's own (a fresh photo starts locked to its shape and the toggle may only record
+/// "free", leaving the raw develop aspect untouched), so the test reads `crop_tool_aspect`.
+#[test]
+fn a_is_the_aspect_lock_under_crop_and_visualize_spots_elsewhere() {
+    use crate::state::RightPanel;
+    let mut h = demo();
+    let aspect = |h: &Headless| h.app.crop_tool_aspect();
+    let spots_before = h.app.ui.visualize_spots;
+    h.app.run("panel.crop", json!({})).unwrap();
+    h.step();
+    h.step();
+    assert_eq!(h.app.ui.right, RightPanel::Crop);
+    let before = aspect(&h);
+    key(&mut h, "A", false);
+    assert_eq!(h.app.ui.right, RightPanel::Crop, "Visualize Spots must not take the panel");
+    assert_eq!(h.app.ui.visualize_spots, spots_before, "nor turn its view on");
+    assert_ne!(aspect(&h), before, "A toggles the aspect lock");
+    key(&mut h, "A", false);
+    assert_eq!(aspect(&h), before, "A toggles it back");
+    // outside the panel the same key is Visualize Spots again
+    h.app.ui.right = RightPanel::None;
+    key(&mut h, "A", false);
+    assert_eq!(h.app.ui.right, RightPanel::Remove, "A opens Remove with the visualization");
+    assert!(h.app.ui.visualize_spots, "Visualize Spots is on");
+    assert_eq!(aspect(&h), before, "and the aspect is untouched");
 }

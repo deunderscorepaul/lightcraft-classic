@@ -75,14 +75,15 @@ pub fn language_from_command(id: &str) -> Option<crate::i18n::Locale> {
 pub const UI_COMMANDS: &[UiCommand] = &[
     ("ui.dock", "Arrange Panel", None, ""),
     ("ui.dock.reset", "Reset Panel Layout", None, "Window>Panels"),
-    ("modelSetup.cancel", "Cancel Pending Photo Action", None, ""),
+    // re-reads midi.toml, so a controller map can be edited without restarting
+    ("midi.reload", "Reload MIDI Map", None, ""),
     ("view.photoGrid", "Photo Grid", None, "View"),
     ("view.squareGrid", "Square Grid", None, "View>Grid View Style"),
     // G: Photo Grid ↔ Square Grid (from other views: the photo grid)
     ("view.gridToggle", "Grid", Some("G"), ""),
     ("library.selectOnlyActive", "Select Only Active Photo", Some("Cmd+Shift+D"), "Edit"),
     ("tool.guidedUpright", "Guided Upright", Some("Shift+G"), "Window>Tools"),
-    ("view.detail", "Detail", Some("D"), "View"),
+    ("view.detail", "Detail View", Some("D"), "View"),
     ("view.compare", "Compare", Some("Shift+C"), "View"),
     ("view.survey", "Survey", Some("N"), "View"),
     ("view.people", "People", None, "View"),
@@ -145,6 +146,9 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     // Overlay and the Remove panel list the modes.
     ("view.toolOverlay", "Cycle Tool Overlay", Some("Shift+H"), ""),
     ("view.visualizeSpots", "Visualize Spots", Some("A"), "View>Tool Overlay"),
+    // A while the Crop panel is open: the aspect lock as a first-class row. Visualize Spots keeps
+    // the key outside the panel; the two are a contextual pair in shortcuts::handle
+    ("crop.lockAspect", "Lock Aspect Ratio", Some("A"), ""),
     ("view.cropOverlay", "Cycle Crop Overlay", Some("Shift+O"), "View>Tool Overlay"),
     ("view.cropOverlayOrientation", "Cycle Crop Overlay Orientation", None, "View>Tool Overlay"),
     ("view.back", "Back to Grid", Some("Escape"), ""),
@@ -158,7 +162,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("view.infoOverlay", "Cycle Info Overlay", Some("Cmd+I"), "View>Loupe Info"),
     ("view.viewOptions", "View Options…", None, "View>Loupe Info"),
     ("view.chooseLayoutImage", "Choose Layout Image…", None, "View"),
-    ("view.layoutImage", "Show Layout Image", Some("Cmd+Alt+O"), "View"),
+    ("view.layoutImage", "Layout Image", Some("Cmd+Alt+O"), "View"),
     ("view.layoutImageOpacity", "Layout Image Opacity", None, ""),
     ("view.layoutImageMatte", "Layout Image Matte", None, ""),
     ("view.navigator", "Navigator", None, "Window>Panels"),
@@ -173,8 +177,13 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("panel.info", "Info", Some("I"), "Window>Panels"),
     ("panel.keywords", "Keywords", Some("K"), "Window>Panels"),
     ("panel.versions", "Versions", Some("Shift+V"), "Window>Panels"),
+    // Edit Keyword Tag for the keyword picked in the Keyword List (upstream #2879)
+    ("panel.editKeywords", "Edit Keywords", Some("Cmd+Shift+K"), ""),
     ("panel.activity", "History", None, "Window>Panels"),
     ("panel.close", "Close Panel", None, ""),
+    // the Color Mixer's layout {tab?: mixer|point, adjust?: hsl|color, group?: hue|sat|lum|all,
+    // band?: red…magenta}: opens it in the Edit panel (the sliders are the mixer.* controls)
+    ("view.colorMixer", "Color Mixer Layout", None, ""),
     ("panel.collapseRight", "Show/Hide Right Panel", None, "Window>Panels"),
     // {solo?}: true opens just that section (⌥-click on its header); otherwise opens or closes it
     // Lightroom Classic's ⌘1–⌘9, top to bottom (the fork's Tone Curve, Color Mixer, Color Grading and Transform are
@@ -270,6 +279,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("merge.focusStackLast", "Focus Stack with Last Settings", None, "Photo>Photo Merge"),
     ("file.addPhotos", "Import Photos…", Some("Cmd+Shift+I"), "File"),
     ("file.addFolder", "Import from Folder…", None, "File"),
+    // {path?, into?: open | new, name?, location?}: asks where the catalog goes unless `into` (or
+    // Settings) says (#2672, `lightroom_destination`)
     ("file.importLightroom", "Import Lightroom Catalog…", None, "File>More Imports"),
     ("file.importImmich", "Import from Immich…", None, "File>More Imports"),
     ("immich.connections", "Immich Settings…", None, "Library>Immich"),
@@ -281,6 +292,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("file.restoreLibrary", "Restore Library from Backup…", None, "File>Libraries"),
     ("photo.locate", "Locate Missing File…", None, ""),
     ("dialog.saveMetadataPreset", "Save Metadata Preset…", None, ""),
+    // the keywords ⇧K adds or removes, typed with commas between them
+    ("dialog.keywordShortcut", "Set Keyword Shortcut…", Some("Cmd+Alt+Shift+K"), ""),
     ("app.quit", "Quit {app}", Some("Cmd+Q"), "File"),
     ("file.importPresets", "Import Profiles & Presets…", None, "File>More Imports"),
     ("file.exportPresets", "Export Presets…", None, "File>More Exports"),
@@ -293,6 +306,9 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("file.exportExportPresets", "Export User Presets…", None, ""),
     ("file.importKeywords", "Import Keywords…", None, "File>More Imports"),
     ("file.exportKeywords", "Export Keywords…", None, "File>More Exports"),
+    // the active photo's colour for other editors (`camera.exportDcp`, `develop.exportLut`)
+    ("file.exportCameraProfile", "Export Camera Profile (.dcp)…", None, "File>More Exports"),
+    ("file.exportLookLut", "Export Look as LUT (.cube)…", None, "File>More Exports"),
     // Edit panel ▸ Curve ▸ Point Curve dropdown
     ("file.importCurvePresets", "Import Point Curve Presets…", None, ""),
     ("file.exportCurvePresets", "Export Point Curve Presets…", None, ""),
@@ -324,6 +340,8 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     ("app.allFilesAccess", "Allow Access to All Files…", None, ""),
     ("app.systemInfo", "System Info…", None, "Help"),
     ("app.openLogFolder", "Open Log Folder", None, "Help"),
+    // the frame-rate display (`frame_rate`): a debugging aid, never saved
+    ("view.frameRate", "Frame Rate", None, "Help>Debug"),
     ("app.whatsNew", "What's New", None, "Help"),
     ("dialog.cull", "Assisted Culling…", None, "Library"),
     ("app.help", "{app} Help", Some("F1"), "Help"),
@@ -370,6 +388,7 @@ fn panel(app: &mut LccApp, ctx: &egui::Context, p: RightPanel, name: &str) {
     if p != RightPanel::Masking && app.ui.tool != "wbPicker" {
         app.ui.tool.clear();
     }
+    app.end_midi_interaction();
     let _ = app.session.end_interaction();
 }
 
@@ -519,6 +538,45 @@ fn theme_command(app: &mut LccApp, p: &Value) -> Result<Value, String> {
     Ok(appearance_json(app))
 }
 
+/// `view.colorMixer`: the Color Mixer's tab, Adjust mode, HSL group and Color-mode band, each
+/// optional; the Edit panel opens on it. Returns the layout now shown.
+fn color_mixer_layout(app: &mut LccApp, p: &Value) -> Result<Value, String> {
+    use crate::panels::edit::{MIXER_ADJUST, MIXER_GROUPS};
+    let choose = |key: &str, keys: &[&str]| -> Result<Option<String>, String> {
+        match p.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(v)) if keys.contains(&v.as_str()) => Ok(Some(v.clone())),
+            Some(other) => Err(format!("view.colorMixer: `{key}` must be one of {}, not {other}", keys.join(", "))),
+        }
+    };
+    let adjust: Vec<&str> = MIXER_ADJUST.iter().map(|(_, k)| *k).collect();
+    let groups: Vec<&str> = MIXER_GROUPS.iter().map(|(_, k)| *k).collect();
+    let (tab, adjust, group, band) =
+        (choose("tab", &["mixer", "point"])?, choose("adjust", &adjust)?, choose("group", &groups)?, choose("band", &lcc_develop::MIXER_BANDS)?);
+    if let Some(tab) = tab
+        && (tab == "point") != app.ui.flyout_open("pointColor")
+    {
+        app.ui.toggle_flyout("pointColor");
+    }
+    if let Some(v) = adjust {
+        app.ui.mixer_adjust = v;
+    }
+    if let Some(v) = group {
+        app.ui.mixer_group = v;
+    }
+    if let Some(v) = band {
+        app.ui.mixer_mode = v;
+    }
+    crate::panels::edit::drop_hidden_mixer_tool(app);
+    app.ui.right = RightPanel::Edit;
+    app.ui.view = ViewMode::Detail;
+    if !app.ui.section_open("mixer") {
+        app.ui.toggle_section("mixer");
+    }
+    let tab = if app.ui.flyout_open("pointColor") { "point" } else { "mixer" };
+    Ok(json!({"tab": tab, "adjust": app.ui.mixer_adjust, "group": app.ui.mixer_group, "band": app.ui.mixer_mode}))
+}
+
 /// Handle UI commands; `None` means "not a UI command — send it to the engine".
 pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     if matches!(id, "ui.dock" | "ui.dock.reset") {
@@ -532,6 +590,23 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
     if id == "photo.reload" {
         // the files are read in the background (a raw's decode takes a second or more)
         return crate::reload::command(app, p);
+    }
+    if id == "midi.reload" {
+        let ctx = app.tasks.repaint.clone().unwrap_or_default();
+        let result = match app.midi_reload.as_mut() {
+            Some(reload) => reload(),
+            None => Err("MIDI input is not available in this build".to_string()),
+        };
+        return Some(match result {
+            Ok(said) => {
+                app.toast(&ctx, said.clone());
+                Ok(json!(said))
+            }
+            Err(e) => {
+                app.toast_error(&ctx, e.clone());
+                Err(e)
+            }
+        });
     }
     if let Some(language) = language_from_command(id) {
         app.ui.language = language;
@@ -821,6 +896,7 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             if app.ui.fullscreen {
                 app.ui.zoom = Zoom::Fit;
                 app.ui.tool.clear();
+                app.end_midi_interaction();
                 let _ = app.session.end_interaction();
             }
             Ok(json!({"fullscreen": app.ui.fullscreen}))
@@ -848,9 +924,22 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             Ok(json!({"infoOverlay": app.ui.info_overlay}))
         }
         "view.viewOptions" => {
-            // `info1` / `info2` set the lines for an agent; without them the window opens
+            // `info1` / `info2` set the lines, `briefly` the Info that Show Briefly When Photo Changes
+            // shows, and `loupeMessages` the loading / rendering message, for an agent; without any of
+            // them the window opens
             let mut info = app.ui.settings.loupe_info;
             let mut set = false;
+            // `loupeMessages` sets Show message when loading or rendering photos
+            let messages = match p.get("loupeMessages") {
+                None => app.ui.settings.loupe_messages,
+                Some(v) => match v.as_bool() {
+                    Some(on) => {
+                        set = true;
+                        on
+                    }
+                    None => return Some(Err("`loupeMessages`: true|false".into())),
+                },
+            };
             for (key, lines) in [("info1", &mut info.info1), ("info2", &mut info.info2)] {
                 let Some(v) = p.get(key) else { continue };
                 match serde_json::from_value(v.clone()) {
@@ -861,12 +950,20 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                 }
                 set = true;
             }
+            if let Some(v) = p.get("briefly") {
+                match serde_json::from_value(v.clone()) {
+                    Ok(v) => info.briefly = v,
+                    Err(_) => return Some(Err("`briefly`: off|basic|exposure (neither, Info 1 or Info 2)".into())),
+                }
+                set = true;
+            }
             if set {
                 app.ui.settings.loupe_info = info;
+                app.ui.settings.loupe_messages = messages;
             } else {
                 app.ui.dialog = Some(Dialog::ViewOptions);
             }
-            Ok(json!({"loupeInfo": app.ui.settings.loupe_info}))
+            Ok(json!({"loupeInfo": app.ui.settings.loupe_info, "loupeMessages": app.ui.settings.loupe_messages}))
         }
         "view.chooseLayoutImage" => {
             let path = match p.get("path").and_then(Value::as_str) {
@@ -967,6 +1064,11 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         "view.filmstrip" => {
             app.ui.filmstrip = !app.ui.filmstrip;
             Ok(Value::Null)
+        }
+        "view.frameRate" => {
+            // {show?: bool} (toggles when omitted)
+            app.ui.frame_rate = p.get("show").and_then(Value::as_bool).unwrap_or(!app.ui.frame_rate);
+            Ok(json!({"show": app.ui.frame_rate}))
         }
         "view.leftPanel" => {
             app.ui.left_panel = !app.ui.left_panel;
@@ -1164,7 +1266,12 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                 "paperInk": app.ui.proof_paper_ink, "destWarning": pr.dest_warning, "displayWarning": pr.display_warning}))
         }
         "view.histogram" => {
-            app.ui.histogram = !app.ui.histogram;
+            // the Modern layout's floating histogram (shown small again), else Classic's panel
+            if crate::modern::on(app) {
+                crate::modern::toggle_histogram(app);
+            } else {
+                app.ui.histogram = !app.ui.histogram;
+            }
             Ok(Value::Null)
         }
         "view.histogram.mode" => {
@@ -1228,6 +1335,9 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         }
         "view.maskOverlay" => {
             app.ui.mask_overlay = p.get("show").and_then(Value::as_bool).unwrap_or(!app.ui.mask_overlay);
+            // switched on, it stays on through edits; switched off, it shows by itself again only for a
+            // mask without settings
+            app.ui.mask_overlay_pinned = app.ui.mask_overlay;
             Ok(json!({"maskOverlay": app.ui.mask_overlay}))
         }
         "view.maskOverlayAll" => {
@@ -1316,6 +1426,8 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             }
             Ok(Value::Null)
         }
+        // A under the Crop panel: the aspect lock (the panel's button runs the same toggle)
+        "crop.lockAspect" => app.run("crop.aspect", json!({"aspect": "toggle"})),
         "view.cropOverlay" => {
             use crate::state::CropOverlay::*;
             app.ui.crop_overlay = match app.ui.crop_overlay {
@@ -1412,7 +1524,15 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             Ok(Value::Null)
         }
         "panel.info" => {
-            panel(app, &ctx, RightPanel::Info, "Info");
+            // the Modern layout's Info card (Library), else Classic's Info panel
+            if crate::modern::on(app) {
+                app.ui.modern.info = !app.ui.modern.info;
+                if app.ui.modern.info && app.ui.module != crate::module::ModuleId::Library {
+                    let _ = app.run("module.library", serde_json::json!({}));
+                }
+            } else {
+                panel(app, &ctx, RightPanel::Info, "Info");
+            }
             Ok(Value::Null)
         }
         "panel.keywords" => {
@@ -1421,6 +1541,18 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         }
         "panel.versions" => {
             panel(app, &ctx, RightPanel::Versions, "Versions");
+            Ok(Value::Null)
+        }
+        "panel.editKeywords" => {
+            // the Keywords panel with its Keyword List open; the keyword picked there opens in
+            // Edit Keyword Tag (with none picked, no dialog opens)
+            if app.ui.right != RightPanel::Keywords {
+                panel(app, &ctx, RightPanel::Keywords, "Keywords");
+            }
+            app.ui.folded_sections.retain(|s| s != "keywordList");
+            if let Some(k) = app.ui.keyword_list_selected.clone().filter(|k| app.session.catalog.has_keyword(k)) {
+                app.ui.dialog = Some(crate::panels::keyword_list::edit_dialog(app, &k));
+            }
             Ok(Value::Null)
         }
         "panel.activity" => {
@@ -1442,12 +1574,14 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             // Return commits a tool panel (crop, remove, red eye, masking): back to Edit
             use RightPanel::*;
             if app.ui.dialog.is_none() && matches!(app.ui.right, Crop | Remove | RedEye | Masking) {
+                app.end_midi_interaction();
                 let _ = app.session.end_interaction();
                 app.ui.tool.clear();
                 app.ui.right = Edit;
             }
             Ok(Value::Null)
         }
+        "view.colorMixer" => color_mixer_layout(app, p),
         "panel.close" => {
             app.ui.right = RightPanel::None;
             app.ui.presets = false;
@@ -1593,7 +1727,15 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             Ok(Value::Null)
         }
         "dialog.captureTime" => {
-            let time = app.session.active().and_then(|id| app.session.catalog.photo(id)).map(|p| p.date().replace('T', " ")).unwrap_or_default();
+            // a time that doesn't fully read isn't offered as the starting point (`10:0` would read as midnight)
+            let time = app
+                .session
+                .active()
+                .and_then(|id| app.session.catalog.photo(id))
+                .map(|p| p.date())
+                .filter(|d| lcc_catalog::dates::shift_iso(d, 0).is_some())
+                .map(|d| d.replace('T', " "))
+                .unwrap_or_default();
             let mode = p.get("mode").and_then(Value::as_str).unwrap_or("set").to_string();
             app.ui.dialog =
                 Some(Dialog::CaptureTime { mode, time: time.get(..19).unwrap_or(&time).to_string(), days: 0, hours: 0, minutes: 0, zone: 0.0 });
@@ -1811,7 +1953,8 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
         }
         "photo.openOriginalInExternal" => open_original_in(app, &ctx, p),
         "dialog.cull" => {
-            app.ui.dialog = Some(Dialog::Cull { reject_below: 0.0, pick_best: true });
+            let (burst_gap, similarity) = app.ui.cull_burst.unwrap_or((10.0, 0.93));
+            app.ui.dialog = Some(Dialog::Cull { reject_below: 0.0, pick_best: true, burst_gap, similarity });
             Ok(Value::Null)
         }
         "app.whatsNew" => {
@@ -1902,6 +2045,11 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             import_into_album(app, p, r)
         }
         "file.importLightroom" => {
+            // where the catalog goes (#2672): checked before a file dialog opens
+            let req = match crate::lightroom_destination::Request::parse(p) {
+                Ok(req) => req,
+                Err(e) => return Some(Err(e)),
+            };
             let path = match p.get("path").and_then(Value::as_str).map(str::to_string) {
                 Some(path) => Some(path),
                 None => {
@@ -1914,12 +2062,17 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                 }
             };
             match path {
-                Some(path) => app.run("library.importLightroom", json!({"path":path})),
+                Some(path) => crate::lightroom_destination::import(app, &path, &req),
                 None => Ok(Value::Null),
             }
         }
         "app.quit" => {
             app.ui.quit = true;
+            Ok(Value::Null)
+        }
+        "dialog.keywordShortcut" => {
+            let now = app.session.keyword_shortcut.join(", ");
+            crate::panels::dialogs::prompt(app, "Set Keyword Shortcut", "Separated by commas", &now, "keyword.setShortcut", json!({}), "keywords");
             Ok(Value::Null)
         }
         "dialog.saveMetadataPreset" => {
@@ -2306,7 +2459,12 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                     }
                     parts.push(msg);
                 }
-                if n > 0 {
+                // Show the new presets: Develop's left column already lists them when it is shown,
+                // so they stay there, unfolded (issue #469); otherwise the presets column opens.
+                let in_left_column = app.ui.module == crate::module::ModuleId::Develop && crate::module::edge_visible(app, crate::module::Edge::Left);
+                if n > 0 && in_left_column {
+                    crate::panels::classic::set_open_with_key(app, crate::module::PanelId::Presets, crate::panels::presets::IN_COLUMN_KEY, true);
+                } else if n > 0 {
                     app.ui.presets = true;
                 }
             }
@@ -2504,6 +2662,48 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
             }
             return Some(r);
         }
+        "file.exportCameraProfile" | "file.exportLookLut" => {
+            let dcp = id == "file.exportCameraProfile";
+            let Some(active) = app.session.active() else { return Some(Err("no photo".into())) };
+            let stem = app
+                .session
+                .catalog
+                .photo(active)
+                .and_then(|ph| std::path::Path::new(&ph.file_name).file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "photo".into());
+            let (ext, command): (&'static str, &str) = if dcp { ("dcp", "camera.exportDcp") } else { ("cube", "develop.exportLut") };
+            let path = match p.get("path").and_then(Value::as_str) {
+                Some(x) => Some(x.to_string()),
+                None => {
+                    let name = format!("{stem}.{ext}");
+                    let req = if dcp {
+                        PickRequest::save(
+                            crate::i18n::tr("Export Camera Profile (.dcp)…"),
+                            crate::i18n::tr("DNG Camera Profile"),
+                            &["dcp"],
+                            name.clone(),
+                        )
+                    } else {
+                        PickRequest::save(crate::i18n::tr("Export Look as LUT (.cube)…"), crate::i18n::tr("Cube LUT"), &["cube"], name.clone())
+                    };
+                    match crate::pick::ask(app, id, p, "path", req, |s| s.save_preset_file.as_mut().map(|f| f(&name).into_iter().collect())) {
+                        Picked::Now(v) => v.into_iter().next(),
+                        Picked::Later => return Some(Ok(Value::Null)),
+                        Picked::Unavailable => return Some(Err("no file dialog on this platform".into())),
+                    }
+                }
+            };
+            let Some(path) = path else { return Some(Ok(Value::Null)) };
+            let r = app.session.execute(command, &json!({"path": path, "ids": [active.0]})).map_err(|e| e.to_string());
+            match &r {
+                Ok(v) if dcp => {
+                    app.toast(&ctx, crate::i18n::tr_format!("Exported the camera profile for {}", v["model"].as_str().unwrap_or_default()))
+                }
+                Ok(_) => app.toast(&ctx, crate::i18n::tr("Exported the look as a LUT")),
+                Err(e) => app.toast_error(&ctx, e.clone()),
+            }
+            return Some(r);
+        }
         "file.exportPresets" => {
             let group = p.get("group").and_then(Value::as_str).map(str::to_string);
             let path = match p.get("path").and_then(Value::as_str) {
@@ -2668,6 +2868,13 @@ pub fn ui_enabled(app: &LccApp, id: &str) -> bool {
         "app.showInFolders" => show_in_folders_enabled(app, None),
         "app.openSamModelFolder" => app.session.segmenter.dir.is_some() && app.services.open_with.is_some(),
         "file.exportPresets" => app.session.presets.iter().any(|p| !p.builtin),
+        // a raw on disk has a camera colour to export; any photo has a look
+        "file.exportCameraProfile" => app
+            .session
+            .active()
+            .and_then(|id| app.session.catalog.photo(id))
+            .is_some_and(|p| p.develops_raw() && matches!(p.source, lcc_engine::catalog::Source::File { .. })),
+        "file.exportLookLut" => app.session.active().is_some(),
         "file.exportMaskEffects" => !app.session.mask_effects.is_empty(),
         "file.exportMetadataPresets" => !app.session.metadata_presets.is_empty(),
         "file.exportExportPresets" => !app.session.export_presets.is_empty(),
@@ -2860,7 +3067,8 @@ fn show_in_folders(app: &mut LccApp, id: Option<lcc_catalog::PhotoId>) -> Result
 /// Photo ▸ Edit In: render a copy of each selected photo with its edits (stacked on its original)
 /// as Settings ▸ External Editing asks for that editor, then open them there. `p` may override the
 /// file (`format`, `colorSpace`, `bitDepth`) and the editor (`app`). PhotoCraft is checked first,
-/// so a missing editor leaves no copy behind.
+/// so a missing editor leaves no copy behind. Once the copies exist, an editor that won't open them
+/// is reported in the result's `failed` (and a toast), not as an error.
 fn edit_in(app: &mut LccApp, ctx: &egui::Context, p: &Value, photocraft: bool) -> Result<Value, String> {
     // every way in (menu, shortcut, context menu, the control channel) says why nothing opened
     edit_in_inner(app, ctx, p, photocraft).inspect_err(|e| app.toast(ctx, crate::i18n::tr_format!("Couldn't open the editor: {e}", e = e)))
@@ -2906,8 +3114,15 @@ fn edit_in_inner(app: &mut LccApp, ctx: &egui::Context, p: &Value, photocraft: b
             }
         }
     }
+    let mut r = r;
+    if let Some(o) = r.as_object_mut() {
+        o.insert("failed".into(), json!(failed));
+    }
     if let Some(e) = failed {
-        return Err(e);
+        // the copies are in the library already (one undo step): an error would invite a retry
+        // that makes another set, so the result says what failed and the toast says why
+        app.toast(ctx, crate::i18n::tr_format!("Couldn't open the editor: {e}", e = e));
+        return Ok(r);
     }
     match copies.as_slice() {
         [(path, _)] => {

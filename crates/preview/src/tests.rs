@@ -787,6 +787,36 @@ fn a_panicking_job_frees_its_slot() {
     assert_eq!(got, Some(2));
 }
 
+/// Given a series of deferred writes faster than its quiet time (a photo's view through a slider drag at full
+/// quality), only its last image reaches the disk, and only once the series is quiet; another series and a plain
+/// deferred write are written as before, and every image is in memory at once
+#[test]
+fn a_series_of_deferred_writes_reaches_the_disk_once_with_its_last_image() {
+    let dir = temp_dir("deferred-series");
+    let cache = Arc::new(PreviewCache::with_disk(1 << 30, &dir, 1 << 31));
+    let img = Arc::new(gradient(64, 48, 9));
+    let drag: Vec<Hash128> = (0..12u32).map(|i| hash_bytes(&[b"drag".as_slice(), &i.to_le_bytes()].concat())).collect();
+    let (other, plain) = (hash_bytes(b"other photo"), hash_bytes(b"plain"));
+    let g = cache.generation();
+    for key in &drag {
+        cache.put_deferred_series(g, 1, *key, img.clone());
+        assert!(cache.get_in_memory(*key).is_some(), "in memory at once");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    cache.put_deferred_series(g, 2, other, img.clone());
+    cache.put_deferred(plain, img.clone());
+    let t = std::time::Instant::now();
+    while cache.queued_bytes() > 0 && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(cache.queued_bytes(), 0, "the queue drains");
+    let disk = cache.disk().unwrap();
+    assert!(disk.get(drag[11]).is_some(), "the series' last image");
+    assert!(drag[..11].iter().all(|k| disk.get(*k).is_none()), "none of the ones it replaced");
+    assert!(disk.get(other).is_some() && disk.get(plain).is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Deferred disk writes go through one writer with a byte budget: a burst of big renders can't queue more than the
 /// budget (each used to start a thread of its own, holding its image; issue #1522), and what was queued reaches disk.
 #[test]
@@ -807,5 +837,27 @@ fn deferred_writes_are_bounded_and_drain_to_disk() {
     assert!(cache.disk().unwrap().get(keys[0]).is_some(), "the first write reached disk");
     // every image is still in memory, written to disk or not
     assert!(keys.iter().all(|k| cache.get(*k).is_some()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cached file whose JPEG header claims more than the cache ever writes is refused from the
+/// header, without decoding it, and an image past that size isn't written (issue #2140).
+#[test]
+fn oversized_cached_files_are_refused_from_their_header() {
+    let small = disk::encode_jpeg(&gradient(32, 20, 3)).unwrap();
+    assert!(disk::decode_jpeg(&small).is_some());
+    let sof = small.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+    let mut huge = small.clone();
+    // 9000 × 9000 (height, then width, big-endian)
+    huge[sof + 5..sof + 9].copy_from_slice(&[0x23, 0x28, 0x23, 0x28]);
+    assert!(disk::decode_jpeg(&huge).is_none());
+    assert!(disk::decode_jpeg(b"\xFF\xD8\xFF\xC0 not a jpeg").is_none());
+    let dir = temp_dir("disk-oversized");
+    let d = DiskCache::new(&dir, 1 << 30);
+    let k = hash_bytes(b"wide");
+    d.put(k, &gradient(disk::MAX_EDGE + 1, 2, 1));
+    assert!(d.get(k).is_none());
+    d.put(k, &gradient(disk::MAX_EDGE, 2, 1));
+    assert_eq!(d.get(k).map(|i| i.width), Some(disk::MAX_EDGE));
     let _ = std::fs::remove_dir_all(&dir);
 }

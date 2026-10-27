@@ -21,7 +21,8 @@ use serde::Serialize;
 /// The rest is headroom for what isn't cached (renders in progress, textures, the UI). An export
 /// batch may, in addition, hold up to twice the budget in photos rendering side by side
 /// ([`export_gate`]): transient memory, given back when the batch ends. Default:
-/// a quarter of the machine's RAM, at most 1.5 GiB (`{ENV_PREFIX}_MEMORY_MB` overrides it).
+/// a quarter of the machine's RAM ([`total_ram`]: a container's or cgroup's memory limit when
+/// smaller), at most 1.5 GiB (`{ENV_PREFIX}_MEMORY_MB` overrides it).
 pub fn default_budget() -> usize {
     if let Some(mb) = lcc_brand::env("MEMORY_MB").and_then(|v| v.trim().parse::<usize>().ok()).filter(|m| *m >= 64) {
         return mb << 20;
@@ -33,13 +34,13 @@ pub fn default_budget() -> usize {
     }
 }
 
-/// Physical memory (bytes), when the platform tells us without native calls.
+/// Memory the process may use (bytes), when the platform tells us without native calls: physical
+/// RAM, held on Linux to the memory limit of the process's cgroup (a container, a Flatpak, a
+/// systemd scope with `MemoryMax`, a CI runner) when that is smaller.
 pub(crate) fn total_ram() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb: usize = s.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kb * 1024)
+        lcc_sysmem::effective_total().map(|b| usize::try_from(b).unwrap_or(usize::MAX))
     }
     #[cfg(target_os = "macos")]
     {
@@ -99,7 +100,10 @@ pub fn cache_share(budget: usize) -> usize {
 /// A weighted semaphore over bytes of working memory: [`WorkGate::acquire`] waits while other
 /// holders already use the limit (one holder may always proceed, whatever its size).
 pub struct WorkGate {
-    state: Mutex<(usize, usize)>,
+    /// Bytes held and the limit. Held is a `u128`: callers weigh work with saturating maths, so a
+    /// permit may hold `usize::MAX`, and the exact total of several such permits still fits, so
+    /// releasing one in any order leaves the others counted (issue #2576).
+    state: Mutex<(u128, usize)>,
     cv: Condvar,
 }
 
@@ -114,7 +118,7 @@ impl WorkGate {
         WorkGate { state: Mutex::new((0, limit)), cv: Condvar::new() }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, (usize, usize)> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (u128, usize)> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -123,24 +127,27 @@ impl WorkGate {
         self.cv.notify_all();
     }
 
-    /// Bytes held now and the limit.
+    /// Bytes held now (at most `usize::MAX`) and the limit.
     pub fn usage(&self) -> (usize, usize) {
-        *self.lock()
+        let g = self.lock();
+        (usize::try_from(g.0).unwrap_or(usize::MAX), g.1)
     }
 
-    /// Hold `bytes`, waiting until they fit (or nothing else is held).
+    /// Hold `bytes`, waiting until they fit (or nothing else is held). Even `usize::MAX` bytes on
+    /// a gate whose limit is `usize::MAX` make the next holder wait.
     pub fn acquire(&self, bytes: usize) -> Permit<'_> {
         let mut g = self.lock();
-        while g.0 > 0 && g.0 + bytes > g.1 {
+        while g.0 > 0 && g.0.saturating_add(bytes as u128) > g.1 as u128 {
             g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
-        g.0 += bytes;
+        g.0 = g.0.saturating_add(bytes as u128);
         Permit { gate: self, bytes }
     }
 
     /// Hold `bytes` without waiting (interactive work): counted, so background work waits for it.
     pub fn acquire_urgent(&self, bytes: usize) -> Permit<'_> {
-        self.lock().0 += bytes;
+        let mut g = self.lock();
+        g.0 = g.0.saturating_add(bytes as u128);
         Permit { gate: self, bytes }
     }
 }
@@ -148,7 +155,7 @@ impl WorkGate {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let mut g = self.gate.lock();
-        g.0 = g.0.saturating_sub(self.bytes);
+        g.0 = g.0.saturating_sub(self.bytes as u128);
         drop(g);
         self.gate.cv.notify_all();
     }
@@ -314,5 +321,33 @@ impl crate::Session {
         let b = set_budget(bytes);
         self.media.set_budget(cache_share(b));
         b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inside a container or a systemd scope with `MemoryMax`, the budget is sized from the limit,
+    /// not the machine's RAM (#3072).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn total_ram_honours_the_cgroup_limit() {
+        let ram = total_ram().unwrap();
+        let info = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let physical = lcc_sysmem::limits::meminfo_bytes(&info, "MemTotal").unwrap();
+        assert!(ram as u64 <= physical);
+        let Some(limit) = lcc_sysmem::limits::cgroup_memory().limit else {
+            lcc_testkit::skip!(System, "no cgroup memory limit on this process (run it under `systemd-run --user --scope -p MemoryMax=2G`)");
+            return;
+        };
+        assert!(ram as u64 <= limit, "total_ram {ram} above the cgroup limit {limit}");
+    }
+
+    /// Prints what the budget is sized from; run by hand inside and outside a limited scope.
+    #[test]
+    #[ignore = "diagnostic: prints the RAM and default budget this process sees"]
+    fn prints_the_default_budget() {
+        println!("total_ram {:?} MiB, default_budget {} MiB", total_ram().map(|b| b >> 20), default_budget() >> 20);
     }
 }

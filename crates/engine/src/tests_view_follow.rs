@@ -1,7 +1,7 @@
 //! The view follows a small edit from the list it had ([`Session::visible`]): whatever the edit, the result has to
 //! be the list worked out from every photo.
 
-use lcc_catalog::{Op, Photo, PhotoId, Source};
+use lcc_catalog::{Album, Op, Photo, PhotoId, Source};
 use serde_json::{Value, json};
 
 use crate::Session;
@@ -17,7 +17,8 @@ impl Dice {
 }
 
 /// A library of `n` photos in three folders, with ratings, flags, keywords and dates spread over them, an album
-/// holding every third photo, a smart album of the photos without keywords, and a stack.
+/// holding every third photo, a smart album of the photos without keywords, and a stack. About one photo in four
+/// has the content of another (some as a Duplicate's `:dup` key), and a few have no content hash.
 fn library(n: usize) -> (Session, Vec<PhotoId>, u64, u64) {
     let mut s = Session::new();
     let mut ids = Vec::new();
@@ -34,6 +35,11 @@ fn library(n: usize) -> (Session, Vec<PhotoId>, u64, u64) {
             &format!("2026-01-{:02}T10:00:00", 1 + i % 9),
         );
         p.captured = Some(format!("2025-{:02}-{:02}T10:00:{:02}", 1 + i % 12, 1 + i % 28, i % 60));
+        p.content_hash = match i % 13 {
+            0 => None,
+            5 => Some(format!("{:032x}:dup{}", (i * 7) % (n * 4 / 5).max(1), id.0)),
+            _ => Some(format!("{:032x}", (i * 7) % (n * 4 / 5).max(1))),
+        };
         s.commit("Add", Op::AddPhoto { photo: Box::new(p) }).unwrap();
         ids.push(id);
     }
@@ -56,8 +62,9 @@ fn library(n: usize) -> (Session, Vec<PhotoId>, u64, u64) {
 }
 
 /// One edit at random: most touch a photo or a few (what it is rated, flagged, keyworded, developed; when it was
-/// taken; where its file is; whether it is in the library at all), some change an album, a stack or the library's
-/// past, and now and then a photo is added or removed for good.
+/// taken; where its file is and what is in it; whether it is in the library at all), some change an album, a stack
+/// or the library's past, and now and then a photo is added (at times with the content of one the library has) or
+/// removed for good.
 fn edit(s: &mut Session, dice: &mut Dice, ids: &mut Vec<PhotoId>, album: u64) {
     let chosen: Vec<u64> = (0..1 + dice.roll(3)).map(|_| ids[dice.roll(ids.len())].0).collect();
     let one = PhotoId(chosen[0]);
@@ -80,6 +87,7 @@ fn edit(s: &mut Session, dice: &mut Dice, ids: &mut Vec<PhotoId>, album: u64) {
             let name = format!("NEW_{n:04}.jpg");
             let mut p = Photo::new(id, Source::File { path: format!("/pics/{}/{name}", n % 3) }, &name, "JPEG", 60, 40, "2026-02-01T10:00:00");
             p.captured = Some(format!("2025-{:02}-11T09:00:00", 1 + n % 12));
+            p.content_hash = s.catalog.photo(ids[dice.roll(ids.len())]).and_then(|q| q.content_hash.clone()).filter(|_| n.is_multiple_of(8));
             if s.commit("Add", Op::AddPhoto { photo: Box::new(p) }).is_ok() {
                 ids.push(id);
             }
@@ -87,6 +95,23 @@ fn edit(s: &mut Session, dice: &mut Dice, ids: &mut Vec<PhotoId>, album: u64) {
         }
         2 if n % 4 == 1 => {
             let _ = s.commit("Remove", Op::RemovePhoto { id: one });
+            return;
+        }
+        2 if n % 4 == 2 => {
+            // the file's content changed (Reload): it is now the same as another photo's, or has no hash
+            let content_hash = s.catalog.photo(ids[dice.roll(ids.len())]).and_then(|q| q.content_hash.clone()).filter(|_| n % 8 == 2);
+            if let Some(p) = s.catalog.photo(one) {
+                let op = Op::SetContent {
+                    id: one,
+                    width: p.width,
+                    height: p.height,
+                    file_size: p.file_size,
+                    content_hash,
+                    preview_only: p.preview_only.clone(),
+                    preview_checked: p.preview_checked.clone(),
+                };
+                let _ = s.commit("Reload", op);
+            }
             return;
         }
         2 => {
@@ -113,6 +138,23 @@ fn edit(s: &mut Session, dice: &mut Dice, ids: &mut Vec<PhotoId>, album: u64) {
     };
 }
 
+fn relative_clock_session(captures: &[&str]) -> (Session, std::sync::Arc<std::sync::Mutex<String>>, Vec<PhotoId>) {
+    let mut s = Session::new();
+    let now = std::sync::Arc::new(std::sync::Mutex::new("2026-10-24T12:00:00".to_string()));
+    let clock = now.clone();
+    s.clock = Box::new(move || clock.lock().unwrap().clone());
+    let mut ids = Vec::new();
+    for (index, captured) in captures.iter().enumerate() {
+        let id = PhotoId(index as u64 + 1);
+        let name = format!("synthetic-{index}.jpg");
+        let mut photo = Photo::new(id, Source::Demo { scene: 0 }, &name, "JPEG", 2, 2, "2026-10-01T00:00:00");
+        photo.captured = Some((*captured).to_string());
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+        ids.push(id);
+    }
+    (s, now, ids)
+}
+
 #[test]
 fn following_an_edit_gives_the_list_worked_out_from_every_photo() {
     let (mut s, mut ids, album, smart) = library(240);
@@ -133,7 +175,13 @@ fn following_an_edit_gives_the_list_worked_out_from_every_photo() {
         json!({"key": "editDate", "ascending": false}),
         json!({"key": "importDate", "ascending": true}),
     ];
-    let filters = [json!({"rating": 0, "text": ""}), json!({"rating": 3, "text": ""}), json!({"rating": 0, "text": "travel"})];
+    let same_content = json!({"match": "all", "rules": [{"field": "sameContent", "op": "is", "value": true}]});
+    let filters = [
+        json!({"rating": 0, "text": ""}),
+        json!({"rating": 3, "text": ""}),
+        json!({"rating": 0, "text": "travel"}),
+        json!({"rating": 0, "text": "", "ruleSet": same_content}),
+    ];
     let mut checked = 0;
     for (i, source) in sources.iter().enumerate() {
         for (j, sort) in sorts.iter().enumerate() {
@@ -159,6 +207,129 @@ fn following_an_edit_gives_the_list_worked_out_from_every_photo() {
     // and it was following that was checked: most edits touch a photo or two, and the view kept up with those
     // without asking every photo again
     assert!(s.view_followed > 400, "followed {} times, worked out {} times", s.view_followed, s.view_worked_out);
+}
+
+#[test]
+fn relative_clock_filter_expires_without_catalog_or_history_mutation() {
+    let (mut s, now, ids) = relative_clock_session(&["2026-10-23T12:00:30"]);
+    s.execute("library.filter", &json!({"ruleSet": {"rules": [{"field": "captureDate", "op": "inLast", "value": 1}]}})).unwrap();
+    let (before_generation, before) = s.visible_shared();
+    assert_eq!(before.as_ref(), ids.as_slice());
+    let revision = s.catalog.revision;
+    let commits = s.commits;
+    let undo = s.undo.len();
+    let redo = s.redo.len();
+
+    *now.lock().unwrap() = "2026-10-24T12:01:00".to_string();
+    let (after_generation, after) = s.visible_shared();
+
+    assert!(after.is_empty(), "a relative filter must expire when its minute changes");
+    assert_ne!(after_generation, before_generation, "the changed list gets a new visible generation");
+    assert_eq!(s.catalog.revision, revision, "clock expiry is not a catalog edit");
+    assert_eq!(s.commits, commits, "clock expiry adds no undo step");
+    assert_eq!(s.undo.len(), undo);
+    assert_eq!(s.redo.len(), redo);
+}
+
+#[test]
+fn relative_clock_direct_and_nested_smart_album_sources_expire() {
+    for nested in [false, true] {
+        let (mut s, now, ids) = relative_clock_session(&["2026-10-23T12:00:30"]);
+        let recent = s
+            .execute(
+                "album.createSmart",
+                &json!({"name": "Recent", "rules": {"ruleSet": {"rules": [{"field": "captureDate", "op": "inLast", "value": 1}]}}}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        let source = if nested {
+            s.execute(
+                "album.createSmart",
+                &json!({"name": "In Recent", "rules": {"ruleSet": {"rules": [{"field": "album", "op": "is", "value": recent}]}}}),
+            )
+            .unwrap()["id"]
+                .as_u64()
+                .unwrap()
+        } else {
+            recent
+        };
+        s.execute("library.source", &json!({"kind": "album", "id": source})).unwrap();
+        assert_eq!(s.visible_cloned(), ids);
+        let revision = s.catalog.revision;
+
+        *now.lock().unwrap() = "2026-10-24T12:01:00".to_string();
+        assert!(s.visible_cloned().is_empty(), "nested={nested}");
+        assert_eq!(s.catalog.revision, revision, "nested={nested}");
+    }
+}
+
+#[test]
+fn relative_clock_source_total_expires_before_or_after_visible_refresh() {
+    for refresh_visible in [false, true] {
+        let (mut s, now, _) = relative_clock_session(&["2026-10-23T12:00:30"]);
+        let album = s
+            .execute(
+                "album.createSmart",
+                &json!({"name": "Recent", "rules": {"ruleSet": {"rules": [{"field": "captureDate", "op": "inLast", "value": 1}]}}}),
+            )
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        s.execute("library.source", &json!({"kind": "album", "id": album})).unwrap();
+        s.execute("library.filter", &json!({"text": "synthetic"})).unwrap();
+        assert_eq!(s.source_total(), Some(1), "the initial total is computed without asking for visible photos");
+        let revision = s.catalog.revision;
+
+        *now.lock().unwrap() = "2026-10-24T12:01:00".to_string();
+        if refresh_visible {
+            s.execute("library.refresh", &json!({})).unwrap();
+            assert!(s.visible_cloned().is_empty());
+        }
+        assert_eq!(s.source_total(), Some(0), "refresh_visible={refresh_visible}");
+        assert_eq!(s.catalog.revision, revision, "refresh_visible={refresh_visible}");
+    }
+}
+
+#[test]
+fn relative_clock_absolute_and_same_minute_views_keep_their_generations() {
+    let (mut absolute, absolute_now, _) = relative_clock_session(&["2026-10-23T12:00:30"]);
+    absolute.execute("library.filter", &json!({"ruleSet": {"rules": [{"field": "captureDate", "op": "is", "value": "2026-10-23"}]}})).unwrap();
+    let (absolute_generation, absolute_ids) = absolute.visible_shared();
+    *absolute_now.lock().unwrap() = "2026-10-25T12:10:00".to_string();
+    let (after_absolute_generation, after_absolute_ids) = absolute.visible_shared();
+    assert_eq!(after_absolute_generation, absolute_generation);
+    assert_eq!(after_absolute_ids, absolute_ids);
+
+    let (mut relative, relative_now, _) = relative_clock_session(&["2026-10-23T12:00:30"]);
+    relative.execute("library.filter", &json!({"ruleSet": {"rules": [{"field": "captureDate", "op": "inLast", "value": 1}]}})).unwrap();
+    let (relative_generation, relative_ids) = relative.visible_shared();
+    *relative_now.lock().unwrap() = "2026-10-24T12:00:45".to_string();
+    let (same_minute_generation, same_minute_ids) = relative.visible_shared();
+    assert_eq!(same_minute_generation, relative_generation);
+    assert_eq!(same_minute_ids, relative_ids);
+}
+
+#[test]
+fn relative_clock_unrelated_smart_album_does_not_expire_album_filter_view() {
+    let (mut s, now, ids) = relative_clock_session(&["2026-10-23T12:00:30"]);
+    let manual = s.catalog.alloc_album_id();
+    s.catalog.apply(Op::AddAlbum { album: Album::new(manual, "Manual") }).unwrap();
+    s.catalog.apply(Op::SetAlbumPhotos { id: manual, photos: vec![ids[0]] }).unwrap();
+    s.execute(
+        "album.createSmart",
+        &json!({"name": "Unrelated recent", "rules": {"ruleSet": {"rules": [{"field": "captureDate", "op": "inLast", "value": 1}]}}}),
+    )
+    .unwrap();
+    s.execute("library.filter", &json!({"ruleSet": {"rules": [{"field": "album", "op": "is", "value": manual.0}]}})).unwrap();
+    let (generation, visible) = s.visible_shared();
+    assert_eq!(visible.as_ref(), ids.as_slice());
+
+    *now.lock().unwrap() = "2026-10-24T12:01:00".to_string();
+    let (after_generation, after_visible) = s.visible_shared();
+
+    assert_eq!(after_generation, generation, "an unrelated relative smart album must not expire this view");
+    assert_eq!(after_visible, visible);
 }
 
 #[test]
@@ -220,6 +391,35 @@ fn an_edit_to_many_photos_or_to_more_than_photos_is_worked_out_whole() {
     assert_eq!((s.view_followed, s.view_worked_out), (followed + 1, whole + 2));
 }
 
+/// A keyword created in the keyword list, inside another and given to the selected photo at once, changes no photo
+/// but that one: the view and the albums' counts follow it from that photo instead of asking every photo again.
+#[test]
+fn a_keyword_created_inside_another_and_given_to_a_photo_is_followed_from_that_photo() {
+    use lcc_catalog::{AlbumId, tally::AlbumTally};
+    let (mut s, ids, _, smart) = library(600);
+    let _ = s.visible_cloned();
+    let mut tally = AlbumTally::of(&s.catalog);
+    let (followed, whole) = (s.view_followed, s.view_worked_out);
+    // (the second photo has no keywords: it is in the smart album of those)
+    let bare = ids[1];
+    assert!(s.catalog.photo(bare).is_some_and(|p| p.meta.keywords.is_empty()));
+    let unkeyworded = tally.counts()[&AlbumId(smart)];
+    s.execute("library.select", &json!({"ids": [bare.0]})).unwrap();
+    s.execute("keyword.create", &json!({"name": "Rome", "parent": "travel", "addToSelected": true})).unwrap();
+    let _ = s.visible_cloned();
+    assert_eq!((s.view_followed, s.view_worked_out), (followed + 1, whole), "followed, not worked out whole");
+    assert!(tally.update(&s.catalog), "the counts followed");
+    assert_eq!(tally.counts()[&AlbumId(smart)], unkeyworded - 1, "the photo has a keyword now");
+    // a keyword created on its own, for no photo: nothing else to follow
+    s.execute("keyword.create", &json!({"name": "Paris", "parent": "travel"})).unwrap();
+    let _ = s.visible_cloned();
+    assert_eq!((s.view_followed, s.view_worked_out), (followed + 2, whole));
+    assert!(tally.update(&s.catalog));
+    // and what was followed is what every photo says
+    assert_eq!(s.visible_cloned(), s.visible_in_full());
+    assert_eq!(tally.counts()[&AlbumId(smart)], s.catalog.album_count(AlbumId(smart)));
+}
+
 #[test]
 fn the_albums_counts_followed_through_edits_are_the_counts_made_from_every_photo() {
     use lcc_catalog::tally::AlbumTally;
@@ -234,6 +434,9 @@ fn the_albums_counts_followed_through_edits_are_the_counts_made_from_every_photo
         json!({"edited": true}),
         json!({"dateFrom": "2025-06-01"}),
         json!({"text": "REN"}),
+        // whether another photo has the same content: an edit to one photo changes it for others
+        json!({"ruleSet": {"match": "all", "rules": [{"field": "sameContent", "op": "is", "value": true}]}}),
+        json!({"ruleSet": {"match": "all", "rules": [{"field": "sameContent", "op": "is", "value": false}]}}),
     ] {
         let made = s.execute("album.createSmart", &json!({"name": "More", "rules": rules}));
         assert!(made.is_ok(), "{rules}: {made:?}");
@@ -262,7 +465,10 @@ fn the_albums_counts_followed_through_edits_are_the_counts_made_from_every_photo
         let moved = tally.revision() != s.catalog.revision;
         match (moved, tally.update(&s.catalog)) {
             (true, true) => followed += 1,
-            (true, false) => whole += 1,
+            (true, false) => {
+                tally = AlbumTally::of(&s.catalog);
+                whole += 1;
+            }
             // (an edit that was refused changed nothing: nothing to follow)
             (false, _) => {}
         }
@@ -288,8 +494,10 @@ fn the_albums_counts_followed_through_edits_are_the_counts_made_from_every_photo
     let many: Vec<u64> = if many.len() >= 300 { many } else { s.visible_cloned().iter().take(300).map(|id| id.0).collect() };
     if many.len() > 256 {
         s.execute("library.select", &json!({"ids": many})).unwrap();
+        let before = shown(&tally);
         s.execute("photo.rate", &json!({"rating": 5})).unwrap();
         assert!(!tally.update(&s.catalog), "more photos than are followed one by one");
-        assert_eq!(shown(&tally), fresh(&s));
+        assert_eq!(shown(&tally), before, "not followed: left as they were, to be counted again");
+        assert_eq!(shown(&AlbumTally::of(&s.catalog)), fresh(&s));
     }
 }

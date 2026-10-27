@@ -23,7 +23,19 @@
 //!   replacing anything** (a hard link, which fails on a taken name; where the volume has no hard
 //!   links, an exclusive create that claims the name, then a rename over that placeholder).
 //! - [`same_file`] tells whether two paths name the same file on disk (device + inode on Unix,
+//!   volume serial number + file index on Windows,
 //!   resolved paths elsewhere), for "is this target an original?" checks.
+//! - [`open_regular`] / [`open_or_create_regular`] open a library file in place (to read, append
+//!   or cut it), never through a link planted at its name, nor a FIFO or a device (issue #2552).
+//!   The replacing writes above are safe already: a rename replaces a link, it doesn't follow it.
+//! - [`open_existing`], [`open_or_create`] and [`read_no_follow`] open a file in place (to append,
+//!   cut or read it) **never through a link** planted at its name, nor a FIFO or a device: a
+//!   library or photo folder may be shared, synced or unpacked from an archive, and a link there
+//!   would have the write land in, or the read copy, a file elsewhere (issue #2122). The replacing
+//!   writes above are safe already: a rename replaces a link, it doesn't follow it.
+//! - [`sync_file`] flushes a file to disk, with a plain `fsync` where the volume refuses the full
+//!   flush (an SMB share mounted by macOS, issue #1407). Every durable write goes through it: the
+//!   ones here, the catalog's and the engine's own (import copies, moves, sidecar backups).
 
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
@@ -34,6 +46,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 thread_local! {
     static FAIL_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
     static SYNCS: Cell<u64> = const { Cell::new(0) };
+    static NO_FULL_SYNC: Cell<bool> = const { Cell::new(false) };
+    static PLAIN_FSYNCS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// How many file and folder syncs this module made **on the calling thread** (for tests: a
@@ -43,10 +57,65 @@ pub fn syncs_on_this_thread() -> u64 {
     SYNCS.with(Cell::get)
 }
 
-fn sync_file(f: &File) -> io::Result<()> {
+fn counted_sync(f: &File) -> io::Result<()> {
     SYNCS.with(|c| c.set(c.get() + 1));
-    // a plain fsync where the volume refuses the full flush (macOS on an SMB share)
-    crate::store::sync_file(f, false)
+    sync_file(f, false)
+}
+
+/// Flush a file to disk: `sync_all`, or `sync_data` when `data_only`.
+///
+/// On macOS both are `F_FULLFSYNC`, which an SMB share refuses with ENOTSUP (issue #1407) while a
+/// plain `fsync` works there: that is the fallback. If it fails too, the write fails.
+pub fn sync_file(f: &File, data_only: bool) -> io::Result<()> {
+    let r = if NO_FULL_SYNC.with(Cell::get) {
+        Err(enotsup())
+    } else if data_only {
+        f.sync_data()
+    } else {
+        f.sync_all()
+    };
+    match r {
+        Err(e) if flush_unsupported(&e) => {
+            PLAIN_FSYNCS.with(|c| c.set(c.get() + 1));
+            lcc_sysmem::fsync(f)
+        }
+        r => r,
+    }
+}
+
+/// The volume can't flush a file to disk (ENOTSUP on macOS, `Unsupported` elsewhere).
+fn flush_unsupported(e: &io::Error) -> bool {
+    const ENOTSUP: i32 = 45;
+    e.kind() == io::ErrorKind::Unsupported || (cfg!(target_vendor = "apple") && e.raw_os_error() == Some(ENOTSUP))
+}
+
+/// What a volume without a full flush answers (macOS: ENOTSUP, os error 45, from `F_FULLFSYNC`).
+fn enotsup() -> io::Error {
+    if cfg!(target_vendor = "apple") { io::Error::from_raw_os_error(45) } else { io::Error::from(io::ErrorKind::Unsupported) }
+}
+
+/// How many plain `fsync` fallbacks [`sync_file`] made **on the calling thread** (for tests).
+#[doc(hidden)]
+pub fn plain_fsyncs_on_this_thread() -> u64 {
+    PLAIN_FSYNCS.with(Cell::get)
+}
+
+/// For tests (in any crate): while the guard lives, every full flush [`sync_file`] asks for on
+/// the calling thread fails as on an SMB share mounted by macOS (issue #1407).
+#[doc(hidden)]
+pub fn full_sync_unsupported() -> NoFullSync {
+    NO_FULL_SYNC.with(|c| c.set(true));
+    NoFullSync(())
+}
+
+/// Ends a [`full_sync_unsupported`] when dropped.
+#[doc(hidden)]
+pub struct NoFullSync(());
+
+impl Drop for NoFullSync {
+    fn drop(&mut self) {
+        NO_FULL_SYNC.with(|c| c.set(false));
+    }
 }
 
 /// Fault injection for tests (in any crate): while the returned guard lives, every write made by
@@ -112,7 +181,7 @@ fn parent_of(path: &Path) -> &Path {
 /// where NTFS journals the rename itself, so errors are ignored.
 pub fn sync_dir(dir: &Path) {
     if let Ok(d) = File::open(dir) {
-        let _ = sync_file(&d);
+        let _ = counted_sync(&d);
     }
 }
 
@@ -146,7 +215,7 @@ fn write_temp(path: &Path, sync: bool, fill: &mut dyn FnMut(&mut dyn Write) -> i
         let n = w.n;
         let f = w.inner.into_inner().map_err(|e| e.into_error())?;
         if sync {
-            sync_file(&f)?;
+            counted_sync(&f)?;
         }
         Ok(n)
     })();
@@ -255,8 +324,10 @@ pub fn write_new_unique(candidates: &mut dyn Iterator<Item = PathBuf>, data: &[u
     r
 }
 
-/// Give the complete temp file `tmp` the name `path`, unless that is taken.
-fn publish_new(tmp: &Path, path: &Path) -> io::Result<()> {
+/// Give the complete temp file `tmp` the name `path`, unless that is taken (`AlreadyExists`): a hard
+/// link, or where the volume has none (FAT/exFAT, some shares) an exclusive placeholder renamed over.
+/// After a link `tmp` is a second name of the file, after a rename it is gone.
+pub fn publish_new(tmp: &Path, path: &Path) -> io::Result<()> {
     match fs::hard_link(tmp, path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
@@ -301,6 +372,74 @@ fn same_content(path: &Path, data: &[u8]) -> io::Result<bool> {
     }
 }
 
+/// The error for a name that is a link, or not a regular file (a FIFO, a device, a folder).
+fn not_plain(path: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, format!("{} is a link or not a regular file: not opened", path.display()))
+}
+
+/// Windows: open a reparse point (a symbolic link or junction) itself rather than its target, so
+/// a link swapped in after the check is opened as the link and refused
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`).
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// Open the existing regular file `path` with `opts`, never through a link at that name: a link,
+/// a FIFO (whose open would block) or a device is refused (`InvalidInput`), and a missing file is
+/// `NotFound`. Between the check and the open a link could be swapped in; the opened file is
+/// checked to be the one looked at (same device and inode on Unix; on Windows the link itself is
+/// opened, and refused).
+pub fn open_existing(path: &Path, opts: &OpenOptions) -> io::Result<File> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() {
+        return Err(not_plain(path));
+    }
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut opts = opts.clone();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let f = opts.open(path)?;
+    let after = f.metadata()?;
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        after.dev() == before.dev() && after.ino() == before.ino()
+    };
+    #[cfg(not(unix))]
+    let same = after.file_type().is_file();
+    if !same {
+        return Err(not_plain(path));
+    }
+    Ok(f)
+}
+
+/// [`open_existing`], or when nothing is at `path` a new file created exclusively (`create_new`),
+/// so a link planted there meanwhile is refused rather than followed.
+pub fn open_or_create(path: &Path, opts: &OpenOptions) -> io::Result<File> {
+    match open_existing(path, opts) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut create = opts.clone();
+            create.create_new(true);
+            match create.open(path) {
+                // created by someone else since: open that, by the same rules
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open_existing(path, opts),
+                r => r,
+            }
+        }
+        r => r,
+    }
+}
+
+/// The content of the regular file `path`, never read through a link ([`open_existing`]).
+pub fn read_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut b = Vec::new();
+    open_existing(path, OpenOptions::new().read(true))?.read_to_end(&mut b)?;
+    Ok(b)
+}
+
 /// Do `a` and `b` name the same existing file (through links, `..`, case-insensitive names)?
 pub fn same_file(a: &Path, b: &Path) -> bool {
     let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
@@ -311,6 +450,14 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
+        // A hard link has its own path but shares the volume serial number and file index with
+        // its original. A volume that does not report them is compared by resolved path below.
+        #[cfg(windows)]
+        {
+            if ::same_file::is_same_file(a, b).unwrap_or(false) {
+                return true;
+            }
+        }
         if ma.len() != mb.len() {
             return false;
         }
@@ -318,6 +465,61 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
             (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
             _ => false,
         }
+    }
+}
+
+/// Open the regular file `path` in place with `opts`, never through a link at that name: a library
+/// folder may come from a share, a sync or an archive, and a link planted there would have a write
+/// land in, or a read take, a file elsewhere (issue #2552). A link, a FIFO (whose open would block),
+/// a device or a folder at the name is refused with a message saying what to do; nothing there is
+/// `None`. `opts` must not create or truncate: [`open_or_create_regular`] makes a missing file.
+///
+/// On Unix the opened file is checked to be the one looked at (same device and inode) before
+/// anything is read or written through it, so a link swapped in meanwhile is refused too.
+pub fn open_regular(path: &Path, opts: &OpenOptions) -> io::Result<Option<File>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !before.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a link or not a regular file; the app won't read or write a library file through one. Remove it or put the real file there.",
+                path.display()
+            ),
+        ));
+    }
+    let f = match opts.open(path) {
+        Ok(f) => f,
+        // removed since it was looked at
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let after = f.metadata()?;
+        if (after.dev(), after.ino()) != (before.dev(), before.ino()) {
+            return Err(io::Error::other(format!("{} changed while it was being opened; try again", path.display())));
+        }
+    }
+    Ok(Some(f))
+}
+
+/// [`open_regular`], or, when nothing is at `path`, a new file made exclusively (`create_new`),
+/// which neither follows a link planted there meanwhile nor creates its target. `true` when this
+/// call made the file.
+pub fn open_or_create_regular(path: &Path, opts: &OpenOptions) -> io::Result<(File, bool)> {
+    if let Some(f) = open_regular(path, opts)? {
+        return Ok((f, false));
+    }
+    match opts.clone().create_new(true).open(path) {
+        Ok(f) => Ok((f, true)),
+        // made by another program since: opened by the same rules
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => open_regular(path, opts)?.map(|f| (f, false)).ok_or(e),
+        Err(e) => Err(e),
     }
 }
 
@@ -330,13 +532,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("a.xmp");
-        let before = crate::store::plain_fsyncs();
+        let before = crate::safe_file::plain_fsyncs_on_this_thread();
         {
-            let _smb = crate::store::full_sync_unsupported();
+            let _smb = crate::safe_file::full_sync_unsupported();
             super::write_atomic(&p, b"<x/>").unwrap();
         }
         assert_eq!(std::fs::read(&p).unwrap(), b"<x/>");
-        assert!(crate::store::plain_fsyncs() > before, "fell back to a plain fsync");
+        assert!(crate::safe_file::plain_fsyncs_on_this_thread() > before, "fell back to a plain fsync");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -353,6 +555,25 @@ mod tests {
         let mut v: Vec<String> = fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         v.sort();
         v
+    }
+
+    /// A sidecar or a DNG on an SMB share mounted by macOS (issue #1407), where the full flush
+    /// fails with ENOTSUP: the file and its folder are flushed with a plain `fsync` instead, and
+    /// any other failure is still one.
+    #[test]
+    fn durable_writes_fall_back_to_fsync_without_a_full_flush() {
+        let d = temp("no-full-flush");
+        let before = plain_fsyncs_on_this_thread();
+        {
+            let _smb = full_sync_unsupported();
+            write_atomic(&d.join("DSC_0001.xmp"), b"<x/>").unwrap();
+        }
+        assert_eq!(plain_fsyncs_on_this_thread() - before, 2, "the file and its folder");
+        assert_eq!(names(&d), vec!["DSC_0001.xmp"]);
+        assert!(flush_unsupported(&enotsup()));
+        assert!(!flush_unsupported(&io::Error::from(io::ErrorKind::StorageFull)));
+        assert!(!flush_unsupported(&io::Error::from_raw_os_error(5)), "an I/O error is still one");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -479,6 +700,20 @@ mod tests {
     }
 
     #[test]
+    fn same_file_sees_a_hard_link_under_another_name() {
+        let d = temp("same-link");
+        let p = d.join("IMG_1.jpg");
+        fs::write(&p, b"original").unwrap();
+        let linked = d.join("linked.png");
+        fs::hard_link(&p, &linked).unwrap();
+        fs::write(d.join("copy.png"), b"original").unwrap();
+        assert!(same_file(&p, &linked), "a hard link is the same file");
+        assert!(same_file(&linked, &p));
+        assert!(!same_file(&p, &d.join("copy.png")), "a copy with the same content and length is another file");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn same_file_sees_through_other_spellings() {
         let d = temp("same");
         let p = d.join("x.jpg");
@@ -488,6 +723,127 @@ mod tests {
         assert!(same_file(&p, &d.join("sub/../x.jpg")));
         assert!(!same_file(&p, &d.join("y.jpg")));
         assert!(!same_file(&p, &d.join("missing.jpg")));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// What can't be a link (Windows test runs can't make one): a folder at the name is refused, a
+    /// missing file is `NotFound`, and `open_or_create` makes the file once and then opens it.
+    #[test]
+    fn opening_in_place_takes_regular_files_only() {
+        let d = temp("in-place");
+        let f = d.join("catalog.log");
+        assert_eq!(read_no_follow(&f).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(open_existing(&f, OpenOptions::new().append(true)).unwrap_err().kind(), io::ErrorKind::NotFound);
+        open_or_create(&f, OpenOptions::new().append(true)).unwrap().write_all(b"a").unwrap();
+        open_or_create(&f, OpenOptions::new().append(true)).unwrap().write_all(b"b").unwrap();
+        assert_eq!(read_no_follow(&f).unwrap(), b"ab");
+        fs::create_dir(d.join("sub")).unwrap();
+        for r in [read_no_follow(&d.join("sub")).map(|_| ()), open_or_create(&d.join("sub"), OpenOptions::new().append(true)).map(|_| ())] {
+            assert_eq!(r.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Links planted in a library folder are never written, cut or read through (issue #2122):
+    /// the lock owner note, the lock itself, `catalog.log` (appended to and cut back by the
+    /// journal) and `prefs.json` (read, and copied aside when damaged). Each target keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn links_in_a_library_folder_are_never_followed() {
+        use crate::store::{FsStore, Store};
+        use std::os::unix::fs::symlink;
+        let d = temp("library-links");
+        let outside = temp("library-links-outside");
+        let victim = |name: &str| {
+            let v = outside.join(name);
+            fs::write(
+                &v, b"keep
+",
+            )
+            .unwrap();
+            v
+        };
+        let owner = victim("owner");
+        symlink(&owner, d.join(crate::lock::OWNER)).unwrap();
+        {
+            let lock = crate::lock::LibraryLock::acquire(&d, "test").unwrap();
+            assert!(lock.held());
+            assert!(!fs::symlink_metadata(d.join(crate::lock::OWNER)).unwrap().file_type().is_symlink(), "the link was replaced by the note");
+        }
+        assert_eq!(
+            fs::read(&owner).unwrap(),
+            b"keep
+"
+        );
+
+        // a lock file linked elsewhere is not created or locked there: the library opens unprotected
+        let d2 = temp("library-links-lock");
+        let missing = outside.join("created-by-lock");
+        symlink(&missing, d2.join(crate::lock::LOCK)).unwrap();
+        assert!(!crate::lock::LibraryLock::acquire(&d2, "test").unwrap().held());
+        assert!(!missing.exists(), "nothing was created through the link");
+
+        let log = victim("log");
+        symlink(&log, d.join("catalog.log")).unwrap();
+        let prefs = victim("prefs");
+        symlink(&prefs, d.join("prefs.json")).unwrap();
+        let mut store = FsStore::open(&d).unwrap();
+        assert!(store.truncate("catalog.log", 0).is_err());
+        assert!(
+            store
+                .append(
+                    "catalog.log",
+                    b"[1]
+"
+                )
+                .is_err()
+        );
+        assert!(store.read("catalog.log").is_err());
+        assert!(store.read("prefs.json").is_err(), "refused: a damaged prefs.json is copied aside");
+        assert_eq!(
+            (fs::read(&log).unwrap(), fs::read(&prefs).unwrap()),
+            (
+                b"keep
+"
+                .to_vec(),
+                b"keep
+"
+                .to_vec()
+            )
+        );
+        // the journal refuses the library rather than cutting the log's target back
+        assert!(crate::journal::Journal::open(Box::new(FsStore::open(&d).unwrap())).is_err());
+        assert_eq!(
+            fs::read(&log).unwrap(),
+            b"keep
+"
+        );
+        for dir in [&d, &d2, &outside] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Issue #2552: only a regular file is opened in place. A link (even to a regular file), a
+    /// folder, a FIFO or a device at the name is refused without being opened, and a missing file
+    /// is `None` until `open_or_create_regular` makes it.
+    #[cfg(unix)]
+    #[test]
+    fn only_regular_files_are_opened_in_place() {
+        let d = temp("regular");
+        let p = d.join("catalog.log");
+        assert!(open_regular(&p, OpenOptions::new().read(true)).unwrap().is_none());
+        assert!(open_or_create_regular(&p, OpenOptions::new().append(true)).unwrap().1, "a missing file is made");
+        assert!(!open_or_create_regular(&p, OpenOptions::new().append(true)).unwrap().1, "an existing one is opened");
+        assert!(open_regular(&p, OpenOptions::new().read(true)).unwrap().is_some());
+        std::os::unix::fs::symlink(&p, d.join("link.log")).unwrap();
+        fs::create_dir_all(d.join("folder.log")).unwrap();
+        let fifo = d.join("fifo.log");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        for refused in [d.join("link.log"), d.join("folder.log"), fifo, PathBuf::from("/dev/null")] {
+            let e = open_regular(&refused, OpenOptions::new().read(true)).unwrap_err();
+            assert!(e.to_string().contains("is a link or not a regular file"), "{}: {e}", refused.display());
+            assert!(open_or_create_regular(&refused, OpenOptions::new().append(true)).is_err(), "{}", refused.display());
+        }
         let _ = fs::remove_dir_all(&d);
     }
 }

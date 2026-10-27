@@ -11,7 +11,11 @@
 //! - `{ENV_PREFIX}_GPU_BACKEND` = `dx12` | `vulkan` | `metal` | `gl` (comma lists allowed), `auto`
 //!   (the platform default), or `off` (no GPU compute; the window still needs one backend and
 //!   keeps the platform default);
-//! - else `WGPU_BACKEND` (wgpu's own variable, same names) for both the window and compute.
+//! - else `WGPU_BACKEND` (wgpu's own variable, same names) for both the window and compute;
+//! - else, for compute only, the saved preference ([`set_compute_preference`]: Settings ▸
+//!   Performance ▸ Graphics interface). On Windows, DX12 builds the compute shaders with FXC, which
+//!   can take many seconds at every start on some machines; Vulkan builds them much faster. The
+//!   window keeps the platform default, so a broken Vulkan driver can't stop it from opening.
 //!
 //! Backends this build doesn't contain (e.g. `gl`: the GL backend isn't compiled in) are ignored
 //! with a warning and the platform default is used.
@@ -99,6 +103,31 @@ pub fn resolve(choice: BackendChoice, default: Backends, compiled: Backends) -> 
     }
 }
 
+static COMPUTE_PREFERENCE: std::sync::OnceLock<BackendChoice> = std::sync::OnceLock::new();
+
+/// The saved compute backend preference (`"auto"`, `"dx12"`, `"vulkan"`…), applied when neither
+/// environment variable names one. Call it once at launch, before any compute device is created;
+/// later calls are ignored. `off` and unknown names count as `auto`: turning the GPU off is
+/// [`crate::set_enabled`]'s job.
+pub fn set_compute_preference(name: &str) {
+    let choice = match parse_backends(name) {
+        Some(BackendChoice::Use(b)) => BackendChoice::Use(b),
+        _ => BackendChoice::Auto,
+    };
+    let _ = COMPUTE_PREFERENCE.set(choice);
+}
+
+/// The compute choice: the environment's when it names one, else `preference`.
+pub fn compute_choice(env: BackendChoice, env_set: bool, preference: Option<BackendChoice>) -> BackendChoice {
+    // (an explicit `auto` in the environment also wins: the platform default, whatever the setting)
+    if env_set { env } else { preference.unwrap_or(BackendChoice::Auto) }
+}
+
+fn env_is_set() -> bool {
+    let usable = |v: Option<String>| v.is_some_and(|v| parse_backends(&v).is_some());
+    usable(lcc_brand::env("GPU_BACKEND")) || usable(std::env::var("WGPU_BACKEND").ok())
+}
+
 fn env_choice() -> BackendChoice {
     static C: std::sync::OnceLock<BackendChoice> = std::sync::OnceLock::new();
     *C.get_or_init(|| {
@@ -110,7 +139,8 @@ fn env_choice() -> BackendChoice {
 
 /// The backends of the compute device (`None`: `{ENV_PREFIX}_GPU_BACKEND=off`).
 pub fn compute_backends() -> Option<Backends> {
-    resolve(env_choice(), default_compute_backends(std::env::consts::OS), wgpu::Instance::enabled_backend_features())
+    let choice = compute_choice(env_choice(), env_is_set(), COMPUTE_PREFERENCE.get().copied());
+    resolve(choice, default_compute_backends(std::env::consts::OS), wgpu::Instance::enabled_backend_features())
 }
 
 /// The backends for the desktop window's renderer (eframe/egui-wgpu). The window always needs
@@ -180,7 +210,8 @@ static ACTIVE: Mutex<u32> = Mutex::new(0);
 /// Write this file before the compute device is created or any shader / pipeline is compiled
 /// (the kernels, the denoise network's), and remove it once that returned (successfully or not).
 /// A file still there at the next launch means the process died inside the driver — e.g. Apple's
-/// Metal compiler (`MTLCompilerService`) aborting on a kernel, issue #250: see
+/// Metal compiler (`MTLCompilerService`) aborting on a kernel, issue #250 — or ended while a device
+/// creation that passed its time limit was still stuck there (issue #3068): see
 /// [`take_init_marker`]. `None` (the default) writes nothing.
 pub fn set_init_marker(path: Option<PathBuf>) {
     *MARKER.lock().unwrap_or_else(|e| e.into_inner()) = path;
@@ -226,6 +257,7 @@ impl Drop for Armed<'_> {
 
 /// Run driver work `f` (`what`: "device creation", "kernel compilation"…) between writing and
 /// removing the init marker (if one is set).
+#[cfg_attr(not(feature = "denoise"), allow(dead_code))] // the denoise network's kernels
 pub(crate) fn with_marker<T>(what: &str, f: impl FnOnce() -> T) -> T {
     let marker = MARKER.lock().unwrap_or_else(|e| e.into_inner()).clone();
     with_marker_on(marker, &ACTIVE, what, f)
@@ -241,9 +273,32 @@ fn with_marker_on<T>(marker: Option<PathBuf>, active: &Mutex<u32>, what: &str, f
     f()
 }
 
-/// Run device creation (and the kernel build that follows it) `f` under the init marker.
-pub(crate) fn with_init_marker<T>(backends: Backends, f: impl FnOnce() -> T) -> T {
-    with_marker(&format!("device and kernel creation (backends {backends:?})"), f)
+/// The init marker (if one is set) and its scope counter, taken on the thread that asks for a device
+/// and carried to the thread that creates it (`init.rs`, issue #3068): the marker stays while the
+/// driver work really runs, also past the caller's time limit.
+pub(crate) struct InitMarker {
+    path: Option<PathBuf>,
+    active: &'static Mutex<u32>,
+}
+
+impl InitMarker {
+    /// The process-wide marker ([`set_init_marker`]).
+    pub(crate) fn current() -> InitMarker {
+        InitMarker { path: MARKER.lock().unwrap_or_else(|e| e.into_inner()).clone(), active: &ACTIVE }
+    }
+
+    /// A marker at `path` on its own scope counter (tests: other tests create real devices through
+    /// the process-wide one).
+    #[cfg(test)]
+    pub(crate) fn at(path: PathBuf, active: &'static Mutex<u32>) -> InitMarker {
+        InitMarker { path: Some(path), active }
+    }
+
+    /// Run device creation (and the kernel build that follows it) `f` on `backends` between writing
+    /// and removing the marker.
+    pub(crate) fn run<T>(self, backends: Backends, f: impl FnOnce() -> T) -> T {
+        with_marker_on(self.path, self.active, &format!("device and kernel creation (backends {backends:?})"), f)
+    }
 }
 
 /// If the init marker `path` is present — the last process died while creating the GPU device —
@@ -347,6 +402,19 @@ pub fn window_renderer_order(
 #[allow(clippy::unwrap_used)]
 mod tests {
 
+    /// The environment names a backend: it wins over the saved preference; otherwise the
+    /// preference applies; nothing at all is the platform default.
+    #[test]
+    fn compute_preference_applies_only_without_an_environment_choice() {
+        let vulkan = BackendChoice::Use(Backends::VULKAN);
+        let dx12 = BackendChoice::Use(Backends::DX12);
+        assert_eq!(compute_choice(BackendChoice::Auto, false, Some(vulkan)), vulkan);
+        assert_eq!(compute_choice(dx12, true, Some(vulkan)), dx12);
+        assert_eq!(compute_choice(BackendChoice::Off, true, Some(vulkan)), BackendChoice::Off);
+        assert_eq!(compute_choice(BackendChoice::Auto, true, Some(vulkan)), BackendChoice::Auto);
+        assert_eq!(compute_choice(BackendChoice::Auto, false, None), BackendChoice::Auto);
+    }
+
     /// #250: the indirect-call validation pipeline is off unless asked for; other flags are kept.
     #[test]
     fn indirect_call_validation_is_off_unless_asked_for() {
@@ -418,12 +486,12 @@ mod tests {
     }
 
     #[test]
-    fn with_init_marker_writes_the_process_wide_marker() {
+    fn the_current_init_marker_is_the_process_wide_one() {
         let dir = std::env::temp_dir().join(format!("lc-gpu-global-{}", std::process::id()));
         let m = dir.join("gpu-init.marker");
         let _ = std::fs::remove_dir_all(&dir);
         set_init_marker(Some(m.clone()));
-        let seen = with_init_marker(Backends::DX12, || m.exists());
+        let seen = InitMarker::current().run(Backends::DX12, || m.exists());
         set_init_marker(None);
         // not checked for removal: device-creating tests running in parallel may still hold the file
         // (the test above checks removal on its own scope counter)

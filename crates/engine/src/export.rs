@@ -8,7 +8,7 @@ use lcc_codecs::{ChromaSubsampling, EncodeImage, EncodeMeta, JxlColour, JxlOptio
 pub use lcc_codecs::{JxlEffort, TiffCompression};
 use lcc_meta::{DateTime, Gps, Metadata};
 pub use lcc_pipeline::{DeepImage, DeepSamples, OutputDepth, OutputSpace};
-use lcc_raster::Rgba8;
+use lcc_raster::{Plane, Rgba8};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +66,12 @@ impl ExportFormat {
     /// Formats that render pixels (everything but `Original` and `Dng`).
     pub fn is_rendered(self) -> bool {
         !matches!(self, Self::Original | Self::Dng)
+    }
+
+    /// Formats whose exports keep a transparent source's alpha (straight in PNG and WebP,
+    /// associated in TIFF); the others composite it onto white (issue #2976).
+    pub fn keeps_alpha(self) -> bool {
+        matches!(self, Self::Png | Self::Tiff | Self::Webp)
     }
 }
 
@@ -404,9 +410,23 @@ fn blend_watermark(img: &mut Rgba8, wm: &Watermark, floor_scale: f32) {
     let width = img.width;
     watermark_coverage(img.width, img.height, wm, crate::fonts::CRAFT_FONTS, floor_scale, |x, y, k, col| {
         let p = &mut img.data[y * width + x];
-        for c in 0..3 {
-            p[c] = (p[c] as f32 + (col[c] as f32 - p[c] as f32) * k).round() as u8;
+        if p[3] == 255 {
+            for c in 0..3 {
+                p[c] = (p[c] as f32 + (col[c] as f32 - p[c] as f32) * k).round() as u8;
+            }
+            return;
         }
+        // over a transparent pixel (an export that keeps transparency): the mark composites over
+        // it and raises its alpha, so it shows where the photo is transparent
+        let a = p[3] as f32 / 255.0;
+        let out = k + a * (1.0 - k);
+        if out <= 0.0 {
+            return;
+        }
+        for c in 0..3 {
+            p[c] = ((col[c] as f32 * k + p[c] as f32 * a * (1.0 - k)) / out).round().clamp(0.0, 255.0) as u8;
+        }
+        p[3] = (out * 255.0).round().clamp(0.0, 255.0) as u8;
     });
 }
 
@@ -430,20 +450,48 @@ pub fn draw_watermark_in(img: &mut Rgba8, wm: &Watermark, x0: usize, y0: usize, 
 /// Draw `wm` onto a high-bit-depth image (`wm.color` is in the image's space, 8-bit encoded; float
 /// images are linear and blend in linear light).
 pub fn draw_watermark_deep(img: &mut DeepImage, wm: &Watermark) {
+    draw_watermark_deep_over(img, None, wm);
+}
+
+/// [`draw_watermark_deep`] onto an image with straight alpha `alpha` (its size): the mark
+/// composites over transparent pixels and raises their alpha, as [`draw_watermark`] does.
+fn draw_watermark_deep_over(img: &mut DeepImage, mut alpha: Option<&mut Plane>, wm: &Watermark) {
     let (width, trc) = (img.width, img.space.trc());
+    // over a transparent pixel `i`: the weights of the mark and of the pixel, its alpha raised
+    // (`None`: an opaque pixel, blended as without alpha)
+    let mut over = move |i: usize, k: f32| -> Option<(f32, f32)> {
+        let a = alpha.as_deref_mut().and_then(|a| a.data.get_mut(i))?;
+        let before = if a.is_finite() { a.clamp(0.0, 1.0) } else { 1.0 };
+        if before >= 1.0 {
+            return None;
+        }
+        let out = k + before * (1.0 - k);
+        *a = out;
+        Some(if out <= 0.0 { (0.0, 1.0) } else { (k / out, before * (1.0 - k) / out) })
+    };
     match &mut img.samples {
         DeepSamples::U16(v) => watermark_coverage(img.width, img.height, wm, crate::fonts::CRAFT_FONTS, 1.0, |x, y, k, col| {
+            let w = over(y * width + x, k);
             let i = (y * width + x) * 3;
             for c in 0..3 {
                 let p = v[i + c] as f32;
-                v[i + c] = (p + (col[c] as f32 * 257.0 - p) * k).round().clamp(0.0, 65535.0) as u16;
+                let t = col[c] as f32 * 257.0;
+                let blended = match w {
+                    Some((wk, wp)) => p * wp + t * wk,
+                    None => p + (t - p) * k,
+                };
+                v[i + c] = blended.round().clamp(0.0, 65535.0) as u16;
             }
         }),
         DeepSamples::F32(v) => watermark_coverage(img.width, img.height, wm, crate::fonts::CRAFT_FONTS, 1.0, |x, y, k, col| {
+            let w = over(y * width + x, k);
             let i = (y * width + x) * 3;
             for c in 0..3 {
                 let target = trc.decode(col[c] as f32 / 255.0);
-                v[i + c] += (target - v[i + c]) * k;
+                v[i + c] = match w {
+                    Some((wk, wp)) => v[i + c] * wp + target * wk,
+                    None => v[i + c] + (target - v[i + c]) * k,
+                };
             }
         }),
     }
@@ -530,11 +578,12 @@ pub(crate) fn watermark_logo(path: &str) -> Option<std::sync::Arc<Rgba8>> {
 }
 
 /// A graphic file (a PNG with transparency, typically) as 8-bit sRGB with its alpha: the
-/// watermark logo, the loupe's layout image. The error says why it couldn't be read or decoded.
+/// watermark logo, the loupe's layout image. Applies EXIF orientation before either consumer sizes it.
+/// The error says why it couldn't be read or decoded.
 pub fn read_graphic(path: &str) -> Result<Rgba8, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("can't read {path}: {e}"))?;
     let decoded = lcc_codecs::decode(&bytes, Default::default()).map_err(|e| format!("can't decode {path}: {e}"))?;
-    Ok(decoded.to_srgb8())
+    Ok(decoded.to_srgb8().into_oriented(lcc_geom::Orientation::from_exif(decoded.orientation)))
 }
 
 /// The graphic watermark: scaled (premultiplied, so transparent edges stay clean) to
@@ -547,20 +596,27 @@ fn logo_coverage(width: usize, height: usize, wm: &Watermark, mut blend_px: impl
     if width == 0 || height == 0 || logo.width == 0 || logo.height == 0 {
         return;
     }
-    let lw = ((wm.image_width.clamp(0.01, 1.0) * width as f32).round() as usize).clamp(1, width);
-    let lh = ((lw as f32 * logo.height as f32 / logo.width as f32).round() as usize).clamp(1, height);
+    let turns = wm.quarter_turns();
+    // Reserve the inset on anchored axes before fitting the turned box. Centered axes
+    // ignore insets, just as placement below does. One scale preserves the graphic's shape.
+    let short = width.min(height) as f32;
+    let (ix, iy) = (wm.inset_x.clamp(0.0, 0.4) * short, wm.inset_y.clamp(0.0, 0.4) * short);
+    use Anchor::*;
+    let available_w = width as f64 - if matches!(wm.anchor, Top | Center | Bottom) { 0.0 } else { ix as f64 };
+    let available_h = height as f64 - if matches!(wm.anchor, Left | Center | Right) { 0.0 } else { iy as f64 };
+    let (max_w, max_h) = if turns % 2 == 1 { (available_h, available_w) } else { (available_w, available_h) };
+    let scale =
+        (wm.image_width.clamp(0.01, 1.0) as f64 * width as f64 / logo.width as f64).min(max_w / logo.width as f64).min(max_h / logo.height as f64);
+    let lw = (logo.width as f64 * scale).round().max(1.0) as usize;
+    let lh = (logo.height as f64 * scale).round().max(1.0) as usize;
     let pre: lcc_raster::Image<[f32; 4]> = lcc_raster::Image::from_fn(logo.width, logo.height, |x, y| {
         let p = logo.get(x, y);
         let a = p[3] as f32 / 255.0;
         [p[0] as f32 * a, p[1] as f32 * a, p[2] as f32 * a, a]
     });
     let scaled = lcc_raster::resample::resize(&pre, lw, lh, lcc_raster::resample::Filter::Mitchell);
-    let short = width.min(height) as f32;
-    let (ix, iy) = (wm.inset_x.clamp(0.0, 0.4) * short, wm.inset_y.clamp(0.0, 0.4) * short);
-    let turns = wm.quarter_turns();
     let (bw, bh) = if turns % 2 == 1 { (lh, lw) } else { (lw, lh) };
     let (w, h, lwf, lhf) = (width as f32, height as f32, bw as f32, bh as f32);
-    use Anchor::*;
     let ox = match wm.anchor {
         TopLeft | Left | BottomLeft => ix,
         Top | Center | Bottom => (w - lwf) / 2.0,
@@ -693,8 +749,8 @@ pub struct ExportOptions {
     /// format's default (TIFF 16, everything else 8). See [`ExportOptions::effective_depth`].
     pub bit_depth: Option<u8>,
     /// HDR output for photos edited in HDR: JPEG as an ISO 21496-1 gain map JPEG (the SDR
-    /// rendition plus a gain map, so the file looks right everywhere; quality as set, `limit_kb`
-    /// not applied), AVIF as 10-bit Rec. 2020 PQ, PNG as 16-bit Rec. 2020 PQ (`cICP`; viewers
+    /// rendition plus a gain map, so the file looks right everywhere; `limit_kb` includes both
+    /// images and their metadata), AVIF as 10-bit Rec. 2020 PQ, PNG as 16-bit Rec. 2020 PQ (`cICP`; viewers
     /// without cICP support show it as sRGB, washed out), JPEG XL as 16-bit Rec. 2020 PQ, 32-bit float
     /// TIFF with the highlights above SDR white kept. Other formats, and photos without an HDR
     /// edit, are SDR.
@@ -1356,7 +1412,7 @@ impl ExportOptions {
         let base = if self.naming.trim().is_empty() { "{name}" } else { self.naming.as_str() };
         let n = seq + self.start_number.max(1) as usize - 1;
         let name = crate::rename::expand_tokens(base, p, n, 3).replace("{custom}", self.custom_text.trim());
-        let mut name: String = name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
+        let mut name = portable_stem(&name);
         let (stem, ext) = p.file_name.rsplit_once('.').unwrap_or((&p.file_name, ""));
         if name.trim().is_empty() {
             // every token came out empty (no title, no capture time…): keep the original name
@@ -1371,7 +1427,24 @@ impl ExportOptions {
     }
 }
 
-/// Unsharp mask on an 8-bit image (separable box-blur approximation of a small Gaussian).
+/// A file name stem every file system takes (issue #2140): path separators, the characters Windows
+/// forbids (`: * ? " < > |`) and control characters become `_`, trailing dots and spaces go (Windows
+/// drops them), and a device name Windows reserves (`CON`, `NUL`, `COM1`…, also before a dot) gets
+/// a `_` so it names a file.
+pub(crate) fn portable_stem(name: &str) -> String {
+    let mut s: String =
+        name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c }).collect();
+    s.truncate(s.trim_end_matches(['.', ' ']).len());
+    let device = s.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let numbered =
+        device.len() == 4 && (device.starts_with("COM") || device.starts_with("LPT")) && device.ends_with(|c: char| ('1'..='9').contains(&c));
+    if matches!(device.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered {
+        s.insert(device.len(), '_');
+    }
+    s
+}
+
+/// Output sharpening of an 8-bit image: an unsharp mask on its luma ([`unsharp`]).
 pub fn output_sharpen(img: &mut Rgba8, target: SharpenFor, amount: SharpenAmount) {
     let src: Vec<[f32; 3]> = img.data.iter().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect();
     if let Some(out) = unsharp(img.width, img.height, &src, target, amount) {
@@ -1396,7 +1469,8 @@ pub fn output_sharpen_deep(img: &mut DeepImage, target: SharpenFor, amount: Shar
             }
         }
         DeepSamples::F32(v) => {
-            let src: Vec<[f32; 3]> = v.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]]).collect();
+            // A NaN or infinite sample would poison its neighbours' blur and local range; treat it as black.
+            let src: Vec<[f32; 3]> = v.as_chunks::<3>().0.iter().map(|c| [c[0], c[1], c[2]].map(|x| if x.is_finite() { x } else { 0.0 })).collect();
             if let Some(out) = unsharp(w, h, &src, target, amount) {
                 for (d, s) in v.iter_mut().zip(out.as_flattened()) {
                     *d = s.max(0.0);
@@ -1406,46 +1480,72 @@ pub fn output_sharpen_deep(img: &mut DeepImage, target: SharpenFor, amount: Shar
     }
 }
 
-/// The sharpened values of `src` (`w × h`), or `None` when nothing is to be done.
+/// How far a sharpened pixel may pass the darkest and lightest of its 3×3 neighbours, as a share
+/// of their difference: enough for crisp edges, too little for the light and dark rims (halos)
+/// a plain unsharp mask draws along strong edges.
+const SHARPEN_OVERSHOOT: f32 = 0.1;
+
+/// The sharpened values of `src` (`w × h`), or `None` when nothing is to be done: an unsharp mask
+/// at the output's own pixel scale (a Gaussian of radius `sigma` output pixels), on luma only (no
+/// colour fringes), with its overshoot past the local range limited ([`SHARPEN_OVERSHOOT`]). Print
+/// media blur more than a screen and get a wider, stronger mask. The values may be on any scale.
 fn unsharp(w: usize, h: usize, src: &[[f32; 3]], target: SharpenFor, amount: SharpenAmount) -> Option<Vec<[f32; 3]>> {
-    let (radius, base) = match target {
+    let (sigma, base) = match target {
         SharpenFor::None => return None,
-        SharpenFor::Screen => (1usize, 0.35f32),
-        SharpenFor::Matte => (2, 0.6),
-        SharpenFor::Glossy => (1, 0.5),
+        SharpenFor::Screen => (0.7f32, 0.65f32),
+        SharpenFor::Glossy => (0.8, 0.85),
+        SharpenFor::Matte => (1.0, 1.05),
     };
     let k = base
         * match amount {
-            SharpenAmount::Low => 0.6,
+            SharpenAmount::Low => 0.5,
             SharpenAmount::Standard => 1.0,
-            SharpenAmount::High => 1.5,
+            SharpenAmount::High => 1.6,
         };
     if w < 3 || h < 3 {
         return None;
     }
-    let r = radius as isize;
-    let box_pass = |inp: &[[f32; 3]], horizontal: bool| -> Vec<[f32; 3]> {
-        let mut out = vec![[0.0; 3]; inp.len()];
-        for y in 0..h {
-            for x in 0..w {
-                let mut acc = [0.0f32; 3];
-                for d in -r..=r {
-                    let (sx, sy) = if horizontal {
-                        ((x as isize + d).clamp(0, w as isize - 1) as usize, y)
-                    } else {
-                        (x, (y as isize + d).clamp(0, h as isize - 1) as usize)
-                    };
-                    let p = inp[sy * w + sx];
-                    acc = [acc[0] + p[0], acc[1] + p[1], acc[2] + p[2]];
-                }
-                let n = (2 * r + 1) as f32;
-                out[y * w + x] = acc.map(|v| v / n);
-            }
+    let luma: Vec<f32> = src.iter().map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).collect();
+    let r = (3.0 * sigma).ceil() as isize;
+    let taps: Vec<f32> = (-r..=r).map(|d| (-((d * d) as f32) / (2.0 * sigma * sigma)).exp()).collect();
+    let norm: f32 = taps.iter().sum();
+    let taps: Vec<f32> = taps.iter().map(|t| t / norm).collect();
+    let gauss = |acc: f32, d: isize, v: f32| acc + v * taps[(d + r) as usize];
+    let blur = separable(&separable(&luma, w, h, r, true, 0.0, gauss), w, h, r, false, 0.0, gauss);
+    let lo = |acc: f32, _: isize, v: f32| acc.min(v);
+    let hi = |acc: f32, _: isize, v: f32| acc.max(v);
+    let lo = separable(&separable(&luma, w, h, 1, true, f32::INFINITY, lo), w, h, 1, false, f32::INFINITY, lo);
+    let hi = separable(&separable(&luma, w, h, 1, true, f32::NEG_INFINITY, hi), w, h, 1, false, f32::NEG_INFINITY, hi);
+    Some(
+        src.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (y, margin) = (luma[i], (hi[i] - lo[i]) * SHARPEN_OVERSHOOT);
+                // max/min rather than clamp: never panics, even on bounds a non-finite input left inverted or NaN.
+                let sharp = (y + (y - blur[i]) * k).max(lo[i] - margin).min(hi[i] + margin);
+                p.map(|v| v + sharp - y)
+            })
+            .collect(),
+    )
+}
+
+/// One pass of a separable filter over a `w × h` plane: each value folds (`f(acc, offset, value)`,
+/// from `init`) its neighbours up to `reach` away along a row (`horizontal`) or a column, edges repeated.
+fn separable(inp: &[f32], w: usize, h: usize, reach: isize, horizontal: bool, init: f32, f: impl Fn(f32, isize, f32) -> f32 + Sync) -> Vec<f32> {
+    let mut out = vec![0.0; inp.len()];
+    lcc_raster::par_rows(&mut out, w, |y, row| {
+        for (x, o) in row.iter_mut().enumerate() {
+            *o = (-reach..=reach).fold(init, |acc, d| {
+                let i = if horizontal {
+                    y * w + (x as isize + d).clamp(0, w as isize - 1) as usize
+                } else {
+                    (y as isize + d).clamp(0, h as isize - 1) as usize * w + x
+                };
+                f(acc, d, inp[i])
+            });
         }
-        out
-    };
-    let blur = box_pass(&box_pass(src, true), false);
-    Some(src.iter().zip(&blur).map(|(s, b)| std::array::from_fn(|c| s[c] + (s[c] - b[c]) * k)).collect())
+    });
+    out
 }
 
 /// Encode a rendered display-referred image according to `o` (its pixels must already be in
@@ -1476,32 +1576,10 @@ pub fn encode_with_metadata(img: &Rgba8, o: &ExportOptions, meta: Option<&Metada
         ExportFormat::Jpeg => {
             // 4:4:4 normally; 4:2:0 when targeting a file size (much smaller at equal visual quality).
             let sub = if o.limit_kb.is_some() { ChromaSubsampling::S420 } else { ChromaSubsampling::S444 };
-            let jpeg = |q: u8| encode::encode_jpeg(&e, q, sub, &meta);
-            match o.limit_kb {
-                Some(kb) => {
-                    let limit = kb as usize * 1024;
-                    // Binary search for the highest quality that fits.
-                    let (mut lo, mut hi) = (1u8, o.quality);
-                    let mut best = None;
-                    while lo <= hi {
-                        let mid = lo + (hi - lo) / 2;
-                        let b = jpeg(mid).map_err(|e| e.to_string())?;
-                        if b.len() <= limit {
-                            best = Some(b);
-                            lo = mid + 1;
-                        } else if mid == 1 {
-                            break;
-                        } else {
-                            hi = mid - 1;
-                        }
-                    }
-                    return best.ok_or_else(|| format!("cannot fit within {kb} KB"));
-                }
-                None => jpeg(o.quality),
-            }
+            return encode_jpeg_with_limit(o, |q| encode::encode_jpeg(&e, q, sub, &meta));
         }
         ExportFormat::Png => encode::encode_png(&e, &meta),
-        ExportFormat::Tiff => encode::encode_tiff(&e, o.tiff_compression, &meta),
+        ExportFormat::Tiff => encode::encode_tiff_associated(&e, o.tiff_compression, &meta),
         ExportFormat::Psd => encode::encode_psd(&e, &meta),
         ExportFormat::Webp => encode::encode_webp_lossless(&e, &meta),
         ExportFormat::Avif => encode::encode_avif(&e, o.quality, 8, &meta),
@@ -1510,6 +1588,27 @@ pub fn encode_with_metadata(img: &Rgba8, o: &ExportOptions, meta: Option<&Metada
         ExportFormat::RenderedDng => return Err("Render to DNG needs a float render".into()),
     };
     r.map_err(|e| e.to_string())
+}
+
+/// Apply the same file-size policy to ordinary JPEGs and complete HDR gain map JPEGs.
+fn encode_jpeg_with_limit(o: &ExportOptions, jpeg: impl Fn(u8) -> lcc_codecs::Result<Vec<u8>>) -> Result<Vec<u8>, String> {
+    let Some(kb) = o.limit_kb else { return jpeg(o.quality).map_err(|e| e.to_string()) };
+    let limit = u64::from(kb) * 1024;
+    let (mut lo, mut hi) = (1u8, o.quality.min(100));
+    let mut best = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let b = jpeg(mid).map_err(|e| e.to_string())?;
+        if b.len() as u64 <= limit {
+            best = Some(b);
+            lo = mid + 1;
+        } else if mid == 1 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best.ok_or_else(|| format!("cannot fit within {kb} KB"))
 }
 
 /// Output sharpening and the watermark on an 8-bit render in `o.effective_space()`.
@@ -1526,11 +1625,16 @@ fn finish_8bit(img: &Rgba8, o: &ExportOptions) -> Rgba8 {
 
 /// Output sharpening and the watermark on a high-bit-depth render.
 fn finish_deep(img: &DeepImage, o: &ExportOptions) -> DeepImage {
+    finish_deep_over(img, None, o)
+}
+
+/// [`finish_deep`] of an image with straight alpha `alpha`, which the watermark raises.
+fn finish_deep_over(img: &DeepImage, alpha: Option<&mut Plane>, o: &ExportOptions) -> DeepImage {
     let mut img = img.clone();
     output_sharpen_deep(&mut img, o.sharpen, o.sharpen_amount);
     if let Some(wm) = &o.watermark {
         let wm = Watermark { color: srgb8_in(img.space, wm.color), target: Some(img.space), ..wm.clone() };
-        draw_watermark_deep(&mut img, &wm);
+        draw_watermark_deep_over(&mut img, alpha, &wm);
     }
     img
 }
@@ -1559,7 +1663,7 @@ pub fn encode_gain_map_jpeg(sdr: &Rgba8, hdr: &DeepImage, o: &ExportOptions, met
     let xmp = meta.map(|m| lcc_meta::write_xmp(m, None));
     let em = EncodeMeta { icc: Some(&profile), exif: exif.as_deref(), xmp: xmp.as_deref(), ppi: Some(o.ppi) };
     let sub = if o.limit_kb.is_some() { ChromaSubsampling::S420 } else { ChromaSubsampling::S444 };
-    gainmap::encode_jpeg(&EncodeImage::rgba8(&base), &map, &gm, o.quality, sub, &em).map_err(|e| e.to_string())
+    encode_jpeg_with_limit(o, |q| gainmap::encode_jpeg(&EncodeImage::rgba8(&base), &map, &gm, q, sub, &em))
 }
 
 /// The codecs' name of an output space (for its ICC profile).
@@ -1589,17 +1693,50 @@ pub fn srgb8_in(space: OutputSpace, c: [u8; 3]) -> [u8; 3] {
 
 /// Encode a render according to `o`: its high-bit-depth samples when it has them (16-bit PNG/TIFF,
 /// 10-bit AVIF, 32-bit float linear TIFF), else its 8-bit image.
+///
+/// A render with alpha ([`lcc_pipeline::Rendered::alpha`]) keeps it in the formats that
+/// can ([`ExportFormat::keeps_alpha`]) when it is not opaque everywhere (issue #2976).
 pub fn encode_rendered(r: &lcc_pipeline::Rendered, o: &ExportOptions, meta: Option<&Metadata>) -> Result<Vec<u8>, String> {
+    let alpha = r.alpha.as_ref().filter(|_| o.format.keeps_alpha());
     match &r.deep {
-        Some(d) if o.effective_depth() != OutputDepth::U8 => encode_deep(d, o, meta),
-        _ => encode_with_metadata(&r.image, o, meta),
+        Some(d) if o.effective_depth() != OutputDepth::U8 => encode_deep_with_alpha(d, alpha, o, meta),
+        _ => match alpha {
+            Some(a) => encode_with_metadata(&with_alpha(&r.image, a)?, o, meta),
+            None => encode_with_metadata(&r.image, o, meta),
+        },
     }
+}
+
+/// `img` with straight alpha `a` (its size) in its fourth channel.
+fn with_alpha(img: &Rgba8, a: &Plane) -> Result<Rgba8, String> {
+    if (a.width, a.height) != (img.width, img.height) || a.data.len() != img.data.len() {
+        return Err("export: the transparency does not match the rendered image".into());
+    }
+    let mut out = img.clone();
+    for (p, &av) in out.data.iter_mut().zip(&a.data) {
+        p[3] = if av.is_finite() { (av.clamp(0.0, 1.0) * 255.0).round() as u8 } else { 255 };
+    }
+    Ok(out)
 }
 
 /// Encode a high-bit-depth image (see [`encode_rendered`]).
 pub fn encode_deep(img: &DeepImage, o: &ExportOptions, meta: Option<&Metadata>) -> Result<Vec<u8>, String> {
+    encode_deep_with_alpha(img, None, o, meta)
+}
+
+/// [`encode_deep`] keeping straight alpha `alpha` (the image's size) in PNG and TIFF when it is
+/// not opaque everywhere (associated in TIFF).
+fn encode_deep_with_alpha(img: &DeepImage, alpha: Option<&Plane>, o: &ExportOptions, meta: Option<&Metadata>) -> Result<Vec<u8>, String> {
     let meta_src = meta;
-    let img = finish_deep(img, o);
+    let mut alpha = match alpha {
+        Some(a) if (a.width, a.height) != (img.width, img.height) => return Err("export: the transparency does not match the rendered image".into()),
+        a => a.cloned(),
+    };
+    let img = finish_deep_over(img, alpha.as_mut(), o);
+    let alpha = alpha.filter(|a| match img.samples {
+        DeepSamples::U16(_) => a.data.iter().any(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() < 65535.0),
+        DeepSamples::F32(_) => a.data.iter().any(|&v| v < 1.0),
+    });
     let profile = match img.samples {
         DeepSamples::F32(_) => icc::write_matrix_trc(&img.space.rgb_space(), &lcc_codecs::Trc::Linear),
         DeepSamples::U16(_) => icc::write_named(named_space(img.space)),
@@ -1608,14 +1745,32 @@ pub fn encode_deep(img: &DeepImage, o: &ExportOptions, meta: Option<&Metadata>) 
     let xmp = meta.map(|m| lcc_meta::write_xmp(m, None));
     let meta = EncodeMeta { icc: Some(&profile), exif: exif.as_deref(), xmp: xmp.as_deref(), ppi: Some(o.ppi) };
     let (w, h) = (img.width as u32, img.height as u32);
-    let e = match &img.samples {
-        DeepSamples::U16(v) => EncodeImage::new(w, h, 3, Samples::U16(v)),
-        DeepSamples::F32(v) => EncodeImage::new(w, h, 3, Samples::F32(v)),
+    // RGB plus the alpha as a fourth sample
+    fn rgba<T: Copy>(v: &[T], a: &Plane, alpha: impl Fn(f32) -> T) -> Vec<T> {
+        v.as_chunks::<3>()
+            .0
+            .iter()
+            .zip(&a.data)
+            .flat_map(|(p, &av)| [p[0], p[1], p[2], alpha(if av.is_finite() { av.clamp(0.0, 1.0) } else { 1.0 })])
+            .collect()
+    }
+    let (rgba16, rgba32);
+    let e = match (&img.samples, alpha.as_ref().filter(|_| matches!(o.format, ExportFormat::Png | ExportFormat::Tiff))) {
+        (DeepSamples::U16(v), Some(a)) => {
+            rgba16 = rgba(v, a, |av| (av * 65535.0).round() as u16);
+            EncodeImage::new(w, h, 4, Samples::U16(&rgba16))
+        }
+        (DeepSamples::F32(v), Some(a)) => {
+            rgba32 = rgba(v, a, |av| av);
+            EncodeImage::new(w, h, 4, Samples::F32(&rgba32))
+        }
+        (DeepSamples::U16(v), None) => EncodeImage::new(w, h, 3, Samples::U16(v)),
+        (DeepSamples::F32(v), None) => EncodeImage::new(w, h, 3, Samples::F32(v)),
     };
     let r = match (o.format, &img.samples) {
         (ExportFormat::Png, DeepSamples::F32(v)) if img.space == OutputSpace::Rec2020 => lcc_codecs::encode_png_pq(w, h, v, &meta),
         (ExportFormat::Png, _) => encode::encode_png(&e, &meta),
-        (ExportFormat::Tiff, _) => encode::encode_tiff(&e, o.tiff_compression, &meta),
+        (ExportFormat::Tiff, _) => encode::encode_tiff_associated(&e, o.tiff_compression, &meta),
         (ExportFormat::Psd, _) => encode::encode_psd(&e, &meta),
         (ExportFormat::RenderedDng, DeepSamples::F32(v)) => {
             let m = meta_src.cloned().unwrap_or_default();
@@ -1686,7 +1841,15 @@ pub fn export_metadata(photo: &lcc_catalog::Photo, catalog: &lcc_catalog::Catalo
         out.gps = m.gps.map(|(latitude, longitude)| Gps { latitude, longitude, altitude: None });
     }
     if o.metadata == MetadataPolicy::All {
-        out.model = text(&m.camera);
+        // Make and Model as read (issue #1618); catalogs from before they were kept separately
+        // only have the label, which stands in for the Model.
+        let (make, model) = if m.camera_make.is_empty() && m.camera_model.is_empty() {
+            (None, text(&m.camera))
+        } else {
+            (text(&m.camera_make), text(&m.camera_model))
+        };
+        out.make = make;
+        out.model = model;
         out.lens_model = text(&m.lens);
         out.focal_length = m.focal_mm.map(f64::from);
         out.f_number = m.aperture.map(f64::from);
@@ -1794,6 +1957,8 @@ enum Work {
         remove_location: bool,
         label: String,
         size: (usize, usize),
+        /// The photo's camera-profile choice (`profile.camera`): a DNG carries the colour the photo renders with.
+        camera: String,
     },
 }
 
@@ -1857,7 +2022,9 @@ fn prepare_guarded(
         let label = p.file_name.clone();
         let meta = export_metadata(p, &session.catalog, o);
         let gain_map = o.hdr_output() && o.format == ExportFormat::Jpeg;
-        let job = session.export_job(id, w, h, o.effective_space(), o.effective_depth())?;
+        // (HDR files are written without alpha: their transparent areas stay on white)
+        let alpha = o.format.keeps_alpha() && !o.hdr_output();
+        let job = session.export_job_with_alpha(id, w, h, o.effective_space(), o.effective_depth(), alpha)?;
         let weight = render_weight(full_px, long, job.level, w.saturating_mul(h));
         if let Some(why) = too_big_for_memory((w, h), native_px, weight, crate::memory::total_ram()) {
             return Err(format!("{label}: {why}"));
@@ -1872,6 +2039,7 @@ fn prepare_guarded(
         // the file's bytes; a DNG also decodes the raw data (16-bit samples) and writes it again
         let weight = (p.file_size as usize).saturating_add(if dng.is_some() { full_px.saturating_mul(6) } else { 0 });
         let work = Work::File {
+            camera: p.develop.profile.camera.clone(),
             path: path.clone(),
             read: session.media.file_bytes.clone(),
             packet: crate::sidecar::sidecar_packet_with(p, &session.catalog, removes_location(p, &session.catalog, o)),
@@ -1987,7 +2155,7 @@ impl PreparedExport {
                     video_file: None,
                 })
             }
-            Work::File { path, read, packet, dng, quality, lossy_edge, label, size, remove_location } => {
+            Work::File { path, read, packet, dng, quality, lossy_edge, label, size, remove_location, camera } => {
                 let bytes = match &read {
                     Some(r) => r(&path)?,
                     None => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
@@ -1998,11 +2166,24 @@ impl PreparedExport {
                         // fail closed: a PSD whose metadata can't be read might hide a location
                         let metadata = lcc_meta::try_extract(&bytes)
                             .map_err(|e| format!("{label}: can't verify location metadata in this original file: {e}"))?;
-                        if metadata.gps.is_some() || lcc_meta::embeds_location(&bytes) {
+                        if !bytes.starts_with(b"8BPS") {
+                            let embedded = lcc_meta::embedded(&bytes);
+                            if let Some(xmp) = embedded.xmp.as_deref() {
+                                lcc_meta::parse_xmp(xmp).map_err(|e| {
+                                    format!("{label}: can't verify location metadata in this original file: malformed embedded XMP: {e}")
+                                })?;
+                            }
+                        }
+                        let embeds_place_name =
+                            [metadata.sublocation.as_deref(), metadata.city.as_deref(), metadata.state.as_deref(), metadata.country.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .any(|value| !value.trim().is_empty());
+                        if metadata.gps.is_some() || embeds_place_name || lcc_meta::embeds_location(&bytes) {
                             // DNG only for what the DNG export below takes
                             let instead = if lcc_raw::probe(&bytes).is_some() { "JPEG, TIFF or DNG" } else { "JPEG or TIFF" };
                             return Err(format!(
-                                "{label}: can't remove the location from an original file that embeds GPS; export as {instead} instead"
+                                "{label}: can't remove the location from an original file that embeds GPS or place names; export as {instead} instead"
                             ));
                         }
                     }
@@ -2021,7 +2202,8 @@ impl PreparedExport {
                     return Err(format!("{label}: DNG export needs a raw photo"));
                 }
                 let mut raw = lcc_raw::decode(&bytes).map_err(|e| format!("{label}: {e}"))?;
-                crate::camera_preview::with_starting_colour(&mut raw, &bytes);
+                // the colour the photo renders with: its chosen .dcp or calibration look, else the starting colour
+                crate::colour_export::with_photo_colour(&mut raw, &bytes, &camera);
                 drop(bytes);
                 let compression = match dng {
                     DngCompression::Lossless => lcc_raw::DngCompression::Lj92 { tile: 256 },
@@ -2606,6 +2788,29 @@ mod tests {
         }
     }
 
+    /// Issue #2976: on a transparent area of an export that keeps alpha, the watermark composites
+    /// over it and raises the alpha, so it shows; opaque pixels blend as before.
+    #[test]
+    fn watermark_shows_over_transparency() {
+        let wm = Watermark { text: "LC".into(), size: 0.3, opacity: 1.0, shadow: false, color: [255, 255, 255], ..Default::default() };
+        let mut clear = Rgba8::from_fn(200, 100, |_, _| [0, 0, 0, 0]);
+        draw_watermark(&mut clear, &wm);
+        let marked: Vec<&[u8; 4]> = clear.data.iter().filter(|p| p[3] > 0).collect();
+        assert!(!marked.is_empty(), "the mark raises the alpha");
+        assert!(marked.iter().all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255), "in its own colour, not faded towards black");
+        assert!(marked.iter().any(|p| p[3] == 255));
+        let mut opaque = Rgba8::from_fn(200, 100, |_, _| [0, 0, 0, 255]);
+        draw_watermark(&mut opaque, &wm);
+        assert!(opaque.data.iter().all(|p| p[3] == 255));
+        let lit = |i: &Rgba8| i.data.iter().filter(|p| p[0] > 128).count();
+        assert!(lit(&opaque) > 0);
+        // straight-alpha deep images: the plane is raised the same way
+        let mut deep = DeepImage { width: 200, height: 100, space: OutputSpace::Srgb, samples: DeepSamples::U16(vec![0; 200 * 100 * 3]) };
+        let mut alpha = Plane::new(200, 100);
+        draw_watermark_deep_over(&mut deep, Some(&mut alpha), &wm);
+        assert!(alpha.data.iter().any(|&a| a > 0.99) && alpha.data.contains(&0.0));
+    }
+
     #[test]
     fn formats_have_magic() {
         let img = test_image();
@@ -2627,6 +2832,137 @@ mod tests {
     }
 
     #[test]
+    fn hdr_jpeg_size_limit_respected() {
+        let img = Rgba8::from_fn(256, 192, |x, y| {
+            let n = (x as u32).wrapping_mul(73856093) ^ (y as u32).wrapping_mul(19349663);
+            [n as u8, (n >> 8) as u8, (n >> 16) as u8, 255]
+        });
+        let hdr = DeepImage {
+            width: img.width,
+            height: img.height,
+            space: OutputSpace::Srgb,
+            samples: DeepSamples::F32(img.data.iter().flat_map(|p| p[..3].iter().map(|v| lcc_color::transfer::decode_srgb8(*v) * 4.0)).collect()),
+        };
+        let opts = ExportOptions { hdr: true, quality: 100, limit_kb: Some(u32::MAX), ..Default::default() };
+        let full = encode_gain_map_jpeg(&img, &hdr, &opts, None).unwrap();
+        let kb = (full.len() / 2048) as u32;
+        let limited = encode_gain_map_jpeg(&img, &hdr, &ExportOptions { limit_kb: Some(kb), ..opts.clone() }, None).unwrap();
+        assert!(limited.len() <= kb as usize * 1024, "{} bytes exceeds {kb} KB", limited.len());
+        let decoded = lcc_codecs::gainmap::read_jpeg(&limited).unwrap();
+        assert!(decoded.meta.alternate_headroom > 1.0, "the gain map must survive size limiting");
+        let impossible = encode_gain_map_jpeg(&img, &hdr, &ExportOptions { limit_kb: Some(1), ..opts }, None);
+        assert!(impossible.is_err_and(|e| e.contains("cannot fit within 1 KB")));
+    }
+
+    #[test]
+    fn graphic_watermark_honours_exif_orientation() {
+        let dir = std::env::temp_dir().join(format!("lc-wm-orientation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let logo = Rgba8::from_fn(40, 20, |x, _| if x < 20 { [255, 0, 0, 255] } else { [0, 0, 255, 255] });
+        for orientation in [2, 6] {
+            let meta = Metadata { orientation: Some(lcc_geom::Orientation::from_exif(orientation)), ..Default::default() };
+            let exif = lcc_meta::write_exif(&meta);
+            let bytes = lcc_codecs::encode_jpeg(
+                &EncodeImage::rgba8(&logo),
+                100,
+                ChromaSubsampling::S444,
+                &EncodeMeta { exif: Some(&exif), ..Default::default() },
+            )
+            .unwrap();
+            let path = dir.join(format!("oriented-{orientation}.jpg"));
+            std::fs::write(&path, bytes).unwrap();
+            let wm = Watermark {
+                image: path.to_string_lossy().into(),
+                image_width: if orientation == 6 { 0.25 } else { 0.5 },
+                opacity: 1.0,
+                inset_x: 0.0,
+                inset_y: 0.0,
+                ..Default::default()
+            };
+            let mut img = Rgba8::from_fn(80, 80, |_, _| [0, 0, 0, 255]);
+            draw_watermark(&mut img, &wm);
+            if orientation == 6 {
+                assert!(img.get(70, 45)[0] > 240 && img.get(70, 75)[2] > 240, "EXIF 6: red above blue");
+            } else {
+                assert!(img.get(45, 70)[2] > 240 && img.get(75, 70)[0] > 240, "EXIF 2: blue left of red");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn graphic_watermark_keeps_aspect_when_fitted_and_rotated() {
+        let dir = std::env::temp_dir().join(format!("lc-wm-aspect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tall.png");
+        let logo = Rgba8::from_fn(40, 160, |_, _| [255, 0, 0, 255]);
+        std::fs::write(&path, lcc_codecs::encode_png(&EncodeImage::rgba8(&logo), &EncodeMeta::default()).unwrap()).unwrap();
+        for (rotation, expected) in [(0, (20, 80)), (90, (120, 30)), (180, (20, 80)), (270, (120, 30))] {
+            let wm = Watermark {
+                image: path.to_string_lossy().into(),
+                image_width: 0.5,
+                opacity: 1.0,
+                inset_x: 0.0,
+                inset_y: 0.0,
+                rotation,
+                ..Default::default()
+            };
+            let mut img = Rgba8::from_fn(120, 80, |_, _| [0, 0, 0, 255]);
+            draw_watermark(&mut img, &wm);
+            let lit: Vec<_> = img.data.iter().enumerate().filter(|(_, p)| p[0] > 200).map(|(i, _)| (i % 120, i / 120)).collect();
+            let bounds = (
+                lit.iter().map(|p| p.0).max().unwrap() - lit.iter().map(|p| p.0).min().unwrap() + 1,
+                lit.iter().map(|p| p.1).max().unwrap() - lit.iter().map(|p| p.1).min().unwrap() + 1,
+            );
+            assert_eq!(bounds, expected, "{rotation} degrees: fitting must preserve the logo's aspect ratio");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn graphic_watermark_fit_preserves_anchor_insets() {
+        let dir = std::env::temp_dir().join(format!("lc-wm-insets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tall.png");
+        let logo = Rgba8::from_fn(40, 160, |_, _| [255, 0, 0, 255]);
+        std::fs::write(&path, lcc_codecs::encode_png(&EncodeImage::rgba8(&logo), &EncodeMeta::default()).unwrap()).unwrap();
+        use Anchor::*;
+        for (anchor, rotation, expected) in [
+            (BottomRight, 90, (0, 44, 111, 71)),
+            (TopLeft, 270, (8, 8, 119, 35)),
+            (Right, 90, (0, 26, 111, 53)),
+            (BottomRight, 0, (94, 0, 111, 71)),
+            (TopLeft, 180, (8, 8, 25, 79)),
+            (Bottom, 0, (51, 0, 68, 71)),
+            // Centered axes ignore their inset rather than shrinking the image unnecessarily.
+            (Center, 90, (0, 25, 119, 54)),
+            (Top, 90, (0, 8, 119, 37)),
+        ] {
+            let wm = Watermark {
+                image: path.to_string_lossy().into(),
+                image_width: 0.5,
+                opacity: 1.0,
+                inset_x: 0.1,
+                inset_y: 0.1,
+                rotation,
+                anchor,
+                ..Default::default()
+            };
+            let mut img = Rgba8::from_fn(120, 80, |_, _| [0, 0, 0, 255]);
+            draw_watermark(&mut img, &wm);
+            let lit: Vec<_> = img.data.iter().enumerate().filter(|(_, p)| p[0] > 200).map(|(i, _)| (i % 120, i / 120)).collect();
+            let bounds = (
+                lit.iter().map(|p| p.0).min().unwrap(),
+                lit.iter().map(|p| p.1).min().unwrap(),
+                lit.iter().map(|p| p.0).max().unwrap(),
+                lit.iter().map(|p| p.1).max().unwrap(),
+            );
+            assert_eq!(bounds, expected, "{anchor:?}, {rotation} degrees");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn sharpen_increases_edge_contrast() {
         let mut img = Rgba8::new(8, 8);
         for (i, p) in img.data.iter_mut().enumerate() {
@@ -2635,6 +2971,55 @@ mod tests {
         }
         output_sharpen(&mut img, SharpenFor::Matte, SharpenAmount::High);
         assert!(img.data[3][0] < 80 && img.data[4][0] > 170);
+    }
+
+    /// Output sharpening (#2970): each step crisper than the one before, Screen / Standard roughly a
+    /// typical web export's, and no wide light or dark rim along a strong edge (overshoot stays
+    /// within a tenth of the edge's contrast). Colour is left alone: a grey edge stays grey.
+    #[test]
+    fn sharpen_steps_are_crisper_without_halos() {
+        let edge = || {
+            let mut img = Rgba8::new(32, 8);
+            for (i, p) in img.data.iter_mut().enumerate() {
+                let v = if i % 32 < 16 { 40 } else { 220 };
+                *p = [v, v, v, 255];
+            }
+            img
+        };
+        let mut last = 0u8;
+        for amount in [SharpenAmount::Low, SharpenAmount::Standard, SharpenAmount::High] {
+            let mut img = edge();
+            output_sharpen(&mut img, SharpenFor::Screen, amount);
+            let (dark, light) = (img.data[15], img.data[16]);
+            let spread = (40 - dark[0]).max(light[0] - 220);
+            assert!(spread >= last && spread > 0, "{amount:?}: {dark:?} {light:?}");
+            assert!(dark[0] >= 40 - 18 && light[0] <= 220 + 18, "{amount:?}: {dark:?} {light:?}");
+            assert!(dark[0] == dark[1] && dark[1] == dark[2] && light[0] == light[2], "grey stays grey");
+            assert_eq!(img.data[0][0], 40, "{amount:?}: flat areas untouched");
+            last = spread;
+        }
+        let mut none = edge();
+        output_sharpen(&mut none, SharpenFor::None, SharpenAmount::High);
+        assert_eq!(none.data, edge().data);
+    }
+
+    /// Output sharpening of a float image with NaN and infinite samples does not panic (#2970 review):
+    /// they are sharpened as black and every result is finite.
+    #[test]
+    fn sharpen_deep_survives_non_finite_samples() {
+        let (nan, inf) = (f32::NAN, f32::INFINITY);
+        let mut samples = vec![0.5f32; 27];
+        samples[..9].copy_from_slice(&[nan, nan, nan, inf, inf, inf, -inf, nan, inf]);
+        samples[12] = nan;
+        samples[20] = inf;
+        for target in [SharpenFor::Screen, SharpenFor::Glossy, SharpenFor::Matte] {
+            let mut img = DeepImage { width: 3, height: 3, space: OutputSpace::Srgb, samples: DeepSamples::F32(samples.clone()) };
+            output_sharpen_deep(&mut img, target, SharpenAmount::High);
+            let DeepSamples::F32(out) = &img.samples else { unreachable!() };
+            assert!(out.iter().all(|v| v.is_finite() && *v >= 0.0), "{target:?}: {out:?}");
+        }
+        let mut all_nan = DeepImage { width: 3, height: 3, space: OutputSpace::Srgb, samples: DeepSamples::F32(vec![nan; 27]) };
+        output_sharpen_deep(&mut all_nan, SharpenFor::Screen, SharpenAmount::Standard);
     }
 
     /// Exported files carry keywords as Lightroom Classic writes them: names flat in `dc:subject`
@@ -2690,6 +3075,28 @@ mod tests {
         assert_eq!((back.copyright_marked, back.usage_terms.as_deref()), (Some(true), Some("Editorial use only")));
         assert_eq!(back.copyright_url.as_deref(), Some("https://example.com/rights"));
         assert!(back.gps.is_some());
+    }
+
+    /// Exports write EXIF Make and Model as read, not the label (#1618); a catalog from before the
+    /// parts were kept separately falls back to the label for the Model.
+    #[test]
+    fn export_writes_camera_make_and_model() {
+        use lcc_catalog::{Catalog, Photo, PhotoId, Source};
+        let mut p = Photo::new(PhotoId(1), Source::Demo { scene: 0 }, "a.jpg", "jpeg", 10, 10, "2026-10-06T00:00:00");
+        p.meta.camera = "Canon IXUS 185".into();
+        p.meta.camera_make = "Canon".into();
+        p.meta.camera_model = "Canon IXUS 185".into();
+        let m = export_metadata(&p, &Catalog::new(), &ExportOptions::default()).unwrap();
+        assert_eq!((m.make.as_deref(), m.model.as_deref()), (Some("Canon"), Some("Canon IXUS 185")));
+        // embedded and readable back from the JPEG
+        let jpg = encode_with_metadata(&test_image(), &ExportOptions::default(), Some(&m)).unwrap();
+        let back = lcc_meta::extract(&jpg);
+        assert_eq!((back.make.as_deref(), back.model.as_deref()), (Some("Canon"), Some("Canon IXUS 185")));
+        // a catalog from before the parts were kept: the label stands in for the Model
+        let mut old = Photo::new(PhotoId(2), Source::Demo { scene: 0 }, "b.jpg", "jpeg", 10, 10, "2026-10-06T00:00:00");
+        old.meta.camera = "Canon Canon IXUS 185".into();
+        let m = export_metadata(&old, &Catalog::new(), &ExportOptions::default()).unwrap();
+        assert_eq!((m.make.as_deref(), m.model.as_deref()), (None, Some("Canon Canon IXUS 185")));
     }
 
     #[test]
@@ -3026,6 +3433,28 @@ mod tests {
         assert_eq!(orig.file_name_for(&named("DSC_1.NEF"), 2), "DSC_1-002.NEF");
         assert_eq!(orig.file_name_for(&named("noext"), 1), "noext-001");
         assert_eq!(ExportOptions { format: ExportFormat::Dng, ..Default::default() }.file_name_for(&named("a.cr2"), 1), "a.dng");
+    }
+
+    /// Titles become file names Windows can create: no forbidden or control characters, no trailing
+    /// dot, no reserved device name (issue #2140).
+    #[test]
+    fn export_names_are_valid_on_windows() {
+        let mut p = named("IMG_1.jpg");
+        let o = ExportOptions { naming: "{title}".into(), ..Default::default() };
+        for (title, want) in [
+            ("What?", "What_.jpg"),
+            ("\"Best\" <of> a|b*c", "_Best_ _of_ a_b_c.jpg"),
+            ("tab\there", "tab_here.jpg"),
+            ("ends with dots...", "ends with dots.jpg"),
+            ("CON", "CON_.jpg"),
+            ("nul.tar", "nul_.tar.jpg"),
+            ("com7", "com7_.jpg"),
+            ("COM0", "COM0.jpg"),
+            ("Console", "Console.jpg"),
+        ] {
+            p.meta.title = title.into();
+            assert_eq!(o.file_name_for(&p, 1), want, "{title:?}");
+        }
     }
 
     fn named(file_name: &str) -> lcc_catalog::Photo {

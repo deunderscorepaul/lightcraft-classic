@@ -9,6 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::safe_file::sync_file;
+
 /// A flat namespace of named files with the few operations the journal needs.
 pub trait Store: Send {
     /// The whole file, or `None` if it doesn't exist.
@@ -96,12 +98,14 @@ pub(crate) fn create_staging(tmp: &std::path::Path) -> io::Result<std::fs::File>
 }
 
 impl Store for FsStore {
+    /// Never through a link at the name, nor from a FIFO or a device (issue #2552): a `prefs.json`
+    /// linked to a private file would be read as damaged and copied into the library.
     fn read(&mut self, name: &str) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.path(name)) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
+        use std::io::Read;
+        let Some(mut f) = crate::safe_file::open_regular(&self.path(name), std::fs::OpenOptions::new().read(true))? else { return Ok(None) };
+        let mut b = Vec::new();
+        f.read_to_end(&mut b)?;
+        Ok(Some(b))
     }
 
     fn write_atomic(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
@@ -155,9 +159,10 @@ impl Store for FsStore {
     fn append(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         use std::io::Write;
         if self.appender.as_ref().is_none_or(|(n, _)| n != name) {
-            let existed = self.path(name).exists();
-            let f = std::fs::OpenOptions::new().create(true).append(true).open(self.path(name))?;
-            if !existed {
+            // never through a link at the name: the records would land in the file it points to, and
+            // a dangling link would create that file (issue #2552)
+            let (f, created) = crate::safe_file::open_or_create_regular(&self.path(name), std::fs::OpenOptions::new().append(true))?;
+            if created {
                 self.sync_dir();
             }
             self.appender = Some((name.to_string(), f));
@@ -177,11 +182,10 @@ impl Store for FsStore {
         if self.appender.as_ref().is_some_and(|(n, _)| n == name) {
             self.appender = None;
         }
-        let f = match std::fs::OpenOptions::new().write(true).open(self.path(name)) {
-            Ok(f) => f,
+        // a link at the name is refused, not cut: a log linked elsewhere would empty that file (issue #2552)
+        let Some(f) = crate::safe_file::open_regular(&self.path(name), std::fs::OpenOptions::new().write(true))? else {
             // nothing to cut (an append that failed before creating the file)
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
+            return Ok(());
         };
         f.set_len(len)?;
         sync_file(&f, false)
@@ -198,76 +202,6 @@ impl Store for FsStore {
 
     fn dir(&self) -> Option<&Path> {
         (!self.json_only).then_some(self.dir.as_path())
-    }
-}
-
-/// Flush a file to disk: `sync_all`, or `sync_data` when `data_only`.
-///
-/// On macOS both are `F_FULLFSYNC`, which an SMB share refuses with ENOTSUP (upstream issue 1407) while a
-/// plain `fsync` works there: that is the fallback. If it fails too, the write fails.
-pub(crate) fn sync_file(f: &std::fs::File, data_only: bool) -> io::Result<()> {
-    #[cfg(test)]
-    let r = if NO_FULL_SYNC.with(std::cell::Cell::get) {
-        Err(enotsup())
-    } else if data_only {
-        f.sync_data()
-    } else {
-        f.sync_all()
-    };
-    #[cfg(not(test))]
-    let r = if data_only { f.sync_data() } else { f.sync_all() };
-    match r {
-        Err(e) if flush_unsupported(&e) => plain_fsync(f),
-        r => r,
-    }
-}
-
-fn plain_fsync(f: &std::fs::File) -> io::Result<()> {
-    #[cfg(test)]
-    PLAIN_FSYNCS.with(|c| c.set(c.get() + 1));
-    lcc_sysmem::fsync(f)
-}
-
-/// The volume can't flush a file to disk (ENOTSUP on macOS, `Unsupported` elsewhere).
-fn flush_unsupported(e: &io::Error) -> bool {
-    const ENOTSUP: i32 = 45;
-    e.kind() == io::ErrorKind::Unsupported || (cfg!(target_vendor = "apple") && e.raw_os_error() == Some(ENOTSUP))
-}
-
-#[cfg(test)]
-thread_local! {
-    static NO_FULL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static PLAIN_FSYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Tests: how many plain `fsync` fallbacks [`FsStore`] made on the calling thread.
-#[cfg(test)]
-pub(crate) fn plain_fsyncs() -> u64 {
-    PLAIN_FSYNCS.with(std::cell::Cell::get)
-}
-
-/// What a volume without a full flush answers (macOS: ENOTSUP, os error 45, from `F_FULLFSYNC`).
-#[cfg(test)]
-fn enotsup() -> io::Error {
-    if cfg!(target_vendor = "apple") { io::Error::from_raw_os_error(45) } else { io::Error::from(io::ErrorKind::Unsupported) }
-}
-
-/// Tests: while the guard lives, every file sync [`FsStore`] makes on the calling thread fails
-/// as on an SMB share mounted by macOS (upstream issue 1407).
-#[cfg(test)]
-pub(crate) fn full_sync_unsupported() -> NoFullSync {
-    NO_FULL_SYNC.with(|c| c.set(true));
-    NoFullSync(())
-}
-
-/// Ends a [`full_sync_unsupported`] when dropped.
-#[cfg(test)]
-pub(crate) struct NoFullSync(());
-
-#[cfg(test)]
-impl Drop for NoFullSync {
-    fn drop(&mut self) {
-        NO_FULL_SYNC.with(|c| c.set(false));
     }
 }
 
@@ -336,6 +270,7 @@ impl Store for MemStore {
 
 #[cfg(all(test, unix))]
 mod tests_staging {
+    #[cfg(unix)]
     use super::*;
 
     /// A link planted at a staging name (`<name>.tmp`) is removed, never followed: the file it points to keeps its
@@ -355,6 +290,68 @@ mod tests_staging {
         store.write_atomic_with("catalog.log", &mut |w| w.write_all(b"[1]")).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert_eq!(std::fs::read(dir.join("catalog.log")).unwrap(), b"[1]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link planted at a catalog name is refused, never read, cut back or appended through: the file it points to
+    /// keeps its bytes, a dangling link makes nothing at its target, and the library is refused with a message
+    /// instead of having its log's target emptied (issue #2552).
+    #[cfg(unix)]
+    #[test]
+    fn links_at_catalog_names_are_never_read_cut_or_appended_through() {
+        use crate::journal::{Journal, LOG};
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("lc-store-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = FsStore::open(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        // not a record: the journal would cut the log back to its last good record, here 0 bytes
+        symlink(&victim, dir.join(LOG)).unwrap();
+        let opened = Journal::open(Box::new(FsStore::open(&dir).unwrap()));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep", "the log's target was cut back");
+        let Err(e) = opened else { panic!("a library with a linked {LOG} was opened") };
+        assert!(e.to_string().contains("is a link or not a regular file"), "{e}");
+
+        symlink(&victim, dir.join("x.log")).unwrap();
+        assert!(store.read("x.log").is_err());
+        assert!(store.append("x.log", b"z").is_err());
+        assert!(store.truncate("x.log", 0).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let target = dir.join("made-through-link");
+        symlink(&target, dir.join("y.log")).unwrap();
+        assert!(store.append("y.log", b"z").is_err());
+        assert!(!target.exists(), "a dangling link's target was created");
+        // real files as before (the append handle kept between appends included)
+        store.append("z.log", b"ab").unwrap();
+        store.append("z.log", b"cd").unwrap();
+        store.truncate("z.log", 2).unwrap();
+        assert_eq!(store.read("z.log").unwrap().unwrap(), b"ab");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The journal's append and truncate (which recovery uses) refuse a non-regular file at the
+    /// name instead of following it, so a link planted at `catalog.log` never receives library
+    /// bytes (CWE-59, Audit row 107); the snapshot write already removes such a link (#1502).
+    #[test]
+    #[cfg(unix)]
+    fn append_and_truncate_refuse_a_link_at_the_name() {
+        let dir = std::env::temp_dir().join(format!("lc-log-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let victim = dir.join("victim.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("catalog.log")).unwrap();
+        let mut store = FsStore::open(&dir).unwrap();
+        assert!(store.append("catalog.log", b"appended").is_err());
+        assert!(store.truncate("catalog.log", 0).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(dir.join("catalog.log")).unwrap().file_type().is_symlink());
+        // A regular file keeps working.
+        std::fs::remove_file(dir.join("catalog.log")).unwrap();
+        std::fs::write(dir.join("catalog.log"), b"abc").unwrap();
+        store.truncate("catalog.log", 1).unwrap();
+        assert_eq!(std::fs::read(dir.join("catalog.log")).unwrap(), b"a");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -167,6 +167,18 @@ pub enum StartupView {
     Detail,
 }
 
+/// What the desktop app opens at launch (Settings ▸ General ▸ At launch; issue #1290). `--library`
+/// and `<PREFIX>_LIBRARY` come first either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LaunchLibrary {
+    /// The library open when the app last quit (holding Alt/Option as the window appears asks once).
+    #[default]
+    Last,
+    /// A window lists the recent libraries to choose from.
+    Ask,
+}
+
 /// When grid cells show their rating / flag / edited badges.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,12 +260,31 @@ impl LoupeInfoField {
 }
 
 /// The three lines each mode of the info overlay shows: Info 1 ([`InfoOverlay::Basic`]) and
-/// Info 2 ([`InfoOverlay::Exposure`]).
+/// Info 2 ([`InfoOverlay::Exposure`]), and which of them Show Briefly When Photo Changes shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LoupeInfo {
     pub info1: [LoupeInfoField; 3],
     pub info2: [LoupeInfoField; 3],
+    /// Show Briefly When Photo Changes: while the info overlay is off, this Info shows for
+    /// [`BRIEF_INFO_SECS`] each time the loupe changes to another photo ([`InfoOverlay::Off`]:
+    /// neither).
+    pub briefly: InfoOverlay,
+}
+
+/// How long Show Briefly When Photo Changes shows the info overlay (seconds).
+pub const BRIEF_INFO_SECS: f64 = 3.0;
+
+/// When the loupe last changed photo, for Show Briefly When Photo Changes
+/// ([`LoupeInfo::briefly`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BriefInfo {
+    /// The photo the loupe showed last.
+    pub photo: Option<lcc_catalog::PhotoId>,
+    /// When the loupe changed to it (seconds on egui's clock).
+    pub since: f64,
+    /// The brief info overlay shows this frame.
+    pub shown: bool,
 }
 
 impl LoupeInfo {
@@ -265,7 +296,7 @@ impl LoupeInfo {
 
 impl Default for LoupeInfo {
     fn default() -> Self {
-        LoupeInfo { info1: LoupeInfo::INFO1, info2: LoupeInfo::INFO2 }
+        LoupeInfo { info1: LoupeInfo::INFO1, info2: LoupeInfo::INFO2, briefly: InfoOverlay::Off }
     }
 }
 
@@ -376,6 +407,15 @@ pub struct AppSettings {
     /// Libraries opened recently, newest first (File ▸ Open Recent Library; at most
     /// [`RECENT_LIBRARIES`]).
     pub recent_libraries: Vec<String>,
+    /// When each recent library was last opened (path → the session clock's ISO 8601 time), for
+    /// the launch window. A separate key so files from earlier versions, and earlier versions
+    /// reading this one, keep their list (issue #1290).
+    #[serde(rename = "recentLibrariesOpened", deserialize_with = "lenient")]
+    pub recent_opened: std::collections::BTreeMap<String, String>,
+    /// Open the last library at launch, or ask (a value this version doesn't know reads as the
+    /// default).
+    #[serde(deserialize_with = "lenient")]
+    pub at_launch: LaunchLibrary,
     pub startup_view: StartupView,
     /// Ask before moving photos to Recently Deleted. Saved under a new key: earlier versions saved
     /// `confirmDelete: false` by default (#1239).
@@ -384,8 +424,14 @@ pub struct AppSettings {
     /// Ask before photos dropped on a Folders row move there on disk (the dialog's "Don't ask
     /// again" turns it off).
     pub ask_before_move: bool,
+    /// A click on the dimmed backdrop around a dialog closes it, like Esc (off: a stray click
+    /// never throws away a dialog's choices).
+    pub close_dialogs_outside: bool,
     /// GPU rendering allowed (`app.gpu`).
     pub gpu: bool,
+    /// The graphics interface GPU rendering uses (Settings ▸ Performance; applies at next launch).
+    /// The window keeps the platform's own; `<PREFIX>_GPU_BACKEND` / `WGPU_BACKEND` win over it.
+    pub gpu_backend: GpuBackend,
     /// Windows DirectComposition to prevent VRR flicker; opt-in, applies at next launch.
     pub compose_window: bool,
     /// An HDR (extended-range) window where the display offers one; off: always an SDR window.
@@ -398,6 +444,10 @@ pub struct AppSettings {
     pub preview_limit: u32,
     /// Keep settled rendering quality during adjustments instead of adaptive drafts.
     pub high_quality_adjustment_previews: bool,
+    /// Zoomed HDR views keep their last few windows in GPU memory, so panning back or zooming in
+    /// again shows them at once. Used only where the GPU has room for them
+    /// ([`crate::render::hdr_cache_fit`]); the Settings dialog says when it hasn't.
+    pub hdr_zoom_cache: bool,
     /// Edit in Other Editor: the application ("" = the system's default for the file type).
     pub external_editor: String,
     /// The file Edit in Other Editor hands over.
@@ -420,6 +470,9 @@ pub struct AppSettings {
     pub wheel_scroll_speed: f32,
     /// When a brush tool is active, the mouse wheel changes its size instead of zooming.
     pub wheel_resizes_brush: bool,
+    /// View ▸ View Options ▸ Show message when loading or rendering photos: the loupe says
+    /// "Rendering…" while the photo it shows is not the finished render.
+    pub loupe_messages: bool,
     /// Shortcuts the user changed (Help ▸ Keyboard Shortcuts): command id → shortcut, `""` = none.
     pub keymap: crate::shortcuts::Keymap,
     /// The keymap set the user's changes apply over (Classic by default).
@@ -449,7 +502,7 @@ pub struct AppSettings {
     /// The Keywording box: whole keyword paths, or grouped by the keyword they are inside.
     #[serde(deserialize_with = "lenient")]
     pub keyword_chips: KeywordChips,
-    /// View ▸ Show Focus Point: draw the box the camera focused on (`view.focusPoint`).
+    /// View ▸ Focus Point: draw the box the camera focused on (`view.focusPoint`).
     pub focus_point: bool,
     /// View ▸ Zoom to Focus Point: Toggle Zoom (Z) centres the zoomed view on the camera's focus point
     /// when the photo has one (`view.zoomToFocus`).
@@ -462,6 +515,46 @@ pub struct AppSettings {
     /// View ▸ View Options: the lines the loupe's info overlay shows in Info 1 and Info 2.
     #[serde(deserialize_with = "lenient")]
     pub loupe_info: LoupeInfo,
+    /// File ▸ Import Lightroom Catalog…: ask whether the catalog merges into the open library or
+    /// gets a new one, or always merge (issue #2672; the window's "Don't ask again" picks that).
+    #[serde(deserialize_with = "lenient")]
+    pub lightroom_import: LightroomImport,
+}
+
+/// Where File ▸ Import Lightroom Catalog… puts a catalog (Settings ▸ General ▸ Library). Saved as
+/// `"ask"` / `"alwaysMerge"`; anything else in a hand-edited `ui.json` reads as [`Self::Ask`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LightroomImport {
+    /// A window asks each time: merge into the open library, or create a new library for it.
+    #[default]
+    Ask,
+    /// Merge into the open library without asking (how imports worked before the window).
+    AlwaysMerge,
+}
+
+/// The graphics interface for GPU rendering (`AppSettings::gpu_backend`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuBackend {
+    /// The platform default (DirectX 12 on Windows, Metal on macOS, Vulkan elsewhere).
+    #[default]
+    Auto,
+    /// DirectX 12 (Windows).
+    Dx12,
+    /// Vulkan: on Windows it builds the GPU's shaders much faster than DirectX 12 on some machines.
+    Vulkan,
+}
+
+impl GpuBackend {
+    /// The name `lcc_gpu::backend::set_compute_preference` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            GpuBackend::Auto => "auto",
+            GpuBackend::Dx12 => "dx12",
+            GpuBackend::Vulkan => "vulkan",
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -469,14 +562,19 @@ impl Default for AppSettings {
         AppSettings {
             library_path: String::new(),
             recent_libraries: Vec::new(),
+            recent_opened: Default::default(),
+            at_launch: LaunchLibrary::Last,
             startup_view: StartupView::Last,
             confirm_delete: true,
             ask_before_move: true,
+            close_dialogs_outside: false,
             gpu: true,
+            gpu_backend: GpuBackend::Auto,
             compose_window: false,
             hdr_display: true,
             preview_limit: 0,
             high_quality_adjustment_previews: false,
+            hdr_zoom_cache: true,
             external_editor: String::new(),
             external_file: EditFile::default(),
             photocraft_path: String::new(),
@@ -487,6 +585,7 @@ impl Default for AppSettings {
             grid_badges: GridBadges::Auto,
             wheel_scroll_speed: 1.0,
             wheel_resizes_brush: true,
+            loupe_messages: true,
             keymap: Default::default(),
             keymap_set: Default::default(),
             appearance_mode: AppearanceMode::Dark,
@@ -505,6 +604,7 @@ impl Default for AppSettings {
             double_click_develop: false,
             hide_filter_in_develop: false,
             loupe_info: LoupeInfo::default(),
+            lightroom_import: LightroomImport::Ask,
         }
     }
 }
@@ -773,6 +873,13 @@ pub enum KeywordChips {
     Grouped,
 }
 
+/// A short message at the bottom of the photo view: its text, when it goes (app time, s), and the colour label it is
+/// shown in, if any.
+pub type Toast = (String, f64, Option<lcc_catalog::ColorLabel>);
+
+/// The most toasts on screen at once: a newer one pushes the oldest out.
+pub const MAX_TOASTS: usize = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiState {
@@ -795,9 +902,14 @@ pub struct UiState {
     /// a later save succeeds).
     #[serde(skip)]
     pub unsaved_seen: bool,
+    /// Help ▸ Debug ▸ Frame Rate (`view.frameRate`): the frame-rate display
+    /// (`crate::frame_rate`). A debugging aid, never saved; `<PREFIX>_FPS=1` starts with it on.
+    #[serde(skip)]
+    pub frame_rate: bool,
     pub view: ViewMode,
-    /// The touch layout (fork-owned; see [`crate::touch`]).
-    pub touch: crate::touch::TouchUi,
+    /// The Modern layout (fork-owned; see [`crate::modern`]). Saved as `touch` before it replaced the touch layout.
+    #[serde(alias = "touch")]
+    pub modern: crate::modern::ModernUi,
     pub left_panel: bool,
     pub right: RightPanel,
     /// The right panel (and Library's right column) is folded away by the tool strip's top button;
@@ -876,6 +988,18 @@ pub struct UiState {
     /// The overlay (on, mode) to go back to when Show Luminance Map is turned off.
     #[serde(skip)]
     pub luminance_map_restore: Option<(bool, String)>,
+    /// The mask overlay was switched on with O or the eye by the Masks title: it stays on through
+    /// edits (it only hides while a slider is at work). Off, the overlay shows by itself only for a
+    /// mask without settings ([`crate::panels::detail::mask_has_settings`]).
+    #[serde(skip)]
+    pub mask_overlay_pinned: bool,
+    /// A mask slider is at work until then: no mask overlay covers the photo.
+    #[serde(skip)]
+    pub mask_adjusting_until: Option<std::time::Instant>,
+    /// The mask whose row in the Masks list is under the pointer: its overlay shows while nothing is
+    /// being adjusted.
+    #[serde(skip)]
+    pub mask_hover: Option<u32>,
     /// Mirroring of the triangle / spiral crop guides (0..4).
     pub crop_overlay_orient: u8,
     pub crop_overlay: CropOverlay,
@@ -924,6 +1048,10 @@ pub struct UiState {
     /// The last person page left: the People view offers a way back to it next to its title.
     #[serde(skip)]
     pub last_person: Option<String>,
+    /// Assisted Culling's burst settings last confirmed (gap in seconds, similarity), for this
+    /// session; `None` until the dialog is first confirmed (then 10 s, 0.93).
+    #[serde(skip)]
+    pub cull_burst: Option<(f32, f32)>,
     /// "More" faces the user hid with ×, for this session: (photo, region index).
     #[serde(skip)]
     pub dismissed_faces: std::collections::HashSet<(u64, usize)>,
@@ -1008,6 +1136,11 @@ pub struct UiState {
     pub mask_curve_channel: String,
     /// Selected mixer mode: "hue" | "saturation" | "luminance" | "all".
     pub mixer_mode: String,
+    /// What the Color Mixer adjusts by: "hsl" (eight sliders per Hue / Saturation / Luminance) |
+    /// "color" (one colour at a time). HSL by default.
+    pub mixer_adjust: String,
+    /// The HSL group shown: "hue" | "sat" | "lum" | "all".
+    pub mixer_group: String,
     /// Selected colour grading tab: "3way" | "shadows" | "midtones" | "highlights".
     pub grading_mode: String,
     /// Colour grading wheels (shadows, midtones, highlights) hidden for viewing by their eye, and
@@ -1136,6 +1269,12 @@ pub struct UiState {
     /// A keyword being dragged in the Keyword List (onto another to nest it).
     #[serde(skip)]
     pub dragging_keyword: Option<String>,
+    /// A preset being dragged (its id; onto a folder to move it there).
+    #[serde(skip)]
+    pub dragging_preset: Option<String>,
+    /// A preset folder being dragged (its path; onto another to nest it).
+    #[serde(skip)]
+    pub dragging_preset_group: Option<String>,
     /// A running slideshow (full screen; see [`crate::panels::slideshow`]).
     #[serde(skip)]
     pub slideshow: Option<Box<crate::panels::slideshow::Run>>,
@@ -1143,6 +1282,9 @@ pub struct UiState {
     pub slides: crate::slideshow_ui::SlideshowState,
     /// Info overlay on the loupe.
     pub info_overlay: InfoOverlay,
+    /// When the loupe last changed photo (View Options' Show Briefly When Photo Changes).
+    #[serde(skip)]
+    pub brief_info: BriefInfo,
     /// The loupe's layout image overlay (View ▸ Loupe Overlay).
     pub layout_image: LayoutImage,
     /// Navigator mini map in the loupe while zoomed in.
@@ -1160,7 +1302,7 @@ pub struct UiState {
     pub reference: Option<u64>,
     /// Transient toast text, expiry (seconds of app time), and optional colour-label styling.
     #[serde(skip)]
-    pub toast: Option<(String, f64, Option<lcc_catalog::ColorLabel>)>,
+    pub toasts: Vec<Toast>,
     /// The result of the last Find Missing Photos (it searches in the background).
     #[serde(skip)]
     pub last_find_missing: Option<serde_json::Value>,
@@ -1182,6 +1324,9 @@ pub struct UiState {
     /// A Settings section to bring into view once (`app.settings {section}`), e.g. `lensProfiles`.
     #[serde(skip)]
     pub settings_section: Option<String>,
+    /// Develop ▸ Lens Corrections: the lens maker picked in the lens picker before a model (issue #307).
+    #[serde(skip)]
+    pub lens_pick_make: Option<String>,
     /// The start-up update check has run (once per session; Help ▸ Check for Updates… is manual).
     #[serde(skip)]
     pub update_checked_at_startup: bool,
@@ -1209,6 +1354,16 @@ impl Dialog {
     /// A fresh Create Preset dialog.
     pub fn create_preset() -> Dialog {
         Dialog::CreatePreset { name: String::new(), group: "User Presets".into(), groups: default_preset_groups() }
+    }
+
+    /// A fresh Create Preset dialog pre-filling `group`.
+    pub fn create_preset_in(group: Option<&str>) -> Dialog {
+        Dialog::CreatePreset { name: String::new(), group: group.unwrap_or("User Presets").into(), groups: default_preset_groups() }
+    }
+
+    /// A fresh Create Preset Folder dialog.
+    pub fn create_preset_folder(parent: Option<String>) -> Dialog {
+        Dialog::CreatePresetFolder { name: String::new(), parent }
     }
 }
 
@@ -1380,10 +1535,13 @@ pub enum Dialog {
     /// Help ▸ What's New.
     WhatsNew,
     /// Photo ▸ Assisted Culling: reject photos below this focus score (0 = none), pick the best
-    /// of each burst.
+    /// of each burst; shots at most `burst_gap` seconds apart and at least `similarity` alike are
+    /// a burst.
     Cull {
         reject_below: f32,
         pick_best: bool,
+        burst_gap: f32,
+        similarity: f32,
     },
     /// Help ▸ System Info: (label, value) rows.
     DenoiseModel {
@@ -1424,6 +1582,11 @@ pub enum Dialog {
         group: String,
         #[serde(default = "default_preset_groups")]
         groups: Vec<String>,
+    },
+    /// Create a new preset folder (or subfolder under `parent`).
+    CreatePresetFolder {
+        name: String,
+        parent: Option<String>,
     },
     CopySettings {
         groups: Vec<String>,
@@ -1476,6 +1639,29 @@ pub enum Dialog {
     LightroomCatalog {
         folder: String,
         catalog: Option<String>,
+    },
+    /// File ▸ Import Lightroom Catalog…: where the catalog at `catalog` goes (issue #2672, see
+    /// [`crate::lightroom_destination`]). Merge into the open library `library` (`photos` in it), or
+    /// (`new_library`) create the library `name` in the folder `location`, switch to it and import
+    /// there. `dont_ask`: merge from now on without asking. `generation`: the library the window
+    /// was opened for (`Session::library_generation`): another one opened meanwhile isn't merged into.
+    LightroomDestination {
+        /// The `.lrcat` file.
+        catalog: String,
+        /// The open library's name (its folder's name).
+        library: String,
+        /// The photos in the open library.
+        photos: usize,
+        /// "Create a new library" is chosen (else "Merge into the open library").
+        new_library: bool,
+        /// The new library's name (prefilled from the catalog's file name).
+        name: String,
+        /// The folder the new library goes in (prefilled with the open library's parent folder).
+        location: String,
+        /// "Don't ask again (always merge into the open library)".
+        dont_ask: bool,
+        /// `Session::library_generation` when the window opened.
+        generation: u64,
     },
     /// Save the selected mask's sliders as a mask effect preset: which sliders (`FIELDS` names,
     /// the colour as `color_sat`), whether it carries Amount and the brush settings.
@@ -1544,6 +1730,10 @@ pub enum Dialog {
         /// What the scan found (`None` while it runs).
         counts: Option<SyncCounts>,
         import_new: bool,
+        /// With `import_new`, the files whose content a photo already has come in too ("Don't
+        /// import files already in the library" unticked; the library's setting, saved on Synchronize).
+        #[serde(default)]
+        import_duplicates: bool,
         #[serde(default = "yes")]
         relink_moved: bool,
         remove_missing: bool,
@@ -1580,7 +1770,12 @@ pub struct SyncCounts {
     #[serde(default)]
     pub offline: bool,
     pub new: usize,
+    /// Files whose content a photo already has.
     pub duplicates: usize,
+    /// Of those, the ones "Don't import files already in the library" unticked brings in (not copies
+    /// of a photo in Recently Deleted: see `lcc_engine::sync::FolderChanges::importable_duplicates`).
+    #[serde(default)]
+    pub copies: usize,
     pub unreadable: usize,
     pub missing: usize,
     pub metadata: usize,
@@ -1590,9 +1785,19 @@ pub struct SyncCounts {
 
 impl SyncCounts {
     /// The folder is there and the scan found nothing to bring in, relink, remove or read: the
-    /// dialog only says so (files it skipped are not changes).
+    /// dialog only says so (files it skipped are not changes). Files the library has elsewhere
+    /// ([`SyncCounts::copies`]) can be brought in by unticking "Don't import files already in the
+    /// library", so the dialog keeps that choice for them.
     pub fn up_to_date(&self) -> bool {
-        !self.offline && self.new + self.moved + self.missing + self.metadata == 0
+        !self.offline && self.new == 0 && self.copies == 0 && self.moved == 0 && self.missing == 0 && self.metadata == 0
+    }
+    /// Whether Synchronize, with Import new photos as `import_new` says and the box under it as
+    /// `import_duplicates` says, would bring in, relink, remove or read nothing: [`SyncCounts::up_to_date`],
+    /// but new files count only when Import new photos is ticked, and files the library has elsewhere
+    /// only when it is and that box brings them in.
+    pub fn nothing_to_do(&self, import_new: bool, import_duplicates: bool) -> bool {
+        let has_incoming = import_new && (self.new != 0 || (import_duplicates && self.copies != 0));
+        !self.offline && !has_incoming && self.moved == 0 && self.missing == 0 && self.metadata == 0
     }
 }
 
@@ -1605,9 +1810,13 @@ impl Default for UiState {
             camera_roll_asked: false,
             preview_build_seen: None,
             unsaved_seen: false,
+            frame_rate: lcc_brand::env("FPS").is_some_and(|v| matches!(v.trim(), "1" | "on" | "true" | "yes")),
             luminance_map_restore: None,
+            mask_overlay_pinned: false,
+            mask_adjusting_until: None,
+            mask_hover: None,
             view: ViewMode::Detail,
-            touch: crate::touch::TouchUi::default(),
+            modern: crate::modern::ModernUi::default(),
             left_panel: false,
             left_width: LEFT_WIDTH.default,
             right_width: RIGHT_WIDTH.default,
@@ -1659,6 +1868,7 @@ impl Default for UiState {
             person_page: None,
             person_from: None,
             last_person: None,
+            cull_burst: None,
             dismissed_faces: Default::default(),
             unnamed_selected: Default::default(),
             unnamed_name: String::new(),
@@ -1688,7 +1898,9 @@ impl Default for UiState {
             dragging_section: None,
             curve_channel: "parametric".into(),
             mask_curve_channel: "master".into(),
-            mixer_mode: "hue".into(),
+            mixer_mode: "red".into(),
+            mixer_adjust: "hsl".into(),
+            mixer_group: "hue".into(),
             grading_mode: "3way".into(),
             grading_hidden: None,
             tool: String::new(),
@@ -1751,7 +1963,10 @@ impl Default for UiState {
             keyword_list_open: Vec::new(),
             keyword_list_selected: None,
             dragging_keyword: None,
+            dragging_preset: None,
+            dragging_preset_group: None,
             info_overlay: InfoOverlay::Off,
+            brief_info: BriefInfo::default(),
             layout_image: LayoutImage::default(),
             navigator: true,
             settings: AppSettings::default(),
@@ -1763,7 +1978,7 @@ impl Default for UiState {
             local_browse_root: None,
             compare: None,
             reference: None,
-            toast: None,
+            toasts: Vec::new(),
             last_find_missing: None,
             last_find_missing_result: None,
             #[cfg(test)]
@@ -1772,6 +1987,7 @@ impl Default for UiState {
             status: String::new(),
             dialog: None,
             settings_section: None,
+            lens_pick_make: None,
             update_checked_at_startup: false,
             update_checked_at: 0.0,
             update_pending: None,
@@ -1782,6 +1998,36 @@ impl Default for UiState {
 }
 
 impl UiState {
+    /// The newest toast on screen.
+    pub fn toast(&self) -> Option<&Toast> {
+        self.toasts.last()
+    }
+
+    /// Take the newest toast off the screen.
+    pub fn take_toast(&mut self) -> Option<Toast> {
+        self.toasts.pop()
+    }
+
+    /// Show a toast below those already showing: one no longer hides another (upstream #1936). The same message again
+    /// (same text and label) is not shown twice: it moves to the newest place and stays until the later of its times.
+    /// Past [`MAX_TOASTS`] the oldest goes.
+    pub fn show_toast(&mut self, toast: Toast) {
+        let (text, until, label) = toast;
+        let until = match self.toasts.iter().position(|t| t.0 == text && t.2 == label) {
+            Some(at) => self.toasts.remove(at).1.max(until),
+            None => until,
+        };
+        self.toasts.push((text, until, label));
+        if self.toasts.len() > MAX_TOASTS {
+            self.toasts.drain(..self.toasts.len() - MAX_TOASTS);
+        }
+    }
+
+    /// Let go of the toasts whose time is over at `now`.
+    pub fn expire_toasts(&mut self, now: f64) {
+        self.toasts.retain(|t| t.1 >= now);
+    }
+
     /// Which colour grading wheels (shadows, midtones, highlights) are hidden for viewing `photo`.
     pub fn grading_hidden_for(&self, photo: lcc_catalog::PhotoId) -> [bool; 3] {
         match self.grading_hidden {
@@ -1968,16 +2214,63 @@ mod loupe_info_tests {
     fn view_options_lines_are_saved_with_the_settings() {
         let mut settings = AppSettings::default();
         settings.loupe_info.info2 = [LoupeInfoField::Lens, LoupeInfoField::None, LoupeInfoField::FileName];
+        settings.loupe_info.briefly = InfoOverlay::Exposure;
         let saved = serde_json::to_value(&settings).unwrap();
         assert_eq!(saved["loupeInfo"]["info2"], serde_json::json!(["lens", "none", "fileName"]));
+        assert_eq!(saved["loupeInfo"]["briefly"], "exposure");
         let read: AppSettings = serde_json::from_value(saved).unwrap();
         assert_eq!(read.loupe_info, settings.loupe_info);
 
         let old: AppSettings = serde_json::from_value(serde_json::json!({"filmNames": false})).unwrap();
         assert_eq!(old.loupe_info, LoupeInfo::default());
+        // lines saved before Show Briefly When Photo Changes existed are kept, with it off
+        let lines: AppSettings = serde_json::from_value(serde_json::json!({"loupeInfo": {"info2": ["lens", "none", "fileName"]}})).unwrap();
+        assert_eq!(lines.loupe_info.info2, settings.loupe_info.info2);
+        assert_eq!(lines.loupe_info.briefly, InfoOverlay::Off);
         let newer: AppSettings =
             serde_json::from_value(serde_json::json!({"filmNames": false, "loupeInfo": {"info1": ["rating", "fileName", "none"]}})).unwrap();
         assert_eq!(newer.loupe_info, LoupeInfo::default());
         assert!(!newer.film_names, "the rest of the settings are still read");
+    }
+
+    /// Show message when loading or rendering photos is on until it is turned off, and is saved
+    /// with the app's settings.
+    #[test]
+    fn the_loading_message_choice_is_saved_with_the_settings() {
+        assert!(AppSettings::default().loupe_messages);
+        let old: AppSettings = serde_json::from_value(serde_json::json!({"filmNames": false})).unwrap();
+        assert!(old.loupe_messages, "a settings file from before the choice existed keeps the message");
+        let settings = AppSettings { loupe_messages: false, ..AppSettings::default() };
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["loupeMessages"], false);
+        let read: AppSettings = serde_json::from_value(saved).unwrap();
+        assert!(!read.loupe_messages);
+    }
+}
+
+#[cfg(test)]
+mod toast_tests {
+    use super::{MAX_TOASTS, UiState};
+
+    /// Two messages close together both stay on screen; the same one again is not shown twice; past the limit the
+    /// oldest goes; each expires at its own time.
+    #[test]
+    fn toasts_stack_instead_of_replacing_one_another() {
+        let mut ui = UiState::default();
+        ui.show_toast(("Red Label".into(), 2.0, None));
+        ui.show_toast(("Cache cleared".into(), 3.0, None));
+        assert_eq!(ui.toasts.len(), 2);
+        assert_eq!(ui.toast().map(|t| t.0.as_str()), Some("Cache cleared"));
+        ui.show_toast(("Red Label".into(), 4.0, None));
+        assert_eq!(ui.toasts.len(), 2, "the same message is shown once");
+        assert_eq!(ui.toast().map(|t| (t.0.as_str(), t.1)), Some(("Red Label", 4.0)));
+        for i in 0..5 {
+            ui.show_toast((format!("m{i}"), 10.0, None));
+        }
+        assert_eq!(ui.toasts.len(), MAX_TOASTS);
+        assert_eq!(ui.toasts.first().map(|t| t.0.as_str()), Some("m2"));
+        ui.show_toast(("short".into(), 1.0, None));
+        ui.expire_toasts(5.0);
+        assert!(ui.toasts.iter().all(|t| t.0 != "short"));
     }
 }

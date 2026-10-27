@@ -14,11 +14,14 @@ path = "src/main.rs"
 workspace = true
 
 [features]
-default = ["denoise"]
+# The upstream project's own AI Denoise model (MIT OR Apache-2.0) is offered as a download
+default = ["denoise", "own-model", "heif"]
 denoise = ["lcc-engine/denoise"]
 rawnind-model = ["denoise", "lcc-engine/rawnind-model"]
-# Open HEIC/HEIF photos (the optional lcc-heif crate). Not default so distributors choose
-# it (HEVC patents); build with `--features heif` to include it.
+own-model = ["denoise", "lcc-engine/own-model"]
+# Open HEIC/HEIF photos (the lcc-heif crate, pure Rust). On by default so every build, local
+# ones included, opens iPhone photos; distributors who must avoid HEVC (patents) build with
+# `--no-default-features --features denoise,own-model`.
 heif = ["lcc-codecs/heif"]
 # Sound for video playback and slideshow music (cpal; links libasound on Linux). See docs/video.md.
 audio-out = ["lcc-engine/audio-out"]
@@ -42,10 +45,10 @@ chrono = { workspace = true }
 # the control port token
 getrandom = { workspace = true }
 log = { workspace = true }
-# the loupe's HDR texture (`hdr_display`): f32 → f16 texels, uploaded as bytes
-half = { workspace = true }
 # HDR metadata on the window's swapchain (Vulkan; no-op elsewhere)
 lcc-hdrmeta = { workspace = true }
+# how much GPU memory the window's adapter offers (the HDR zoom cache needs room)
+lcc-gpumem = { workspace = true }
 bytemuck = { workspace = true }
 
 [build-dependencies]
@@ -58,10 +61,15 @@ winresource = "0.1"
 # (`wayland_hdr`)
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
-winit = { version = "0.30", default-features = false, features = ["x11"] }
+# GNOME on Wayland draws no window frame: winit draws one (vector minimize, maximize and close buttons,
+# no title font embedded; upstream #1928)
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland-csd-adwaita-notitle"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rfd = { workspace = true }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+midir = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
@@ -77,6 +85,7 @@ muda = { workspace = true }
 objc2 = { workspace = true }
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
+dispatch2 = "0.3.1"
 
 [dev-dependencies]
 # tests record why they skip (`cargo xtask ci` lists the skips)

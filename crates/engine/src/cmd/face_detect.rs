@@ -24,7 +24,7 @@ const C: &str = "faces.detect";
 /// Regions made by this command say so in their description; only those are replaced on a new run.
 pub(crate) const MARK: &str = "Detected by ";
 pub(crate) const LABEL: &str = "YuNet 2023mar";
-/// Long edge of the picture the detector looks at (it shrinks it to its own 640 anyway).
+/// Long edge of the picture the detector is given (it shrinks it to its own scan size, 1024 px, anyway).
 const LOOK_EDGE: usize = 1280;
 /// YuNet is 232 KB; a file this much larger in its folder is not it.
 const MAX_MODEL_BYTES: u64 = 8 << 20;
@@ -232,8 +232,10 @@ fn overlaps_existing(f: &Face, regions: &[Region]) -> bool {
     })
 }
 
+/// A region Detect Faces may replace: one it found earlier and the user has not ignored (an ignored face is kept,
+/// and its box stops the same face being found again).
 pub(crate) fn is_detected(r: &Region) -> bool {
-    r.description.as_deref().is_some_and(|d| d.starts_with(MARK))
+    r.kind != RegionKind::IgnoredFace && r.description.as_deref().is_some_and(|d| d.starts_with(MARK))
 }
 
 /// The photo as the faces see it: upright, uncropped, default settings, as 8-bit RGB with its size, its long edge at
@@ -253,6 +255,7 @@ fn detect(s: &mut Session, p: &Value) -> Result<Value> {
         score: p.get("score").and_then(Value::as_f64).map_or(defaults.score, |v| v as f32),
         nms_iou: p.get("nmsIou").and_then(Value::as_f64).map_or(defaults.nms_iou, |v| v as f32),
         max_faces: p.get("maxFaces").and_then(Value::as_u64).map_or(defaults.max_faces, |v| usize::try_from(v).unwrap_or(defaults.max_faces)),
+        long_edge: defaults.long_edge,
     };
     let detector = detector(s).map_err(|e| e.into_error(C))?;
     let started = Instant::now();

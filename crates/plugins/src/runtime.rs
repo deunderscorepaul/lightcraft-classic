@@ -382,6 +382,7 @@ fn placeholder_manifest() -> Manifest {
         id: String::new(),
         name: String::new(),
         version: String::new(),
+        requires: Vec::new(),
         description: String::new(),
         author: String::new(),
         permissions: Default::default(),
@@ -390,5 +391,6 @@ fn placeholder_manifest() -> Manifest {
         publish: None,
         export_destinations: Vec::new(),
         metadata_fields: Vec::new(),
+        settings: Vec::new(),
     }
 }

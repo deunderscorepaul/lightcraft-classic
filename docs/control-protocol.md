@@ -48,15 +48,25 @@ headless snapshots or `lcc-cli mcp` without `--connect`. A request that has alre
 
 Connections close after five minutes without incoming bytes while the server is waiting for
 input, including in the middle of an unfinished request line. This allows pauses between
-automation commands while releasing abandoned connection slots. An idle read timeout gets an
-`ok: false` error saying the connection is closing; incomplete input is never dispatched.
+automation commands while releasing abandoned connection slots. An idle read timeout gets one
+reply without an `id`, then the connection closes; incomplete input is never dispatched:
+
+```text
+← {"ok": false, "error": "control connection idle too long; closing the connection", "closed": "idle"}
+```
+
 This is a socket read inactivity limit, not a total connection lifetime: a peer that keeps
 sending bytes can keep it open. Waiting for an already-dispatched command's reply does not
 count as idle reading and retains the request timeout above.
 
-Reconnect before sending another request after an idle close. MCP connect mode detects closed
-connections before sending and reconnects; if a connection is lost after sending a request,
-its outcome remains unknown and the client must not blindly replay it.
+Reconnect before sending another request after an idle close. A request sent just as the
+connection expires crosses the notice: the client reads the notice where it expects the reply.
+The server reads nothing after its idle timeout, so that request never ran, and `"closed": "idle"`
+(only on this notice) says it is safe to send it again, once, on a new connection. Apps from
+before the marker send the same notice without it; match its exact `error` text for them. MCP
+connect mode does both: it detects closed connections before sending and reconnects, and
+resends a request that crossed the idle notice once. Any other lost connection after sending a
+request leaves its outcome unknown, and the client must not blindly replay it.
 
 **Only requests are read.** Every line must be a JSON object with a string `method` (`id` and `params` are
 optional; blank lines are skipped). Anything else — text that isn't JSON, a JSON array or number, an object without
@@ -119,6 +129,7 @@ filmstrip is visible.
 | `ui.set` | partial UI state, e.g. `{"view": "detail"}` | Resulting UI state |
 | `ui.dialog.confirm` / `ui.dialog.cancel` | — | Close the open dialog (confirm runs its action; also Read / Save Metadata's overwrite question, which those commands answer with `{confirm: "dialog", affected}`; Synchronize Folder on a folder that is up to date answers `{"upToDate": true}` and starts nothing) |
 | `ui.resize` | `{width, height}` | Resize the window |
+| `ui.dropFiles` | `{paths: [..], hover?}` | Files dragged from the file manager. `hover: true` makes every following frame report `paths` as hovered over the window (the drop card appears, `ui.widgets` lists `dropOverlay`) until another `ui.dropFiles` replaces them; `{paths: [], hover: true}` ends the hover. Without `hover` the files are dropped: the hover ends and the next frame receives them as dropped files, exactly as an OS drop arrives (photos and folders open the import review, or import at once with Settings ▸ Import ▸ Import dropped files without review). An empty path stands for a file whose path the platform doesn't tell |
 | `ui.zoomFactor` | `{factor}` | Set the interface scale (0.5–3; egui's zoom keys are off, Cmd+= / Cmd+- zoom the photo) |
 | `ui.screenshot` | `{path?, headless?}` | `{path, width, height}` once the frame (with finished renders) is captured. `headless: true` draws the UI on the CPU (no compositor needed); a windowed capture that gets no frame within 2 s falls back to headless automatically. While the loupe still waits for a render, `ui.widgets {filter: "loupe:rendering"}` lists its "Rendering…" pill; `loupe:renderFailed` is the pill saying a render failed behind a stand-in; Compare and Reference panes have their own (`compare:rendering:<pane>`, `compare:renderFailed:<pane>`) |
 | `engine.execute {command: "app.export", params}` | export params (see `docs/mcp.md`), plus `preset`, `dir` / `path`, `ids`, `background`; `destinationMode: "sameAsOriginal"` writes each photo into its original's folder (+ `subfolder`) instead of `dir`; `destinationMode: "chooseLater"` without `dir` opens the folder dialog and exports once a folder is chosen (nothing when it is cancelled; an error where there is no folder dialog) | Writes the files and returns `{files}` (one `{path, width, height, bytes, sidecars}` per file, plus `gpuFallback` — why that render fell back from the GPU to the CPU — when it did; see `docs/gpu-pipeline.md`); with `background: true` (what the Export dialog and menus use) it returns `{background: true, total}` at once and the batch runs on a worker thread — poll `ui.inspect` → `export` |
@@ -143,9 +154,19 @@ raws with colour matrices — in the file (DNG) or measured for the camera model
 #730) — and on raws whose white-balance presets give the scale (`lcc_raw::kelvin_presets`), where As Shot
 reads the file's as-shot white; rendered files and raws without matrices use a relative scale
 whose 6500 K / 0 is the as-shot look (the Edit panel shows it as −100..+100). The stored `wb` of such a Kelvin raw
-says `"scale": "kelvin"`; a partial settings JSON given to `develop.merge` or a preset whose `wb` sets `temp` / `tint`
-**without** `scale` keeps the relative meaning it always had (6500 = as shot) on every raw, so agents that mean
-Kelvin on a Kelvin raw pass `"scale": "kelvin"` or use `develop.set` / `develop.wb`.
+says `"scale": "kelvin"`; a partial settings JSON given to `develop.merge`, to a preset's `wb`, or to
+`<cli> render --settings` and which sets `temp` / `tint` **without** `scale` keeps the relative meaning it
+always had (6500 = as shot) on every raw, so agents that mean Kelvin on a Kelvin raw pass `"scale": "kelvin"` or use
+`develop.set` / `develop.wb`. A partial that names only one of `temp` / `tint` is resolved against the photo
+(issue #2910): the photo's white balance is first brought onto the partial's scale with the photo's own as-shot
+white, so the field the partial does not name keeps the look it had instead of being re-read on the partial's scale,
+and the stored result is back on the scale the photo is edited on (`"scale": "kelvin"` on a Kelvin raw). The same
+holds for `preset.apply` when the preset names only one of the two numbers; a preset written by the app, or imported
+from crs / XMP, names `mode`, `temp`, `tint` and `scale` together and behaves exactly as before. A photo whose white
+balance mode answers its own white — `As Shot`, or a named preset on a raw edited in Kelvin — has that white written
+out as `Custom` values first, because a number merged into such a mode would otherwise be stored where no render
+reads it (the panel would show 5800 while the photo stayed at as shot); a partial that names a `mode` itself stays
+authoritative. Partials naming both fields mean the same as before.
 
 Image navigation is also available directly as the UI command `view.navigate`, with
 `{zoom?: "fit" | "fill" | {"percent": number}, pan?: [x, y]}`. Percentage zoom accepts fractional
@@ -196,7 +217,42 @@ catalog, a missing drive), the session starts empty and in memory — never with
 to do: `ui.inspect` → `libraryProblem` is `{path, error, temporarySession, pendingImport}` (else `null`); its buttons
 are `button:libraryRetry`, `button:libraryChoose`, `button:libraryTemporary` (Continue Without Saving) and
 `button:libraryQuit`. A temporary session shows a banner (`indicator:temporarySession`, `button:libraryReopen`) and
-writes nothing. `app.openLibrary` opening a library ends it.
+writes nothing. `app.openLibrary` opening a library ends it. `pendingImport` counts the files waiting for a
+library: those given on the command line, and photos dropped on the window while it (or the launch list below) is
+up (desktop app); they are imported into the library that opens, or into the temporary session. Presets dropped
+then are refused with a toast.
+
+### Choosing the library at launch
+
+With Settings ▸ General ▸ At launch set to Ask me (`ui.set {"settings": {"atLaunch": "ask"}}`; `"last"`, the
+default, opens the last library), or Alt/Option held during the first 2 s after the window appears, the desktop app
+shows a window listing the recent libraries (issue #1290). `--library` and `<PREFIX>_LIBRARY` skip it, and so does
+`--memory`; `<cli>` never shows it. `ui.inspect` → `libraryProblem.chooser` is `{libraries: [{path,
+lastOpened, available, checking, reason}], selected, libraryOpen}` (else `null`; `libraryOpen: true` when it was opened
+over the last library with Alt). Each library is checked read-only on a worker thread of its own, never on the UI
+thread (the folder and its catalog file are looked at, never locked or written, so a library another program has
+open shows as available and Open reports who has it in `libraryProblem.error`). `checking: true` until its check
+answers (the row says *Checking…*, then that the drive isn't answering after 5 s); `available` is `false` only
+once a check found a `reason`, so a row still checking can be opened. The selection starts on the last library and
+moves to the first one that can be opened once every check has answered, unless it was moved meanwhile. Each row is the widget `libraryRecent:<index>`; the buttons are `button:libraryOpen`,
+`button:libraryOpenAnother` (the folder dialog of `app.openLibrary`), `button:libraryNew` (`app.newLibrary`),
+`button:libraryForget` (Remove from List) and `button:libraryQuit`; `ui.key` ArrowUp / ArrowDown move the selection,
+Enter opens it and Escape quits (over an open library: closes the window and keeps it). `app.openLibrary {path}`
+opening a library ends it. While it shows, the settings are saved as usual (a removal is kept).
+
+`app.recentLibraries` returns `[{path, name, exists, checking, open, lastOpened}]`. `exists` is what the last
+background check found (`false`: moved, on a disconnected drive, not a folder or no longer a library; `null`: not
+checked yet, or the check couldn't tell, e.g. a folder that can't be listed, an unreadable catalog or a lookup that
+failed) and `checking` whether one
+is running: the command never looks at a folder itself. A failed open never marks a library missing (another program
+may have it). Recent libraries are checked in the
+background when the app starts (the first 8) and when the launch window opens; one not found is looked for again every
+30 s (a drive plugged back in), the others only when the window comes back to the front (a timer would wake external
+drives and shares). File ▸ Open Recent Library greys out only an entry a check found missing (not there, not a folder,
+no library in it); an unreadable catalog, a folder that refuses to be listed, a failed open or a lookup that failed
+(a share that timed out) doesn't grey it out. `lastOpened`: ISO 8601, `null` when not known; kept in `ui.json` →
+`settings.recentLibrariesOpened`. `{remove: path}` forgets one entry (an error if the list
+doesn't hold it) and `{clear: true}` (or `app.clearRecentLibraries`) all of them; nothing on disk is touched.
 
 ### Open Library on a Lightroom catalog
 
@@ -204,11 +260,28 @@ writes nothing. `app.openLibrary` opening a library ends it.
 folder (it holds a `*.lrcat`), one of its `*.lrdata` / `*.lrcat-data` folders or `Backups/`, the `.lrcat` itself or
 its `-wal` / `-shm` / `.lock` files, it keeps the library open now and returns `{opened: false, lightroomCatalog:
 <the .lrcat found, or null>, path}`; the window shows a dialog whose `button:dialogOk` (Import Lightroom Catalog…, or
-`ui.dialog.confirm`) runs `file.importLightroom` with that catalog (no catalog found: it asks for one) and
-`button:dialogCancel` (`ui.dialog.cancel`) does nothing. A folder that is a library of the app (`catalog.snap` / `catalog.log`) always
+`ui.dialog.confirm`) runs `file.importLightroom` with that catalog (no catalog found: it asks for one), which then
+asks where the catalog goes when `settings.lightroomImport` is `"ask"` (next section), and `button:dialogCancel` (`ui.dialog.cancel`) does nothing. A folder that is a library of the app (`catalog.snap` / `catalog.log`) always
 opens as one. With no library open (the library problem window) it is an error instead. The engine refuses the same
 places (`EngineError::LightroomCatalog`, so `lcc-cli --library` and `mcp --library` too). `library.importLightroom
 {status: true}` reports the catalog's `path` after the task ends as well as while it runs.
+
+### Import Lightroom Catalog: where the catalog goes
+
+`file.importLightroom {path?, into?, name?, location?}` (File ▸ Import Lightroom Catalog…, issue #2672). With `into`
+it acts without asking: `"open"` imports into the library open now (`library.importLightroom`); `"new"` creates the
+library `name` (default: the catalog's file name without `.lrcat`, or `Travel 2`… when taken) in the folder
+`location` (a full path; default: the open library's parent folder) under `app.newLibrary`'s rules, opens it and
+imports there, returning the import's start with `library: {path, name, photos}`. A catalog file that isn't there is
+refused before anything is made; so is a new library while an import runs. Without `into`, a library on disk with
+`settings.lightroomImport` `"ask"` (the default) opens a window and returns `{asking: true, path, into}` (`into`: the
+choice it opens with, `"open"` when the library is empty, else `"new"`). Its widgets:
+`radio:lightroomDestination-open`, `radio:lightroomDestination-new`, `field:lightroomLibraryName`,
+`field:lightroomLibraryLocation`, `button:lightroomLibraryChoose` (where there is a folder dialog), `check:lightroomDontAsk` (with Merge only; sets
+`"alwaysMerge"`), `button:dialogOk` / `ui.dialog.confirm` (which stays open on an error such as a folder that isn't
+empty) and `button:dialogCancel`. With `"alwaysMerge"` (`ui.set {"settings": {"lightroomImport": "alwaysMerge"}}`,
+or Settings ▸ General `button:settingsLightroomImport-0|1`), or in a session in memory, it imports into the open
+library without asking.
 
 ## External controllers
 
@@ -342,11 +415,11 @@ the pending name. `ui.dialog.confirm` starts the same import into the selected a
 
 ## Panel docking
 
-Library, Tools, and Presets panels can be regrouped, split, floated within the app window, closed, and reopened. Tools keeps the current Edit/Crop/Masking mode; the photo view and filmstrip stay together. The document/session view is protected. Layouts, active tabs, panel visibility, and floating rectangles are saved with the app's existing UI preferences. These operations do not edit document contents.
+Library, Tools, and Presets panels can be regrouped, split, floated within the app window, closed, and reopened. Tools keeps the current Edit/Crop/Masking mode; the photo view and filmstrip stay together. The document/session view is protected. Layouts, active tabs, panel visibility, and floating rectangles are saved with the app's existing UI preferences as a craft-ui docking workspace (`docking`: `version`, `layout`, `hidden`, `saved`, `locked`); settings written before workspaces had a `version` load as version 1. These operations do not edit document contents.
 
 Panel IDs: `library`, `tools`, `presets`. The protected center is `canvas`.
 
-`ui.dock` accepts `operation` and `panel`. Operations are `open`, `close`, `activate`, `float` (with finite positive `rect: [x, y, width, height]`), or `move` (with `target` and `zone: center|left|right|top|bottom`). Center groups with the target; side zones split beside it. `ui.dock.reset` restores the default arrangement. Invalid moves return an error without changing the layout.
+`ui.dock` accepts `operation` and `panel`. Operations are `open`, `close`, `activate`, `float` (with finite positive `rect: [x, y, width, height]`), or `move` (with `target` and `zone: center|tab|left|right|top|bottom|above|below`; `Center`, `Left`, `Right`, `Top` and `Bottom` also parse, while `tab`, `above` and `below` are lowercase only). Center and tab group with the target; side zones split beside it; above and below put the panel in a new group above or below the target's group. `ui.dock.reset` restores the default arrangement. Invalid moves return an error without changing the layout. Both commands return `{"docking": workspace}`.
 
 Invoke these UI commands through `engine.execute`, for example `{"command":"ui.dock","params":{"operation":"float","panel":"tools","rect":[100,100,320,440]}}`.
 

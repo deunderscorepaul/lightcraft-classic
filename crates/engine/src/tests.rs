@@ -111,6 +111,22 @@ fn demo_library_loads() {
 }
 
 #[test]
+fn rating_rejects_fractional_values() {
+    let mut s = demo();
+    let id = s.active().unwrap();
+    let before = s.catalog.photo(id).unwrap().rating;
+    for bad in [5.9, -0.9, 0.5] {
+        let err = s.execute("photo.rate", &json!({"rating": bad})).unwrap_err();
+        assert!(matches!(&err, crate::EngineError::BadParams { cmd, .. } if cmd == "photo.rate"), "{bad}: {err}");
+        assert_eq!(s.catalog.photo(id).unwrap().rating, before, "{bad} changed the rating");
+    }
+    s.execute("photo.rate", &json!({"rating": 5.0})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().rating, 5);
+    s.execute("photo.rate", &json!({"rating": 2})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().rating, 2);
+}
+
+#[test]
 fn rating_flag_undo_redo() {
     let mut s = demo();
     let id = s.active().unwrap();
@@ -2139,4 +2155,26 @@ fn auto_sync_hdr_enabled_preserves_per_photo_tuning() {
         assert_eq!(s.selection, selection, "selection and active photo must survive enabled={enabled}");
         assert!(s.auto_sync, "Auto Sync must remain enabled");
     }
+}
+
+/// Upright that finds nothing to correct says why instead of silently doing nothing.
+#[test]
+fn upright_says_why_it_found_nothing_to_correct() {
+    let mut s = demo();
+    let mut noted = 0;
+    for id in s.visible().iter().copied().take(4).collect::<Vec<_>>() {
+        s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+        let r = s.execute("geometry.upright", &json!({"mode": "vertical"})).unwrap();
+        let identity = r["transform"] == serde_json::to_value(lcc_geom::Homography::IDENTITY).unwrap();
+        match r["note"].as_str() {
+            Some(note) => {
+                noted += 1;
+                assert!(note.starts_with("No vertical correction: "), "{note}");
+            }
+            None => assert!(!identity, "a vertical correction was found: {r}"),
+        }
+    }
+    assert!(noted > 0, "the demo's natural scenes have no verticals to correct");
+    let r = s.execute("geometry.upright", &json!({"mode": "off"})).unwrap();
+    assert!(r["note"].is_null());
 }

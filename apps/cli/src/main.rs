@@ -13,6 +13,9 @@
 //! <cli> commands [--json]
 //! <cli> controls [--json]
 //! <cli> calibrate [--max N] [--out DIR] FOLDERS/FILES…
+//! <cli> calibrate-lightroom preset|fit|add|list|verify …
+//! <cli> calibrate-chart --shot RAW --corners "x,y x,y x,y x,y" [--light L] [--shot …]… [--chart 2014|2005] [--dcp OUT] [--preview DIR]
+//! <cli> compare REFERENCE TEST [--size N] [--no-align] [--diff OUT.png] [--json]
 //! <cli> camdb extract [--contributor NAME] NATIVE.dng…
 //! <cli> camdb show MAKE MODEL
 //! ```
@@ -20,7 +23,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod alloc_release;
+mod calibrate_chart;
+mod calibrate_lightroom;
 mod catalog_migrate;
+mod compare;
 mod run_action;
 mod sync_folder;
 
@@ -130,6 +136,40 @@ USAGE:
       model, written as <model>.json to DIR (default: the profiles folder {app} reads,
       <config>/camera-profiles, or ${P}_CAMERA_PROFILES). Raws of a profiled model then
       take their colour from the profile and only their tone from their own JPEG.
+  {cli} calibrate-lightroom preset -o FILE.xmp
+      Write the baseline Lightroom preset to apply (on virtual copies) before exporting for a fit.
+  {cli} calibrate-lightroom fit --raws DIR… --exports DIR… [-o OUTDIR] [--contributor NAME] [--dry-run]
+      Fit a camera's colour model and looks to Lightroom's exports of your own raws (16-bit TIFF, one export
+      folder per Lightroom profile). Writes <Make>_<Model>.json (the file to send: numbers only, no images) and
+      one .dcp per look for your own testing. --dry-run pairs and reports coverage without fitting.
+  {cli} calibrate-lightroom add FILE [--repo DIR] [--contributor NAME]
+      Developers: validate a contributed calibration, write it to crates/camdb/data/calibrations/ and add its
+      assets/ATTRIBUTION.md row (DIR: the repository root, default .).
+  {cli} calibrate-lightroom list
+      The calibrations built into this binary, with their looks and held-out colour error.
+  {cli} calibrate-lightroom verify --raws DIR… --exports DIR… [--report DIR] [--json] [--size N] [--max N]
+      Moving from another editor: render your edited raws the way {app} imports them (their XMP sidecars, or the
+      settings Lightroom embeds in its exports) and measure each against its edited export (CIEDE2000), per photo
+      and per group of controls the edits used. --report writes verify.json and a ΔE00 map per photo.
+  {cli} compare REFERENCE TEST [--size N] [--no-align] [--diff OUT.png] [--json]
+      How far TEST is from REFERENCE: two renders of the same photo from any editor or camera (JPEG, TIFF, PNG,
+      …, read through their embedded colour profiles). Lines them up, then prints CIEDE2000 (mean, median, p95,
+      p99) overall, by tone band and by hue, with the lightness, saturation and hue bias. --size: long edge
+      compared (default 512); --no-align: compare pixel for pixel; --diff: write a false-colour ΔE00 map.
+  {cli} calibrate-lightroom probe -o DIR (--like RAW | --make MAKE --model MODEL) [--unique-model NAME] [--base-only]
+      Write synthetic probe DNGs for a camera: colour patches spread through camera RGB, and one copy per
+      slider-sweep step with that Lightroom setting embedded (applied when Lightroom imports it). Export them all
+      from Lightroom as 16-bit ProPhoto TIFFs; probe_base's export can also go into `fit` with your raws.
+  {cli} calibrate-lightroom probe-check --probes DIR --exports DIR [--json] [-o FILE]
+      Read Lightroom's probe exports back by position: the default render's ΔE00 against {app}'s, and for each
+      slider step the {app} value whose change matches Lightroom's best, next to the value the import uses.
+  {cli} calibrate-chart --shot RAW --corners 'x,y x,y x,y x,y' [--light L] [--shot …]… [--chart 2014|2005]
+          [--dcp OUT.dcp] [--preview DIR] [--report FILE.json] [--contributor NAME]
+      Measure a camera's colour from raw shots of an X-Rite ColorChecker Classic (24 patches): one shot in
+      daylight, ideally another under tungsten (--light daylight|d65|d50|shade|tungsten|KELVIN, default
+      daylight). --corners: the centres of the four corner patches as fractions of the photo's width and height,
+      in any order. Prints a camera database entry (TOML) and the colour error per patch before and after;
+      --dcp also writes a camera profile to try at once, --preview a picture of where each patch was read.
   {cli} camdb extract [--contributor NAME] NATIVE.dng…
       Print camera database entries (TOML, for data/cameras/<maker>.toml in the camdb crate) from DNGs the
       camera wrote itself. DNGs written by Adobe software or by {app}'s own export are refused.
@@ -218,6 +258,9 @@ fn main() -> ExitCode {
         Some("denoise-serve") => denoise_serve(&args[1..]),
         Some("calibrate") => calibrate(&args[1..]),
         Some("camdb") => camdb(&args[1..]),
+        Some("calibrate-lightroom") => calibrate_lightroom::run(&args[1..]),
+        Some("calibrate-chart") => calibrate_chart::run(&args[1..]),
+        Some("compare") => compare::run(&args[1..]),
         Some("--version" | "-V" | "version") => {
             println!("{CLI} {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -659,6 +702,8 @@ fn run(args: &[String]) -> Result<(), String> {
         } else {
             std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?
         };
+        // Windows PowerShell 5.1 writes a UTF-8 BOM; it is not part of the first JSON line.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty() && !l.trim_start().starts_with('#')) {
             let v: Value = serde_json::from_str(line).map_err(|e| format!("{path}:{}: {e}", n + 1))?;
             // `{"command": id, "params": …}` or a control request `{"method": m, "params": …}`
@@ -706,6 +751,8 @@ fn run(args: &[String]) -> Result<(), String> {
                     h.session.execute("library.select", &json!({"ids": ids, "active": first})).map_err(|e| e.to_string())?;
                 }
             }
+            // the user at a shell may name the program Edit In starts; `mcp` may not
+            h.trusted = true;
             Box::new(h)
         }
     };
@@ -1010,6 +1057,8 @@ fn snapshot(args: &[String]) -> Result<(), String> {
             Box::new(std::io::stdin().lines())
         } else {
             let text = std::fs::read_to_string(script).map_err(|e| format!("{script}: {e}"))?;
+            // Windows PowerShell 5.1 writes a UTF-8 BOM; it is not part of the first JSON line.
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
             Box::new(text.lines().map(|l| Ok(l.to_string())).collect::<Vec<_>>().into_iter())
         };
         let mut out = std::io::stdout().lock();

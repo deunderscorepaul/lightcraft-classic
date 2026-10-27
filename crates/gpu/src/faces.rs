@@ -87,9 +87,8 @@ fn dev() -> Result<&'static Dev, String> {
 
 fn create_device() -> Result<Dev, String> {
     let Some(backends) = crate::backend::compute_backends() else { return Err(format!("disabled by {}=off", lcc_brand::env_var("GPU_BACKEND"))) };
-    crate::backend::with_init_marker(backends, || {
-        std::panic::catch_unwind(|| make_device(backends)).unwrap_or_else(|_| Err("device creation panicked".into()))
-    })
+    // on a thread of its own, under the crash sentinel, with a time limit (#3068, `init.rs`)
+    crate::init::create(backends, move || make_device(backends))
 }
 
 fn entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
@@ -816,6 +815,13 @@ static PER_CONV: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The face detector's kernels validate without a GPU.
+    #[test]
+    fn the_face_kernels_validate_without_a_gpu() {
+        assert_eq!(crate::validate_wgsl("faces_conv", include_str!("wgsl/faces_conv.wgsl")), Ok(()));
+        assert_eq!(crate::validate_wgsl("faces_ops", include_str!("wgsl/faces_ops.wgsl")), Ok(()));
+    }
 
     fn gpu() -> Option<Arc<FaceGpu>> {
         match accelerator() {

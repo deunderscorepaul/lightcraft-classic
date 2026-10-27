@@ -140,6 +140,22 @@ fn unsupported_wasm() -> Result<Value, String> {
     Err("Lightroom catalog import is unavailable in browser builds; open the catalog in the native app".into())
 }
 
+/// Tests: a catalog import that never ends while the returned value lives, so a drop meets it pending.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn stall_import(app: &mut LccApp) -> Box<dyn std::any::Any> {
+    let (tx, rx) = mpsc::channel::<Message>();
+    let task = LightroomTask::new(
+        &app.session,
+        Kind::Import,
+        PathBuf::from("catalog.lrcat"),
+        Arc::new(AtomicBool::new(false)),
+        LightroomProgress::default(),
+        rx,
+    );
+    app.lightroom = Some(task);
+    Box::new(tx)
+}
+
 /// Whether a Lightroom task currently owns the catalog transition.
 pub fn is_running(app: &LccApp) -> bool {
     app.lightroom.is_some()
@@ -636,7 +652,7 @@ mod tests {
         let (task, _tx, _, _) = fake_import(&h);
         let value = json!({"photos": 1, "imported": 1, "collections": 0, "missing": ["D:/Photos/a.NEF"], "mapping": {"1": id}, "library": "C:/Pictures/Photo Library"});
         terminal(&mut h.app, &h.view.ctx, &task, value);
-        assert!(h.app.ui.toast.as_ref().unwrap().0.contains("1 photos added"));
+        assert!(h.app.ui.toast().unwrap().0.contains("1 photos added"));
         h.step();
         h.step();
         let text = h.painted_text().join(" ");
@@ -645,7 +661,7 @@ mod tests {
         assert!(text.contains("1 originals are missing"), "{text}");
         assert!(text.contains("Show in Library"), "{text}");
         // The activity and toast can go away; the modal result remains until dismissed.
-        h.app.ui.toast = None;
+        h.app.ui.toasts.clear();
         h.step();
         assert!(h.app.ui.dialog.is_some());
         let dialog = h.app.ui.dialog.clone().unwrap();

@@ -4,7 +4,8 @@
 //!   checkbox, unchecked unless an installed version already has it. Only what the user ticks is
 //!   granted; an update shows what it newly asks for.
 //! - Per plug-in: enable/disable, toggle (revoke) each requested permission, remove, read the log,
-//!   run its commands (with their declarative dialogs).
+//!   run its commands (with their declarative dialogs, opening with the values they last ran with,
+//!   or as the plug-in's `prepare` step says), and open its page (its Settings tab).
 //! - After an export, enabled export hooks and the chosen export destination run on the written
 //!   files, on a worker with an activity row ([`after_export`], [`poll`]).
 //!
@@ -18,7 +19,7 @@ use lcc_engine::activity::{Cancel, TaskGuard};
 use serde_json::{Value, json};
 
 use crate::LccApp;
-use crate::i18n::tr;
+use crate::i18n::{tr, tr_format};
 
 /// An install waiting for the user's approval: the file, its inspection and the ticked grant.
 #[derive(Clone)]
@@ -28,13 +29,38 @@ struct Pending {
     grant: Value,
 }
 
+/// A command's dialog, as `plugin.prepare` gave it.
+#[derive(Clone)]
+struct Dialog {
+    plugin: String,
+    command: String,
+    label: String,
+    /// The fields (with the options the plug-in gave) and their values.
+    fields: Vec<Value>,
+    values: Value,
+    /// The plug-in's prepare step failed: why (the fields are the declared ones).
+    error: Option<String>,
+}
+
+/// A plug-in's page: its Settings tab, as `plugin.settings` gave it.
+#[derive(Clone)]
+struct Page {
+    id: String,
+    name: String,
+    fields: Vec<Value>,
+    values: Value,
+    /// The plug-in couldn't fill its own options, or saving failed.
+    error: Option<String>,
+}
+
 #[derive(Clone, Default)]
 struct State {
     open: bool,
     path: String,
     pending: Option<Pending>,
-    /// The command whose dialog is open: (plugin, command, values).
-    dialog: Option<(String, String, Value)>,
+    /// The command whose dialog is open.
+    dialog: Option<Dialog>,
+    page: Option<Page>,
     message: String,
 }
 
@@ -61,7 +87,8 @@ fn app_ctx(app: &LccApp) -> egui::Context {
 
 /// UI commands: `plugins.manager {open?}` opens / closes the window; `plugins.install {path}`
 /// inspects a module and opens the approval dialog; `plugins.runItem {plugin, command}` runs a
-/// plug-in command from the menu (asking its dialog first, if it has one).
+/// plug-in command from the menu (asking its dialog first, if it has one); `plugins.page {id,
+/// open?}` opens / closes a plug-in's page (its Settings tab).
 pub fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value, String>> {
     let ctx = app_ctx(app);
     let mut s = state(&ctx);
@@ -84,6 +111,17 @@ pub fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value, String
             }
             r
         }
+        "plugins.page" => {
+            let Some(id) = p.get("id").and_then(Value::as_str) else {
+                return Some(Err("plugins.page needs `id`".into()));
+            };
+            if p.get("open").and_then(Value::as_bool) == Some(false) {
+                s.page = s.page.take().filter(|pg| pg.id != id);
+                Ok(json!({"open": false}))
+            } else {
+                open_page(app, &mut s, id).map(|_| json!({"open": true}))
+            }
+        }
         _ => return None,
     };
     set_state(&ctx, s);
@@ -105,18 +143,58 @@ fn begin_install(app: &mut LccApp, s: &mut State, path: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// Runs a command right away, or opens its dialog. `Value::Null` when the dialog opened.
+/// Runs a command right away, or opens its dialog. `Value::Null` when the dialog opened. A command
+/// with a `prepare` step is asked first (`plugin.prepare`): it may run at once, explain why it
+/// can't (`{message}`, shown, nothing runs) or give the dialog its own options; the dialog opens
+/// with the values it last ran with.
 fn start_command(app: &mut LccApp, s: &mut State, plugin: &str, command: &str) -> Result<Value, String> {
     let list = app.session.execute("plugin.commands", &json!({})).map_err(|e| e.to_string())?;
     let decl = list.as_array().into_iter().flatten().find(|c| c["plugin"] == plugin && c["command"] == command).cloned();
     let decl = decl.ok_or_else(|| format!("{plugin}: {command}: {}", tr("no such plug-in command (is the plug-in enabled?)")))?;
-    let fields = decl["dialog"].as_array().cloned().unwrap_or_default();
-    if fields.is_empty() {
+    let prepared = app.session.execute("plugin.prepare", &json!({"plugin": plugin, "command": command})).map_err(|e| e.to_string())?;
+    if let Some(m) = prepared.get("message").and_then(Value::as_str) {
+        return Ok(json!({"message": m}));
+    }
+    let fields = prepared["dialog"].as_array().cloned().unwrap_or_default();
+    if let (true, Some(e)) = (fields.is_empty(), prepared["error"].as_str()) {
+        // the prepare step failed and there is no dialog to show it in: nothing runs
+        return Err(e.to_string());
+    }
+    if prepared.get("run").is_some() || fields.is_empty() {
+        // `plugin.run` asks the prepare step again and runs with what it gives
         return app.session.execute("plugin.run", &json!({"plugin": plugin, "command": command})).map_err(|e| e.to_string());
     }
-    let values: serde_json::Map<String, Value> = fields.iter().filter_map(|f| Some((f["key"].as_str()?.to_string(), f["default"].clone()))).collect();
-    s.dialog = Some((plugin.to_string(), command.to_string(), Value::Object(values)));
+    let values: serde_json::Map<String, Value> = fields.iter().filter_map(|f| Some((f["key"].as_str()?.to_string(), f["value"].clone()))).collect();
+    s.dialog = Some(Dialog {
+        plugin: plugin.to_string(),
+        command: command.to_string(),
+        label: decl["label"].as_str().unwrap_or(command).to_string(),
+        fields,
+        values: Value::Object(values),
+        error: prepared["error"].as_str().map(str::to_string),
+    });
     Ok(Value::Null)
+}
+
+/// Opens plug-in `id`'s page with its settings as they are (`plugin.settings`).
+fn open_page(app: &mut LccApp, s: &mut State, id: &str) -> Result<(), String> {
+    let v = app.session.execute("plugin.settings", &json!({"id": id})).map_err(|e| e.to_string())?;
+    if v["fields"].as_array().is_none_or(Vec::is_empty) {
+        return Err(format!("{id}: {}", tr("this plug-in has no settings")));
+    }
+    let name = app
+        .session
+        .execute("plugin.list", &json!({}))
+        .ok()
+        .and_then(|l| l["plugins"].as_array()?.iter().find(|p| p["id"] == id).and_then(|p| p["name"].as_str().map(str::to_string)));
+    s.page = Some(Page {
+        id: id.to_string(),
+        name: name.unwrap_or_else(|| id.to_string()),
+        fields: v["fields"].as_array().cloned().unwrap_or_default(),
+        values: v["values"].clone(),
+        error: v["error"].as_str().map(str::to_string),
+    });
+    Ok(())
 }
 
 /// File ▸ Plug-in Extras: the commands of enabled plug-ins, then the manager.
@@ -271,7 +349,8 @@ pub fn export_destination_ui(ui: &mut egui::Ui) {
             for (plugin, d) in &offered {
                 let on = current.is_some_and(|(p, cd)| p == plugin && cd.id == d.id);
                 if ui.selectable_label(on, &d.name).clicked() && !on {
-                    let values: serde_json::Map<String, Value> = d.dialog.iter().map(|f| (f.key.clone(), f.default_value())).collect();
+                    // the values it last ran with
+                    let values = lcc_engine::cmd::plugins::manager().as_ref().map(|m| m.destination_values(plugin, &d.id)).unwrap_or_default();
                     chosen = Some((plugin.clone(), d.id.clone(), Value::Object(values)));
                 }
             }
@@ -282,9 +361,10 @@ pub fn export_destination_ui(ui: &mut egui::Ui) {
     if let Some((plugin, dest, values)) = chosen.as_mut()
         && let Some((_, d)) = offered.iter().find(|(p, d)| p == plugin && d.id == *dest)
     {
+        let scope = format!("{plugin}:{dest}");
         for f in &d.dialog {
             if let Ok(f) = serde_json::to_value(f) {
-                field_ui(ui, &f, values);
+                field_ui(ui, &scope, &f, values);
             }
         }
     }
@@ -434,42 +514,62 @@ fn exec(app: &mut LccApp, id: &str, p: Value, msg: &mut String) -> Option<Value>
 
 pub fn show(app: &mut LccApp, ctx: &egui::Context) {
     let mut s = state(ctx);
-    if !s.open && s.dialog.is_none() {
+    if !s.open && s.dialog.is_none() && s.page.is_none() {
         return;
     }
     let list = app.session.execute("plugin.list", &json!({})).unwrap_or(Value::Null);
     let mut actions: Vec<(&'static str, Value)> = Vec::new();
     let mut inspect: Option<String> = None;
     if s.open {
-        let mut open = true;
-        egui::Window::new(tr("Plug-in Manager")).id(key()).open(&mut open).default_width(560.0).vscroll(true).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(tr("Module (.wasm):"));
-                let r = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(320.0));
-                crate::access::label(&r, "Module (.wasm):");
-                if ui.button(tr("Install…")).clicked() {
-                    inspect = Some(s.path.trim().to_string());
+        let open = !crate::dialog_frame::esc_closes(app.ui.dialog.is_some(), ctx);
+        let mut closed = false;
+        egui::Window::new(tr("Plug-in Manager"))
+            .id(key())
+            .title_bar(false)
+            .frame(crate::dialog_frame::card_frame(ctx))
+            .default_width(560.0)
+            .vscroll(true)
+            .show(ctx, |ui| {
+                if crate::dialog_frame::card_header(ui, tr("Plug-in Manager"), Some("plugin-manager:close")) {
+                    closed = true;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(tr("Module (.wasm):"));
+                    let r = ui.add(egui::TextEdit::singleline(&mut s.path).desired_width(320.0));
+                    crate::access::label(&r, "Module (.wasm):");
+                    if ui.button(tr("Install…")).clicked() {
+                        inspect = Some(s.path.trim().to_string());
+                    }
+                });
+                if let Some(dir) = list["dir"].as_str() {
+                    ui.weak(format!("{} {dir}", tr("Installed in")));
+                }
+                for f in list["failed"].as_array().into_iter().flatten() {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("{}: {}", f["file"].as_str().unwrap_or(""), f["error"].as_str().unwrap_or("")),
+                    );
+                    // a module that didn't load can still be removed
+                    if let Some(id) = f["id"].as_str() {
+                        use crate::button::Button;
+                        if Button::new("Remove").widget(format!("button:pluginRemoveFailed:{id}")).show(ui).clicked() {
+                            actions.push(("plugin.uninstall", json!({"id": id})));
+                        }
+                    }
+                }
+                if !s.message.is_empty() {
+                    ui.colored_label(ui.visuals().warn_fg_color, &s.message);
+                }
+                ui.separator();
+                let plugins = list["plugins"].as_array().cloned().unwrap_or_default();
+                if plugins.is_empty() {
+                    ui.weak(tr("No plug-ins installed."));
+                }
+                for p in &plugins {
+                    plugin_ui(ui, p, &mut actions);
                 }
             });
-            if let Some(dir) = list["dir"].as_str() {
-                ui.weak(format!("{} {dir}", tr("Installed in")));
-            }
-            for f in list["failed"].as_array().into_iter().flatten() {
-                ui.colored_label(ui.visuals().error_fg_color, format!("{}: {}", f["file"].as_str().unwrap_or(""), f["error"].as_str().unwrap_or("")));
-            }
-            if !s.message.is_empty() {
-                ui.colored_label(ui.visuals().warn_fg_color, &s.message);
-            }
-            ui.separator();
-            let plugins = list["plugins"].as_array().cloned().unwrap_or_default();
-            if plugins.is_empty() {
-                ui.weak(tr("No plug-ins installed."));
-            }
-            for p in &plugins {
-                plugin_ui(ui, p, &mut actions);
-            }
-        });
-        s.open = open;
+        s.open = open && !closed;
     }
     if let Some(path) = inspect {
         s.message.clear();
@@ -479,9 +579,25 @@ pub fn show(app: &mut LccApp, ctx: &egui::Context) {
     }
     approval_ui(ctx, &mut s, &mut actions);
     dialog_ui(ctx, &mut s, &mut actions);
+    page_ui(ctx, &mut s, &mut actions);
     for (id, p) in actions {
         s.message.clear();
         match id {
+            "plugins.page" => {
+                let id = p["id"].as_str().unwrap_or("").to_string();
+                if let Err(e) = open_page(app, &mut s, &id) {
+                    s.message = e;
+                }
+            }
+            "plugin.setSettings" => match app.session.execute(id, &p) {
+                Ok(_) => s.page = None,
+                Err(e) => {
+                    // the page stays open with the user's values and why they weren't saved
+                    if let Some(pg) = s.page.as_mut() {
+                        pg.error = Some(e.to_string());
+                    }
+                }
+            },
             "plugins.runItem" => {
                 let (plugin, command) = (p["plugin"].as_str().unwrap_or("").to_string(), p["command"].as_str().unwrap_or("").to_string());
                 match start_command(app, &mut s, &plugin, &command) {
@@ -513,46 +629,76 @@ fn approval_ui(ctx: &egui::Context, s: &mut State, actions: &mut Vec<(&'static s
     let m = pending.info["manifest"].clone();
     let installed = pending.info["installed"].clone();
     let had = if installed.is_object() { installed["granted"].clone() } else { Value::Null };
+    // what stops the install (plugin.install refuses it too): features this version lacks, a bad version
+    let missing: Vec<String> = pending.info["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+    let version_error = pending.info["versionError"].as_str().map(str::to_string);
+    let blocked = !missing.is_empty() || version_error.is_some();
+    let downgrade = pending.info["downgrade"].as_bool() == Some(true);
     let mut keep = true;
     let window_id = key().with("approve");
-    let shown = egui::Window::new(tr("Install Plug-in")).id(window_id).collapsible(false).resizable(false).show(ctx, |ui| {
-        let mut layout = crate::dialog_frame::ModalLayout::begin(ui, window_id);
-        layout.body(ui, |ui| {
-            ui.strong(format!("{} {}", m["name"].as_str().unwrap_or(""), m["version"].as_str().unwrap_or("")));
-            ui.weak(format!("{} · {}", m["id"].as_str().unwrap_or(""), m["author"].as_str().unwrap_or("")));
-            if installed.is_object() {
-                ui.label(format!("{} {}", tr("Updates the installed version"), installed["version"].as_str().unwrap_or("")));
-            }
-            ui.separator();
-            let req = &m["permissions"];
-            let rows = permission_rows(req);
-            if rows.is_empty() {
-                ui.label(tr("It asks for no permissions: it can only keep its own data."));
-            } else {
-                ui.label(tr("It asks for these permissions. Tick the ones you allow:"));
-            }
-            for row in rows {
-                let mut on = row.granted(&pending.grant);
-                let new = !row.granted(&had);
-                let text = if new && installed.is_object() { format!("{}  ({})", row.label(), tr("new")) } else { row.label() };
-                if ui.checkbox(&mut on, text).changed() {
-                    row.set(&mut pending.grant, on);
+    let shown = egui::Window::new(tr("Install Plug-in"))
+        .id(window_id)
+        .title_bar(false)
+        .frame(crate::dialog_frame::card_frame(ctx))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            crate::dialog_frame::card_header(ui, tr("Install Plug-in"), None);
+            let mut layout = crate::dialog_frame::ModalLayout::begin(ui, window_id);
+            layout.body(ui, |ui| {
+                ui.strong(format!("{} {}", m["name"].as_str().unwrap_or(""), m["version"].as_str().unwrap_or("")));
+                ui.weak(format!("{} · {}", m["id"].as_str().unwrap_or(""), m["author"].as_str().unwrap_or("")));
+                let (new, old) = (m["version"].as_str().unwrap_or(""), installed["version"].as_str().unwrap_or(""));
+                if downgrade {
+                    ui.label(tr_format!("Version {new} is older than the installed version {installed}", new = new, installed = old));
+                } else if installed.is_object() {
+                    ui.label(format!("{} {old}", tr("Updates the installed version")));
                 }
-            }
-        });
-        layout.footer(ui, |ui| {
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button(tr("Install")).clicked() {
-                    actions.push(("plugin.install", json!({"path": pending.path, "grant": pending.grant})));
-                    keep = false;
+                ui.separator();
+                if blocked {
+                    if !missing.is_empty() {
+                        ui.label(tr("It needs features this version of the app doesn't have:"));
+                        for f in &missing {
+                            ui.label(format!("• {f}"));
+                        }
+                        ui.label(tr("Install a newer version of the app to use it."));
+                    }
+                    if let Some(e) = &version_error {
+                        ui.label(format!("{} {e}", tr("It can't be installed:")));
+                    }
+                    return;
                 }
-                if ui.button(tr("Cancel")).clicked() {
-                    keep = false;
+                let req = &m["permissions"];
+                let rows = permission_rows(req);
+                if rows.is_empty() {
+                    ui.label(tr("It asks for no permissions: it can only keep its own data."));
+                } else {
+                    ui.label(tr("It asks for these permissions. Tick the ones you allow:"));
+                }
+                for row in rows {
+                    let mut on = row.granted(&pending.grant);
+                    let new = !row.granted(&had);
+                    let text = if new && installed.is_object() { format!("{}  ({})", row.label(), tr("new")) } else { row.label() };
+                    if ui.checkbox(&mut on, text).changed() {
+                        row.set(&mut pending.grant, on);
+                    }
                 }
             });
+            layout.footer(ui, |ui| {
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    use crate::button::{Button, Kind};
+                    let label = if downgrade { "Install Older Version" } else { "Install" };
+                    if !blocked && Button::new(label).kind(Kind::Primary).widget("button:pluginInstall").show(ui).clicked() {
+                        actions.push(("plugin.install", json!({"path": pending.path, "grant": pending.grant, "allowDowngrade": downgrade})));
+                        keep = false;
+                    }
+                    if Button::new("Cancel").widget("button:pluginInstallCancel").show(ui).clicked() {
+                        keep = false;
+                    }
+                });
+            });
         });
-    });
     crate::dialog_frame::ModalLayout::finish(ctx, window_id, shown.as_ref().map(|w| w.response.rect));
     if keep {
         s.pending = Some(pending);
@@ -615,31 +761,87 @@ impl Row {
 }
 
 fn dialog_ui(ctx: &egui::Context, s: &mut State, actions: &mut Vec<(&'static str, Value)>) {
-    let Some((plugin, command, mut values)) = s.dialog.take() else { return };
-    let decl = {
-        let g = lcc_engine::cmd::plugins::manager();
-        g.as_ref().and_then(|m| m.get(&plugin)).and_then(|p| p.plugin.manifest().command(&command).cloned())
-    };
-    let Some(decl) = decl else { return };
+    let Some(mut d) = s.dialog.take() else { return };
     let mut keep = true;
-    egui::Window::new(decl.label.clone()).id(key().with("dialog")).collapsible(false).show(ctx, |ui| {
-        for f in &decl.dialog {
-            if let Ok(f) = serde_json::to_value(f) {
-                field_ui(ui, &f, &mut values);
+    egui::Window::new(d.label.clone()).id(key().with("dialog")).title_bar(false).frame(crate::dialog_frame::card_frame(ctx)).collapsible(false).show(
+        ctx,
+        |ui| {
+            crate::dialog_frame::card_header(ui, &d.label, None);
+            if let Some(e) = &d.error {
+                ui.colored_label(ui.visuals().warn_fg_color, e);
             }
-        }
-        ui.horizontal(|ui| {
-            if ui.button(tr("Run")).clicked() {
-                actions.push(("plugin.run", json!({"plugin": plugin, "command": command, "args": values})));
-                keep = false;
+            let scope = format!("{}:{}", d.plugin, d.command);
+            for f in &d.fields {
+                field_ui(ui, &scope, f, &mut d.values);
             }
-            if ui.button(tr("Cancel")).clicked() {
-                keep = false;
-            }
-        });
-    });
+            ui.add_space(6.0);
+            button_row(ui, |ui| {
+                use crate::button::{Button, Kind};
+                if Button::new("Run").kind(Kind::Primary).widget("button:pluginRun").show(ui).clicked() {
+                    actions.push(("plugin.run", json!({"plugin": d.plugin, "command": d.command, "args": d.values})));
+                    keep = false;
+                }
+                if Button::new("Cancel").widget("button:pluginRunCancel").show(ui).clicked() {
+                    keep = false;
+                }
+            });
+        },
+    );
     if keep {
-        s.dialog = Some((plugin, command, values));
+        s.dialog = Some(d);
+    }
+}
+
+/// A dialog's buttons, right-aligned on one row (a bare right-to-left layout takes the window's
+/// whole height and leaves the dialog tall and mostly empty).
+fn button_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 30.0), egui::Layout::right_to_left(egui::Align::Center), add);
+}
+
+/// A plug-in's page: a tab bar (Settings only, for now; the permissions join it later) and the
+/// plug-in's settings, saved together with Save (`plugin.setSettings`, checked by the host).
+fn page_ui(ctx: &egui::Context, s: &mut State, actions: &mut Vec<(&'static str, Value)>) {
+    let Some(mut pg) = s.page.take() else { return };
+    let mut keep = !crate::dialog_frame::esc_closes(false, ctx);
+    let window_id = key().with("page");
+    let shown = egui::Window::new(pg.name.clone())
+        .id(window_id)
+        .title_bar(false)
+        .frame(crate::dialog_frame::card_frame(ctx))
+        .collapsible(false)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            if crate::dialog_frame::card_header(ui, &pg.name, Some("plugin-page:close")) {
+                keep = false;
+            }
+            let mut layout = crate::dialog_frame::ModalLayout::begin(ui, window_id);
+            layout.body(ui, |ui| {
+                crate::widgets::segmented(ui, "pluginPage", &[("Settings", "settings")], Some(0), 4);
+                ui.add_space(6.0);
+                if let Some(e) = &pg.error {
+                    ui.colored_label(ui.visuals().warn_fg_color, e);
+                }
+                let scope = format!("settings:{}", pg.id);
+                for f in &pg.fields {
+                    field_ui(ui, &scope, f, &mut pg.values);
+                }
+            });
+            layout.footer(ui, |ui| {
+                ui.separator();
+                button_row(ui, |ui| {
+                    use crate::button::{Button, Kind};
+                    if Button::new("Save").kind(Kind::Primary).widget("button:pluginSettingsSave").show(ui).clicked() {
+                        actions.push(("plugin.setSettings", json!({"id": pg.id, "values": pg.values})));
+                    }
+                    if Button::new("Cancel").widget("button:pluginSettingsCancel").show(ui).clicked() {
+                        keep = false;
+                    }
+                });
+            });
+        });
+    crate::dialog_frame::ModalLayout::finish(ctx, window_id, shown.as_ref().map(|w| w.response.rect));
+    if keep {
+        s.page = Some(pg);
     }
 }
 
@@ -663,6 +865,13 @@ fn plugin_ui(ui: &mut egui::Ui, p: &Value, actions: &mut Vec<(&'static str, Valu
             }
             if ui.button(tr("Remove")).clicked() {
                 actions.push(("plugin.uninstall", json!({"id": id})));
+            }
+            // its page: the Settings tab (only plug-ins with settings have one for now)
+            if p["settings"].as_array().is_some_and(|a| !a.is_empty()) {
+                use crate::button::Button;
+                if Button::new("Settings…").widget(format!("button:pluginSettings:{id}")).show(ui).clicked() {
+                    actions.push(("plugins.page", json!({"id": id})));
+                }
             }
         });
         let rows = permission_rows(&p["requested"]);
@@ -723,7 +932,8 @@ fn contributions(p: &Value) -> Vec<String> {
     v
 }
 
-fn field_ui(ui: &mut egui::Ui, f: &Value, values: &mut Value) {
+/// One dialog or settings field; `scope` (the plug-in and its dialog) keeps widget ids apart.
+fn field_ui(ui: &mut egui::Ui, scope: &str, f: &Value, values: &mut Value) {
     let Some(k) = f["key"].as_str() else { return };
     let label = f["label"].as_str().unwrap_or(k);
     let v = &mut values[k];
@@ -745,17 +955,20 @@ fn field_ui(ui: &mut egui::Ui, f: &Value, values: &mut Value) {
             }
             Some("choice") => {
                 let mut cur = v.as_str().unwrap_or("").to_string();
-                egui::ComboBox::from_id_salt(("plugin-field", k)).selected_text(cur.clone()).show_ui(ui, |ui| {
+                let r = egui::ComboBox::from_id_salt(("plugin-field", scope, k)).selected_text(cur.clone()).show_ui(ui, |ui| {
                     for o in f["options"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                         ui.selectable_value(&mut cur, o.to_string(), o);
                     }
                 });
+                crate::widgets::register(ui.ctx(), format!("pluginChoice:{scope}:{k}"), r.response.rect);
+                crate::access::label(&r.response, label);
                 *v = json!(cur);
             }
             _ => {
                 let mut t = v.as_str().unwrap_or("").to_string();
-                let r = ui.text_edit_singleline(&mut t);
-                crate::access::label(&r, label);
+                let widget = format!("pluginText:{scope}:{k}");
+                let r = crate::text_field::TextField::singleline(&widget, &mut t).width(240.0).show(ui);
+                crate::access::label(&r.response, label);
                 *v = json!(t);
             }
         }

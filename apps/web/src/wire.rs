@@ -124,6 +124,8 @@ impl WireJob {
             proof: None,
             window: self.window.map(|[x, y, w, h]| lcc_engine::pipeline::PixelWindow { x, y, w, h }),
             display: None,
+            downscale: lcc_engine::pipeline::Downscale::Smooth,
+            alpha: false,
         }
     }
 
@@ -526,7 +528,7 @@ mod tests {
             }
         };
         frame(&mut watch, &mut index); // an empty filtered view: no render request yet
-        cache.clear(); // File ▸ Clear Preview Cache
+        cache.clear(); // File ▸ Discard Preview Cache
         frame(&mut watch, &mut index);
         // the filter is removed: the first thumbnail request (`Workers::try_start`)
         gone.extend(watch.observe(&cache, cache.generation(), &mut index));

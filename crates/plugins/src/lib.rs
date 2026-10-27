@@ -13,8 +13,9 @@
 //!
 //! What a plug-in can contribute (declared in its [`Manifest`]): menu commands with an optional
 //! declarative dialog, export post-process hooks, metadata/keyword providers and publish services
-//! (through the [`publish::PublishProvider`] trait boundary). The [`Manager`] keeps the installed
-//! plug-ins, their grants (given on install, revocable), enabled state and logs.
+//! (through the [`publish::PublishProvider`] trait boundary), settings kept for the whole app
+//! ([`SettingsStore`]). The [`Manager`] keeps the installed plug-ins, their grants (given on
+//! install, revocable), enabled state, settings and logs.
 //!
 //! Every failure (malformed module, trap, exhausted budget, denied capability, bad output) is an
 //! [`Error`]; nothing a module does can panic or hang the host.
@@ -32,13 +33,15 @@ pub mod permissions;
 pub mod publish;
 mod runtime;
 mod safe_io;
+pub mod settings;
 mod store;
 
 pub use context::{HostApi, NoHost};
-pub use manager::{Installed, Manager, PendingCall};
-pub use manifest::{CommandDecl, DestinationDecl, Field, FieldKind, Hooks, Manifest, MetadataField, PublishDecl};
+pub use manager::{Failed, Installed, Manager, PendingCall, Prepared, SettingsView};
+pub use manifest::{CommandDecl, DestinationDecl, Field, FieldKind, HOST_FEATURES, Hooks, Manifest, MetadataField, PublishDecl};
 pub use permissions::{FsRoot, Permissions};
 pub use runtime::{ABI_VERSION, Limits, Outcome, Plugin};
+pub use settings::SettingsStore;
 pub use store::NamespaceStore;
 
 /// A plug-in error. Every way a module can misbehave ends here, never in a panic.
@@ -50,6 +53,12 @@ pub enum Error {
     Abi(String),
     #[error("plug-in manifest: {0}")]
     Manifest(String),
+    /// The plug-in requires host features this version of the app doesn't have.
+    #[error("{}", missing_message(.0))]
+    Unsupported(Vec<String>),
+    /// An older version than the installed one, not confirmed.
+    #[error("version {new} is older than the installed version {installed}; confirm to install it anyway (allowDowngrade)")]
+    Downgrade { installed: String, new: String },
     #[error("plug-in trapped: {0}")]
     Trap(String),
     #[error("plug-in exceeded its {0}")]
@@ -69,3 +78,14 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// "needs `a` and `b`, which this version of the app doesn't have".
+fn missing_message(missing: &[String]) -> String {
+    let names: Vec<String> = missing.iter().map(|m| format!("`{m}`")).collect();
+    let list = match names.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("the plug-in needs {list}, which this version of the app doesn't have")
+}

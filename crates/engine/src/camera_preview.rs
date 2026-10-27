@@ -46,7 +46,9 @@ use lcc_raw::{
 /// 16: tone curves of low-contrast scenes (range limit 1.2, with the bright-area check for curves under 1.5, upstream
 /// #699); a tone-only fallback for near-black scenes with too few colour pairs (upstream #1587); Sony DRO tone.
 /// 17: fitted tone curves are smoothed, and a DRO-lowered one follows Sony's curve between knots (upstream #2188).
-pub const LOOK_VERSION: u32 = 17;
+/// 18: ISO 50 on the ILCE-7CR fits and renders one stop darker (`vendor::arw::extended_iso_exposure`, upstream #2854).
+/// 19: the Canon CR3/CR2 camera JPEG read in the colour space of the Canon maker note (upstream #2664).
+pub const LOOK_VERSION: u32 = 19;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CameraLook {
@@ -257,14 +259,20 @@ fn is_spectral(e: &lcc_camdb::Entry) -> bool {
     e.provenance.source == lcc_camdb::Source::SpectralSensitivities
 }
 
+/// Whether a camera database entry gives model-wide colorimetric matrices the Colorimetric camera colour can start
+/// from: measured spectral sensitivities, else dcraw's table (`lcc_camdb::find` ranks the spectral ones first).
+fn is_colorimetric(e: &lcc_camdb::Entry) -> bool {
+    is_spectral(e) || e.provenance.source == lcc_camdb::Source::Dcraw
+}
+
 /// The camera database entry for the raw's model, when it has no colour matrices of its own, its starting look is
-/// otherwise fitted to its JPEG ([`file_local_look`]) and the entry comes from measured spectral sensitivities: what
-/// [`CameraColour::Colorimetric`] starts from.
+/// otherwise fitted to its JPEG ([`file_local_look`]) and the entry gives colorimetric matrices (measured spectral
+/// sensitivities, else dcraw's table): what [`CameraColour::Colorimetric`] starts from.
 pub(crate) fn colorimetric_camera(raw: &RawImage) -> Option<lcc_camdb::Entry> {
     if lcc_raw::color::has_matrix(&raw.color) || !file_local_look(raw.format) {
         return None;
     }
-    lcc_camdb::find(raw.metadata.make.as_deref(), raw.metadata.model.as_deref()?).filter(is_spectral)
+    lcc_camdb::find(raw.metadata.make.as_deref(), raw.metadata.model.as_deref()?).filter(is_colorimetric)
 }
 
 /// [`starting_colour`] with the JPEG fit (the look, and whether the JPEG is black and white) and the black-and-white
@@ -325,14 +333,14 @@ fn starting_colour_traced_from(
         };
         return (xy, t, None);
     }
-    // Colorimetric: the spectral matrices, never the JPEG (a model without them starts as Auto does)
+    // Colorimetric: the spectral (else dcraw's) matrices, never the JPEG (a model without them starts as Auto does)
     if colour == CameraColour::Colorimetric
         && file_local_look(raw.format)
-        && let Some(e) = entry.as_ref().filter(|e| is_spectral(e))
+        && let Some(e) = entry.as_ref().filter(|e| is_colorimetric(e))
         && e.apply(raw).matrix
     {
         if lcc_pipeline::profiling() {
-            eprintln!("[profile] {:?} camera colour from spectral sensitivities (Colorimetric): {} {}", raw.format, e.make, e.model);
+            eprintln!("[profile] {:?} camera colour from {:?} (Colorimetric): {} {}", raw.format, e.provenance.source, e.make, e.model);
         }
         let (make, model, provenance) = named(e);
         trace.colour = ColourSource::Database { make, model, provenance };
@@ -516,6 +524,7 @@ pub(crate) fn dng_colour(tags: &ColorData, declared: &crate::files::DngWhite, t:
         as_shot_neutral: Some(neutral),
         as_shot_white_xy: None,
         baseline_exposure: t.baseline_exposure + k.log2(),
+        white_extension_ev: 0.0,
         baseline_sharpness: tags.baseline_sharpness,
         kelvin_presets: None,
         balanced_as_shot: None,
@@ -657,6 +666,14 @@ fn with_profile_colour_from(
 /// the render's highlight reconstruction.
 const SENSOR_CLIP: f32 = 0.99;
 
+/// [`SENSOR_CLIP`] relative to the white level the file states, for `raw`'s normalised samples. A CR3 whose white
+/// level the decoder raised to the sensor's saturation point (`white_extension_ev`) still fits its look without the
+/// samples the file calls clipped, so the fit, and every render below the old white level, stays as it was.
+fn sensor_clip(raw: &RawImage) -> f32 {
+    let ev = raw.color.white_extension_ev;
+    if ev.is_finite() && ev > 0.0 { SENSOR_CLIP * (-ev).exp2() as f32 } else { SENSOR_CLIP }
+}
+
 /// [`fit_look_with`] for a photo without Sony's DRO.
 #[cfg(test)]
 fn fit_look(sensor: &Rgb32f, reference: &Rgb32f, clipped: &[bool], colour: Option<(Mat3, Option<HsvTable>)>) -> Option<CameraLook> {
@@ -722,10 +739,10 @@ fn without_clipped(sensor: &Rgb32f, clipped: &[bool]) -> Option<Rgb32f> {
     Some(out)
 }
 
-/// 1 where any channel of a camera-RGB pixel is at or above [`SENSOR_CLIP`], else 0.
-fn clip_mask(camera: &Rgb32f) -> Rgb32f {
+/// 1 where any channel of a camera-RGB pixel is at or above `clip` ([`sensor_clip`]), else 0.
+fn clip_mask(camera: &Rgb32f, clip: f32) -> Rgb32f {
     let mut mask = camera.clone();
-    mask.map_in_place(|p| if p.iter().any(|v| *v >= SENSOR_CLIP) { [1.0; 3] } else { [0.0; 3] });
+    mask.map_in_place(|p| if p.iter().any(|v| *v >= clip) { [1.0; 3] } else { [0.0; 3] });
     mask
 }
 
@@ -1121,7 +1138,7 @@ fn proxies(
     let edge = (2 * size).max(384) as u32;
     let decoded = crate::files::decode_raw_preview(
         bytes,
-        lcc_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: FIT_PREVIEW_MAX_PIXELS },
+        lcc_codecs::DecodeOptions { max_size: Some((edge, edge)), max_pixels: FIT_PREVIEW_MAX_PIXELS, ..Default::default() },
         None,
     )?;
     let (a, crop) = (raw.active_area, raw.crop.clipped(raw.active_area.width, raw.active_area.height));
@@ -1151,7 +1168,7 @@ fn proxies(
     // Fixed, bounded proxy: the selected look cannot depend on thumbnail/export resolution.
     let k = (crop.width.max(crop.height).div_ceil(edge as usize).max(2)).div_ceil(2) * 2;
     let mut sensor = sensor_proxy(raw, k, edge as usize)?;
-    let mut clipped = clip_mask(&sensor);
+    let mut clipped = clip_mask(&sensor, sensor_clip(raw));
     // The camera may have corrected its JPEG with the lens warp the file carries (Nikon Z lenses always, at up to 9 %
     // zoom; other cameras when their correction setting is on): the sensor moved into that geometry is a candidate,
     // kept below when it lines up with the JPEG better than the uncorrected one.
@@ -1533,7 +1550,7 @@ fn into_lens_geometry(img: &Rgb32f, raw: &RawImage, k: usize, lens: &LensGeometr
 }
 
 fn sensor_proxy(raw: &RawImage, k: usize, edge: usize) -> Option<Rgb32f> {
-    Some(match raw.develop_binned(k, SENSOR_CLIP).ok()? {
+    Some(match raw.develop_binned(k, sensor_clip(raw)).ok()? {
         Some(sensor) => sensor,
         // Lens opcodes cannot be applied to a binned mosaic: they are defined at full resolution.
         None if (raw.cpp == 3 && raw.cfa.is_none()) || (raw.format == RawFormat::Dng && !raw.opcodes.list3.is_empty()) => {
@@ -2676,6 +2693,29 @@ fn fit_tone_conditional(mut pairs: Vec<(f64, f64)>) -> Option<CameraTone> {
 
 #[cfg(test)]
 mod tests {
+    /// A raw whose white level the decoder raised to the sensor's saturation point (a CR3, issue #2053) fits its look
+    /// without the samples the file calls clipped, as it did before the raise.
+    #[test]
+    fn samples_at_the_stated_white_level_stay_clipped_after_the_white_level_is_raised() {
+        let bytes = crate::tests_xmp::synthetic_dng_with(None, Default::default());
+        let mut raw = lcc_raw::decode(&bytes).unwrap();
+        let (black, stated) = (raw.black.mean(), raw.white_at(0));
+        raw.data = lcc_raw::RawData::U16(vec![stated as u16; raw.width * raw.height]);
+        let clipped_share = |raw: &RawImage| {
+            let mask = super::clip_mask(&super::sensor_proxy(raw, 2, 32).unwrap(), super::sensor_clip(raw));
+            mask.data.iter().filter(|p| p[0] == 1.0).count() as f64 / mask.data.len() as f64
+        };
+        assert_eq!(clipped_share(&raw), 1.0);
+        // the decoder's raise (`extend_white_to_saturation`): a white level 0.3 EV higher, the change in the baseline
+        // exposure and recorded as the white extension
+        raw.white = vec![black + (stated - black) * 0.3f32.exp2()];
+        raw.color.baseline_exposure += 0.3;
+        raw.color.white_extension_ev = 0.3;
+        assert_eq!(clipped_share(&raw), 1.0);
+        raw.color.white_extension_ev = 0.0;
+        assert_eq!(clipped_share(&raw), 0.0, "without the record the old white level reads as unclipped light");
+    }
+
     use super::*;
 
     fn steep_toe_scene() -> (Rgb32f, Rgb32f) {
@@ -3500,8 +3540,15 @@ mod tests {
         );
         assert!(asked, "Auto fits the JPEG before the spectral colour");
 
-        // no spectral colour for the model: Colorimetric is Auto
+        // no spectral colour, but a dcraw row: Colorimetric starts from it without the JPEG
         let mut raw = raw_of(RawFormat::Nef, "NIKON CORPORATION", "NIKON D3", Default::default());
+        assert_eq!(colorimetric_camera(&raw).map(|e| e.provenance.source), Some(lcc_camdb::Source::Dcraw));
+        let (_, t, look) =
+            starting_colour_with(&mut raw, CameraColour::Colorimetric, |_, _| panic!("Colorimetric never fits the JPEG"), |_, _| None, |_, _| None);
+        assert!(!t.matrix_is_fallback && look.is_none(), "dcraw's matrix gives the colour");
+
+        // no colorimetric matrices at all for the model: Colorimetric is Auto
+        let mut raw = raw_of(RawFormat::Nef, "NIKON CORPORATION", "NIKON Z 99", Default::default());
         assert!(colorimetric_camera(&raw).is_none());
         let mut asked = false;
         let (_, t, _) = starting_colour_with(
@@ -3548,7 +3595,7 @@ mod tests {
         assert!(!t.matrix_is_fallback);
         assert_eq!(xy, lcc_raw::color::as_shot_white_xy(&raw));
 
-        let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 7D", Default::default());
+        let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 7Z", Default::default());
         let (_, t, look) = starting_colour_with(
             &mut raw,
             CameraColour::Auto,
@@ -3605,10 +3652,19 @@ mod tests {
         assert_eq!(traced(&mut raw, None, None, false, None), StartTrace { colour: ColourSource::NeutralFallback, tone: ToneSource::None });
     }
 
-    /// Step 5: a camera outside the table whose fit fails keeps the neutral fallback.
+    /// Step 5: a camera outside every table whose fit fails keeps the neutral fallback; one in dcraw's table takes its
+    /// matrix.
     #[test]
     fn a_camera_outside_the_table_keeps_the_fallback() {
+        // a model only dcraw's table covers takes its matrix after the failed fit, not the fallback
         let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 7D", Default::default());
+        let mut trace = StartTrace::default();
+        let entry = lcc_camdb::find(Some("Canon"), "Canon EOS 7D");
+        assert_eq!(entry.as_ref().map(|e| e.provenance.source), Some(lcc_camdb::Source::Dcraw));
+        let (_, t, _) = starting_colour_traced_from(&mut raw, entry, CameraColour::Auto, |_, _| (None, false), |_, _| None, |_, _| None, &mut trace);
+        assert!(!t.matrix_is_fallback, "dcraw's matrix, not the neutral fallback");
+        assert!(matches!(&trace.colour, ColourSource::Database { provenance, .. } if provenance.contains("Dcraw")), "{trace:?}");
+        let mut raw = raw_of(RawFormat::Cr2, "Canon", "Canon EOS 7Z", Default::default());
         let (_, t, look) = starting_colour(&mut raw, &[], None, None, CameraColour::Auto, false);
         assert!(look.is_none() && t.matrix_is_fallback);
         assert_eq!(raw.color, lcc_raw::ColorData::default());
@@ -3654,7 +3710,7 @@ mod tests {
         assert_eq!(lcc_raw::spectral::find(Some("SONY"), "ILCE-1M2"), None);
         assert_eq!(lcc_catalog::relative_wb_camera("ARW", "SONY ILCE-1M2"), !lcc_raw::kelvin_presets::covers(Some("SONY"), "ILCE-1M2"));
         // the same failure outside ARW keeps the neutral fallback
-        let mut raw = raw_of(RawFormat::Nef, "NIKON CORPORATION", "NIKON D3", Default::default());
+        let mut raw = raw_of(RawFormat::Nef, "NIKON CORPORATION", "NIKON D3Z", Default::default());
         let (_, t, _) = starting_colour_with(&mut raw, CameraColour::Auto, |_, _| (None, false), |_, _| None, |_, _| None);
         assert!(t.matrix_is_fallback);
         assert_eq!(raw.color, lcc_raw::ColorData::default());
@@ -5274,7 +5330,7 @@ mod tests {
         assert!(tone(RawFormat::Cr3, "Canon EOS R5 Mark II", &[], true, &None).is_none());
         let fitted = dro_test_look(&std::array::from_fn(|i| 0.006 * 1.13f32.powi(i as i32)), &|x| x.sqrt());
         assert!(tone(RawFormat::Cr3, "Canon EOS R5 Mark II", &[], false, &Some(fitted)).is_none());
-        assert!(tone(RawFormat::Cr3, "Canon EOS 7D", &[], false, &None).is_none());
+        assert!(tone(RawFormat::Cr3, "Canon EOS 7Z", &[], false, &None).is_none());
         assert!(tone(RawFormat::Cr2, "Canon EOS 600D", &[], false, &None).is_none());
     }
 

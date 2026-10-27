@@ -29,10 +29,16 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("ILCA-99M2", include_str!("../../../assets/camera-profiles/ILCA-99M2.json")),
     ("ILCE-7CR", include_str!("../../../assets/camera-profiles/ILCE-7CR.json")),
     ("ILCE-7M4", include_str!("../../../assets/camera-profiles/ILCE-7M4.json")),
+    ("ILCE-7RM5", include_str!("../../../assets/camera-profiles/ILCE-7RM5.json")),
     ("NIKON D5300", include_str!("../../../assets/camera-profiles/NIKON_D5300.json")),
     ("NIKON D750", include_str!("../../../assets/camera-profiles/NIKON_D750.json")),
     ("NIKON D780", include_str!("../../../assets/camera-profiles/NIKON_D780.json")),
     ("NIKON D90", include_str!("../../../assets/camera-profiles/NIKON_D90.json")),
+    ("NIKON D70", include_str!("../../../assets/camera-profiles/NIKON_D70.json")),
+    ("NIKON D700", include_str!("../../../assets/camera-profiles/NIKON_D700.json")),
+    ("X-T1", include_str!("../../../assets/camera-profiles/X-T1.json")),
+    ("X100T", include_str!("../../../assets/camera-profiles/X100T.json")),
+    ("X20", include_str!("../../../assets/camera-profiles/X20.json")),
     ("NIKON Z 6_2", include_str!("../../../assets/camera-profiles/NIKON_Z_6_2.json")),
     ("NIKON Z 8", include_str!("../../../assets/camera-profiles/NIKON_Z_8.json")),
     ("X-H2S", include_str!("../../../assets/camera-profiles/X-H2S.json")),
@@ -197,6 +203,14 @@ fn cache_key_for(directory: Option<&Path>) -> u64 {
     for (model, json) in BUNDLED {
         h.str(model).str(json);
     }
+    for (name, json) in lcc_camdb::calibration::embedded_files() {
+        h.str(name).str(json);
+    }
+    for p in dev_calibrations_dir().map(|d| json_files(&d)).unwrap_or_default() {
+        let meta = std::fs::metadata(&p).ok();
+        let modified = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+        h.str(&p.to_string_lossy()).u64(meta.map_or(0, |m| m.len())).u64(modified.as_secs()).u64(u64::from(modified.subsec_nanos()));
+    }
     h.finish().0 as u64
 }
 
@@ -279,7 +293,54 @@ pub fn install_dcps() {
         }
         lcc_raw::dcp::install(list);
         lcc_raw::dcp::install_library(library_dcps());
+        lcc_raw::dcp::install_calibrated(calibrations().iter().map(lcc_camdb::calibration::Calibration::calibrated).collect());
     });
+}
+
+/// Folder of calibration files under development (debug and test builds only): `{ENV_PREFIX}_CAMERA_CALIBRATIONS`.
+fn dev_calibrations_dir() -> Option<PathBuf> {
+    if cfg!(debug_assertions) { lcc_brand::env_os("CAMERA_CALIBRATIONS").map(PathBuf::from) } else { None }
+}
+
+/// The `.json` files in `dir`, sorted.
+fn json_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> =
+        entries.flatten().map(|e| e.path()).filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json"))).collect();
+    paths.sort();
+    paths
+}
+
+/// Calibration files in `dir` (damaged ones skipped with a warning).
+fn load_calibrations(dir: &Path) -> Vec<lcc_camdb::calibration::Calibration> {
+    json_files(dir)
+        .into_iter()
+        .filter_map(|p| {
+            let read = std::fs::metadata(&p)
+                .map_err(|e| e.to_string())
+                .and_then(|m| if m.len() > lcc_camdb::calibration::MAX_FILE as u64 { Err("too large".to_string()) } else { Ok(()) })
+                .and_then(|()| std::fs::read_to_string(&p).map_err(|e| e.to_string()))
+                .and_then(|t| lcc_camdb::calibration::Calibration::parse(&t).map_err(|e| e.to_string()));
+            read.inspect_err(|e| log::warn!("ignoring camera calibration {}: {e}", p.display())).ok()
+        })
+        .collect()
+}
+
+/// The bundled calibrations, with a development file for the same camera replacing the bundled one.
+fn calibrations() -> Vec<lcc_camdb::calibration::Calibration> {
+    merge_calibrations(lcc_camdb::calibration::embedded().to_vec(), dev_calibrations_dir().map(|d| load_calibrations(&d)).unwrap_or_default())
+}
+
+fn merge_calibrations(
+    mut list: Vec<lcc_camdb::calibration::Calibration>,
+    dev: Vec<lcc_camdb::calibration::Calibration>,
+) -> Vec<lcc_camdb::calibration::Calibration> {
+    // a development calibration replaces the bundled one for the same camera and editor; other editors' stay
+    for c in dev {
+        list.retain(|b| !(b.editor == c.editor && b.matches(Some(&c.make), &c.model)));
+        list.push(c);
+    }
+    list
 }
 
 /// Replace `color` with the colour model a photo's camera-profile choice names (see
@@ -376,6 +437,42 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn calibration(model: &str, look: &str) -> lcc_camdb::calibration::Calibration {
+        use lcc_camdb::calibration as c;
+        let fm = Mat3([[0.70, 0.18, 0.08], [0.28, 0.80, -0.08], [0.02, -0.15, 0.95]]);
+        let cm = Mat3([[0.9, -0.3, -0.05], [-0.5, 1.4, 0.1], [-0.1, 0.3, 0.6]]);
+        c::Calibration {
+            version: c::VERSION,
+            make: "TESTMAKE".into(),
+            model: model.into(),
+            aliases: vec![],
+            editor: c::Editor::Lightroom,
+            method: c::METHOD.into(),
+            tool_version: "1".into(),
+            contributor: None,
+            licence: c::LICENCE.into(),
+            camera: c::CameraModel { illuminants: [17, 21], color_matrix: [cm, cm], forward_matrix: [fm, fm], hue_sat_map: None },
+            looks: vec![c::Look { name: look.into(), baseline_exposure_offset: 0.0, look_table: None, tone_curve: vec![] }],
+            evidence: c::Evidence { photos: 10, samples: 100, hue_coverage: 0.5, ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn dev_calibrations_skip_damaged_files_and_replace_bundled_ones() {
+        let dir = std::env::temp_dir().join(format!("lc-calibrations-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = calibration("CAM ONE", "Dev Look");
+        std::fs::write(dir.join("good.json"), good.to_json().unwrap()).unwrap();
+        std::fs::write(dir.join("bad.json"), "{\"version\": 1").unwrap();
+        let loaded = load_calibrations(&dir);
+        assert_eq!(loaded, vec![good.clone()]);
+        let merged = merge_calibrations(vec![calibration("CAM ONE", "Bundled"), calibration("CAM TWO", "Other")], loaded);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().any(|c| c.model == "CAM ONE" && c.looks[0].name == "Dev Look"));
+        assert!(merged.iter().all(|c| c.looks[0].name != "Bundled"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn profile() -> CameraProfile {
         let table = HsvTable { hue_divisions: 4, sat_divisions: 2, val_divisions: 1, data: vec![[5.0, 1.2, 1.0]; 8], srgb_value: false };

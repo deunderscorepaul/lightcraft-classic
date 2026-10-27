@@ -46,7 +46,8 @@ mod webp;
 
 pub use encode::{
     ChromaSubsampling, EncodeImage, EncodeMeta, HDR_REFERENCE_WHITE_NITS, HLG_REFERENCE_PEAK_NITS, HdrTransfer, Samples, TiffCompression,
-    encode_avif, encode_avif_hdr, encode_avif_pq, encode_jpeg, encode_png, encode_png_pq, encode_psd, encode_tiff, encode_webp_lossless, hlg_signal,
+    encode_avif, encode_avif_hdr, encode_avif_pq, encode_jpeg, encode_png, encode_png_pq, encode_psd, encode_tiff, encode_tiff_associated,
+    encode_webp_lossless, hlg_signal,
 };
 pub use jxl_encode::{JxlColour, JxlEffort, JxlOptions, encode_jxl};
 pub use sniff::{Format, sniff};
@@ -84,13 +85,29 @@ pub struct DecodeOptions {
     /// Fit the result within this box (never upscales). JPEG uses DCT-domain scaling (1/2, 1/4,
     /// 1/8) before a final linear-light resample; other formats decode fully then resample.
     pub max_size: Option<(u32, u32)>,
-    /// Refuse images with more pixels than this (default 1 Gpx).
+    /// Refuse images with more pixels than this (default [`DEFAULT_MAX_PIXELS`], 512 MP).
     pub max_pixels: u64,
+    /// Refuse images whose samples, in the file's own layout (before conversion to float), need more
+    /// bytes than this (default [`DEFAULT_MAX_BYTES`], 4 GiB): the buffer a format decoder allocates
+    /// from the header alone, which a few-KB compressed file can make huge (issues #2116, #2125).
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: u64,
+}
+
+/// Default [`DecodeOptions::max_pixels`]: 512 MP, the largest image Lightroom Classic opens (65,000 px
+/// a side and 512 megapixels), so every file it reads is in range.
+pub const DEFAULT_MAX_PIXELS: u64 = 512_000_000;
+
+/// Default [`DecodeOptions::max_bytes`]: 4 GiB, a 512 MP image at 8 bytes a pixel (RGBA, 16 bits).
+pub const DEFAULT_MAX_BYTES: u64 = 4 << 30;
+
+fn default_max_bytes() -> u64 {
+    DEFAULT_MAX_BYTES
 }
 
 impl Default for DecodeOptions {
     fn default() -> Self {
-        DecodeOptions { max_size: None, max_pixels: 1 << 30 }
+        DecodeOptions { max_size: None, max_pixels: DEFAULT_MAX_PIXELS, max_bytes: DEFAULT_MAX_BYTES }
     }
 }
 
@@ -191,8 +208,9 @@ pub struct Header {
 
 /// Read the stored dimensions and orientation of any format [`decode`] supports, agreeing with
 /// what a decode reports, without decoding pixels: JPEG, PNG, TIFF, WebP, PSD, HEIF and AVIF are read
-/// from their headers (markers, chunks, IFD, resources, boxes). GIF, BMP and JPEG XL fall back to
-/// a small decode.
+/// from their headers (markers, chunks, IFD, resources, boxes); GIF and BMP from theirs (a small one
+/// also has its pixel data checked); JPEG XL from its codestream, with its frames parsed but never
+/// rendered (upstream #2182).
 ///
 /// The header readers also refuse what a decode would refuse before reaching the pixels (an
 /// unsupported layout, compression or frame type) and files whose image data is cut short
@@ -218,7 +236,10 @@ pub fn read_header_unguarded(bytes: &[u8], format: Format) -> Result<Header> {
         Format::Heif => heif::header(bytes)?,
         #[cfg(not(target_arch = "wasm32"))]
         Format::Avif => avif::header(bytes)?,
-        // rare here (or, for JPEG XL, without a header reader yet): a small decode, as before
+        Format::Gif | Format::Bmp => other::header(bytes, format)?,
+        #[cfg(feature = "jxl")]
+        Format::Jxl => jxl::header(bytes)?,
+        // what a decode refuses outright (not decodable in this build)
         _ => {
             let d = decode_unguarded(bytes, format, &DecodeOptions::fit(64, 64))?;
             (d.source_width, d.source_height, d.orientation)
@@ -226,6 +247,10 @@ pub fn read_header_unguarded(bytes: &[u8], format: Format) -> Result<Header> {
     };
     Ok(Header { format, width, height, orientation })
 }
+
+/// GIF and BMP images up to this many pixels have their pixel data read by [`read_header`] (a 16 MB
+/// scratch buffer at most).
+pub const HEADER_CHECK_PIXELS: u64 = 1 << 22;
 
 /// Decode a JPEG preview with its enclosing container's colour space as a fallback.
 /// A JPEG carrying ICC or EXIF metadata keeps its own interpretation. The fallback is applied
@@ -259,13 +284,42 @@ pub fn decode_unguarded(bytes: &[u8], format: Format, opts: &DecodeOptions) -> R
         Format::Avif => unsupported(),
         Format::RawTiffLike | Format::RawOther => unsupported(),
     }?;
-    // an image with no pixels (a malformed header claiming zero width or height, or a buffer
-    // shorter than its size) is refused here, so nothing downstream sees an empty image
-    let (w, h) = (d.image.width, d.image.height);
-    if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|n| d.image.data.len() < n) {
+    check_has_pixels(format, &d.image)?;
+    Ok(d)
+}
+
+/// An image with no pixels (a malformed header claiming zero width or height, a `w × h` that
+/// overflows, or a buffer shorter than its size) is refused, so nothing downstream sees an empty
+/// image.
+fn check_has_pixels(format: Format, image: &Rgb32f) -> Result<()> {
+    let (w, h) = (image.width, image.height);
+    if w == 0 || h == 0 || w.checked_mul(h).is_none_or(|n| image.data.len() < n) {
         return Err(Error::Malformed(format, "image has no pixels".into()));
     }
-    Ok(d)
+    Ok(())
+}
+
+#[cfg(test)]
+mod has_pixels_tests {
+    use super::*;
+
+    fn image(width: usize, height: usize, len: usize) -> Rgb32f {
+        Rgb32f { width, height, data: vec![[0.0; 3]; len] }
+    }
+
+    #[test]
+    fn decoded_image_without_pixels_is_refused() {
+        for (w, h, len) in [(0, 4, 0), (4, 0, 0), (usize::MAX, 2, 1), (4, 4, 15)] {
+            let r = check_has_pixels(Format::Png, &image(w, h, len));
+            assert!(matches!(r, Err(Error::Malformed(Format::Png, _))), "{w}x{h} with {len} pixels");
+        }
+    }
+
+    #[test]
+    fn decoded_image_with_all_pixels_is_accepted() {
+        assert!(check_has_pixels(Format::Png, &image(4, 4, 16)).is_ok());
+        assert!(check_has_pixels(Format::Png, &image(1, 1, 1)).is_ok());
+    }
 }
 
 /// Convert a decode result to linear Rec.2020 D65 (Bradford-adapted), the develop working space.
@@ -287,6 +341,27 @@ pub fn to_working(d: &Decoded) -> Rgb32f {
         }
     }
     img
+}
+
+/// Undo [`to_working`]'s flatten onto white for an output that keeps transparency (issue #2976):
+/// the straight colour `c` from the flattened `f = c·a + (1 − a)` and the alpha `a` it was flattened
+/// with. Exact in linear light, and after any linear resample of both (fitting, orienting), where it
+/// gives the alpha-weighted colour. Pixels with almost no alpha keep the white: their colour is not
+/// recoverable, and white is what edits around them saw before. `None` when `alpha` does not match
+/// `img`.
+pub fn unflatten(img: &Rgb32f, alpha: &Plane) -> Option<Rgb32f> {
+    if (alpha.width, alpha.height) != (img.width, img.height) || alpha.data.len() != img.data.len() {
+        return None;
+    }
+    const VISIBLE: f32 = 1.0 / 1024.0;
+    let mut out = img.clone();
+    for (p, &av) in out.data.iter_mut().zip(&alpha.data) {
+        if av.is_finite() && av >= VISIBLE {
+            let av = av.min(1.0);
+            *p = p.map(|f| (f - (1.0 - av)) / av);
+        }
+    }
+    Some(out)
 }
 
 /// Where a thumbnail came from.
@@ -351,7 +426,7 @@ pub fn decode_thumbnail_with(bytes: &[u8], opts: &ThumbnailOptions) -> Result<Th
     {
         return Ok(t);
     }
-    let d = decode(bytes, DecodeOptions { max_size: Some((max_edge, max_edge)), max_pixels: opts.max_pixels })?;
+    let d = decode(bytes, DecodeOptions { max_size: Some((max_edge, max_edge)), max_pixels: opts.max_pixels, ..Default::default() })?;
     Ok(Thumbnail {
         image: d.to_srgb8(),
         orientation: d.orientation,

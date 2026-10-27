@@ -2,7 +2,7 @@
   description = "Photo library and non-destructive raw developer, in pure Rust";
 
   inputs = {
-    # The app needs edition 2024 and rustc ≥ 1.90, so the flake tracks unstable. Consumers on a
+    # The app needs edition 2024 and rustc ≥ 1.95, so the flake tracks unstable. Consumers on a
     # release channel can retarget it: `inputs.<this-flake>.inputs.nixpkgs.follows = "nixpkgs";`
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -12,7 +12,7 @@
     # glyphs. Pinned to the revision the release workflow uses — bump deliberately
     # (`nix flake update craft-fonts`); craftrules standards/fonts.md.
     craft-fonts = {
-      url = "github:storytold/craft-fonts/3d9ab3a132ed0eff457e424226a435a901da30d3";
+      url = "github:storytold/craft-fonts/b4ce3ee090ea4b06791e9501ea2f8e6f746d5cd3";
       flake = false;
     };
   };

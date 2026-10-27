@@ -1,20 +1,22 @@
 //! The Plugin Manager: installed plug-ins, their grants, enabled state, logs and data.
 //!
 //! On disk (a folder, usually `<settings>/plugins`): `<id>.wasm` per plug-in, `plugins.json` with
-//! each plug-in's `{enabled, grant}`, and `data/<id>.json`, its metadata namespace. A manager
+//! each plug-in's `{enabled, grant}`, `data/<id>.json`, its metadata namespace (per library), and
+//! `settings/<id>.json`, its settings and remembered dialog values (for the whole app). A manager
 //! without a folder keeps everything in memory (tests, the web build).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::context::{CallContext, HostApi};
-use crate::manifest::dialog_args;
+use crate::manifest::{Field, dialog_args, parse_version};
 use crate::permissions::Permissions;
 use crate::runtime::{Limits, Plugin};
+use crate::settings::{SettingsStore, command_scope, destination_scope};
 use crate::store::{NamespaceStore, write_atomic};
 use crate::{Error, Result};
 
@@ -24,6 +26,8 @@ const MAX_LOG: usize = 500;
 const MAX_PLUGINS: usize = 256;
 /// Most photos / files one hook request carries.
 const MAX_BATCH: usize = 10_000;
+/// Longest message a `prepare` hook may show.
+const MAX_PREPARE_MESSAGE: usize = 4096;
 
 /// One installed plug-in.
 #[derive(Debug)]
@@ -34,6 +38,8 @@ pub struct Installed {
     pub grant: Permissions,
     pub log: VecDeque<String>,
     store: Option<NamespaceStore>,
+    /// Its settings and remembered dialog values (shared with a call running off the lock).
+    settings: Arc<Mutex<SettingsStore>>,
     /// A call is running off the manager's lock ([`Manager::begin`] … [`Manager::end`]): its store is lent to it.
     busy: bool,
 }
@@ -56,12 +62,41 @@ impl Installed {
         let m = self.plugin.manifest();
         json!({
             "id": m.id, "name": m.name, "version": m.version, "description": m.description, "author": m.author,
+            "requires": m.requires,
             "enabled": self.enabled, "size": self.plugin.size(),
             "requested": m.permissions, "granted": self.effective(),
             "commands": m.commands, "hooks": m.hooks, "publish": m.publish,
             "exportDestinations": m.export_destinations, "metadataFields": m.metadata_fields,
+            "settings": m.settings,
         })
     }
+
+    fn settings(&self) -> std::sync::MutexGuard<'_, SettingsStore> {
+        self.settings.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A plug-in's settings as its page shows them ([`Manager::settings`]).
+#[derive(Debug, Clone)]
+pub struct SettingsView {
+    /// The manifest's settings fields, as the `settings.prepare` hook prepared them.
+    pub fields: Vec<Field>,
+    /// Per field, the stored value when the field (as prepared) takes it, else its default.
+    pub values: serde_json::Map<String, Value>,
+    /// Why the prepare step failed (the fields are then as declared).
+    pub error: Option<String>,
+}
+
+/// What a command's `prepare` step decided ([`Manager::prepare_command`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Prepared {
+    /// Show the dialog with these fields (the manifest's, with the options and defaults the
+    /// plug-in gave). `error`: the prepare step failed, and these are the manifest's own fields.
+    Dialog { fields: Vec<Field>, error: Option<String> },
+    /// Run the command at once with these arguments, without the dialog.
+    Run(Value),
+    /// Show this message and run nothing.
+    Message(String),
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -70,7 +105,7 @@ struct State {
     plugins: BTreeMap<String, Entry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Entry {
     enabled: bool,
     grant: Permissions,
@@ -83,8 +118,11 @@ pub struct PendingCall {
     plugin: Arc<Plugin>,
     perms: Permissions,
     store: NamespaceStore,
+    settings: Arc<Mutex<SettingsStore>>,
     request: Value,
     lent: Vec<PathBuf>,
+    /// A prepare step: its host calls may read, never write.
+    read_only: bool,
 }
 
 impl PendingCall {
@@ -95,21 +133,75 @@ impl PendingCall {
 
     /// Runs the call (the plug-in's code: possibly long, e.g. an upload).
     pub fn run(&mut self, host: &mut dyn HostApi) -> crate::Outcome {
-        let mut ctx = CallContext { perms: &self.perms, lent: &self.lent, host, store: &mut self.store };
-        self.plugin.invoke(&self.request, &mut ctx)
+        let plugin = self.plugin.clone();
+        let mut ctx = CallContext {
+            perms: &self.perms,
+            lent: &self.lent,
+            host,
+            store: &mut self.store,
+            settings: &self.settings,
+            fields: &plugin.manifest().settings,
+            read_only: self.read_only,
+        };
+        plugin.invoke(&self.request, &mut ctx)
+    }
+}
+
+/// A module in the plug-in folder that didn't load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failed {
+    pub file: String,
+    pub error: String,
+    /// The host features it requires that this version lacks (empty: it failed for another reason).
+    pub missing: Vec<String>,
+    /// The plug-in's id, to remove it by ([`Manager::uninstall`]): its manifest's when that could be
+    /// read, else the file's name without `.wasm` (installed modules are `<id>.wasm`). Empty: not a
+    /// module in the folder.
+    pub id: String,
+    /// The module file, deleted when the plug-in is removed.
+    pub path: Option<PathBuf>,
+}
+
+impl Failed {
+    /// A failure that isn't a module in the folder (the folder itself couldn't be opened).
+    pub fn new(file: String, error: String) -> Failed {
+        Failed { file, error, missing: Vec::new(), id: String::new(), path: None }
     }
 }
 
 /// The set of installed plug-ins.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Manager {
     dir: Option<PathBuf>,
     limits: Limits,
+    /// The host features plug-ins may require ([`crate::HOST_FEATURES`]).
+    features: Vec<String>,
     plugins: BTreeMap<String, Installed>,
-    /// `(file, error)` for modules in the folder that failed to load.
-    pub failed: Vec<(String, String)>,
+    /// Modules in the folder that failed to load.
+    pub failed: Vec<Failed>,
+    /// `plugins.json` entries of modules that didn't load, written back unchanged, so a plug-in that
+    /// loads again (the app updated, the module replaced) keeps its enabled state and grant.
+    kept: BTreeMap<String, Entry>,
+    /// The versions of modules that didn't load because they need features this version lacks, by
+    /// id: installing an older one over them is still a downgrade.
+    unloaded: BTreeMap<String, String>,
     /// The open library's id: plug-in data is kept per library (photo ids are per library).
     library: String,
+}
+
+impl Default for Manager {
+    fn default() -> Self {
+        Manager {
+            dir: None,
+            limits: Limits::default(),
+            features: crate::HOST_FEATURES.iter().map(|f| f.to_string()).collect(),
+            plugins: BTreeMap::new(),
+            failed: Vec::new(),
+            kept: BTreeMap::new(),
+            unloaded: BTreeMap::new(),
+            library: String::new(),
+        }
+    }
 }
 
 impl Manager {
@@ -121,6 +213,11 @@ impl Manager {
     /// Opens the plug-in folder `dir` (created when missing) and loads every installed module;
     /// a module that fails to load is listed in [`Manager::failed`] and skipped.
     pub fn open(dir: &Path) -> Result<Manager> {
+        Manager::open_with_features(dir, crate::HOST_FEATURES)
+    }
+
+    /// [`Manager::open`] for a host that has `features` (tests; the app has [`crate::HOST_FEATURES`]).
+    pub fn open_with_features(dir: &Path, features: &[&str]) -> Result<Manager> {
         let io = |e: std::io::Error| Error::Io(format!("{}: {e}", dir.display()));
         std::fs::create_dir_all(dir).map_err(io)?;
         let state: State = match std::fs::read(dir.join("plugins.json")) {
@@ -131,6 +228,7 @@ impl Manager {
             Err(_) => State::default(),
         };
         let mut m = Manager { dir: Some(dir.to_path_buf()), ..Manager::default() };
+        m.set_features(features);
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .map_err(io)?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -139,17 +237,97 @@ impl Manager {
         files.sort();
         files.truncate(MAX_PLUGINS);
         for f in files {
-            match read_module(&f, &m.limits).and_then(|b| Plugin::load(&b, m.limits.clone())) {
-                Ok(p) => {
-                    let id = p.id().to_string();
-                    // not in plugins.json (copied in by hand): disabled, nothing granted
-                    let (enabled, grant) = state.plugins.get(&id).map_or((false, Permissions::default()), |e| (e.enabled, e.grant.clone()));
-                    m.plugins.insert(id, Installed { plugin: Arc::new(p), enabled, grant, log: VecDeque::new(), store: None, busy: false });
+            let file = f.display().to_string();
+            // installed modules are `<id>.wasm`: the id when the manifest can't be read
+            let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let loaded = read_module(&f, &m.limits).and_then(|b| Plugin::load(&b, m.limits.clone()));
+            let p = match loaded {
+                Ok(p) => p,
+                Err(e) => {
+                    m.keep(&state, &stem);
+                    m.failed.push(Failed { file, error: e.to_string(), missing: Vec::new(), id: stem, path: Some(f) });
+                    continue;
                 }
-                Err(e) => m.failed.push((f.display().to_string(), e.to_string())),
+            };
+            let id = p.id().to_string();
+            let missing = p.manifest().missing_features(&m.features);
+            if !missing.is_empty() {
+                // the app was downgraded: keep its grant and data for when it's updated again
+                m.keep(&state, &id);
+                m.unloaded.insert(id.clone(), p.manifest().version.clone());
+                m.failed.push(Failed { file, error: Error::Unsupported(missing.clone()).to_string(), missing, id, path: Some(f) });
+                continue;
             }
+            // not in plugins.json (copied in by hand): disabled, nothing granted
+            let (enabled, grant) = state.plugins.get(&id).map_or((false, Permissions::default()), |e| (e.enabled, e.grant.clone()));
+            let mut log = VecDeque::new();
+            if let Err(e) = p.manifest().semver() {
+                log.push_back(format!("loaded without a valid version ({e}); installing a new version will need one"));
+            }
+            let (settings, damaged) = m.open_settings(&id);
+            log.extend(damaged);
+            m.plugins.insert(id, Installed { plugin: Arc::new(p), enabled, grant, log, store: None, settings, busy: false });
         }
         Ok(m)
+    }
+
+    /// Plug-in `id`'s settings: from its file, or in memory without a folder. A damaged file gives
+    /// the defaults and a log line (also returned, for the plug-in's log).
+    fn open_settings(&self, id: &str) -> (Arc<Mutex<SettingsStore>>, Option<String>) {
+        let (store, damaged) = match &self.dir {
+            Some(d) => SettingsStore::open(SettingsStore::path_in(d, id)),
+            None => (SettingsStore::in_memory(), None),
+        };
+        let damaged = damaged.map(|e| {
+            log::warn!("plug-in {id}: settings: {e}");
+            format!("settings: {e}")
+        });
+        (Arc::new(Mutex::new(store)), damaged)
+    }
+
+    /// Keeps `id`'s `plugins.json` entry from `state` (its module didn't load).
+    fn keep(&mut self, state: &State, id: &str) {
+        if let Some(e) = state.plugins.get(id) {
+            self.kept.insert(id.to_string(), e.clone());
+        }
+    }
+
+    /// The host features plug-ins may require (default [`crate::HOST_FEATURES`]). Affects installs
+    /// from now on; [`Manager::open_with_features`] sets them for loading.
+    pub fn set_features(&mut self, features: &[&str]) {
+        self.features = features.iter().map(|f| f.to_string()).collect();
+    }
+
+    /// The host features plug-ins may require.
+    pub fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    /// The version of plug-in `id` in the folder: loaded, or kept there because it needs features
+    /// this version lacks.
+    pub fn installed_version(&self, id: &str) -> Option<String> {
+        self.plugins.get(id).map(|i| i.plugin.manifest().version.clone()).or_else(|| self.unloaded.get(id).cloned())
+    }
+
+    /// A plug-in in the folder that didn't load because it needs features this version lacks: its
+    /// version and the grant it keeps.
+    pub fn unloaded(&self, id: &str) -> Option<(String, Permissions)> {
+        let version = self.unloaded.get(id)?.clone();
+        Some((version, self.kept.get(id).map(|e| e.grant.clone()).unwrap_or_default()))
+    }
+
+    /// Why `manifest` can't be installed over what is installed now, as `(missing features,
+    /// version problem, downgrade from)`, for the install dialog ([`Manager::install_bytes`]
+    /// refuses each one; a downgrade only without `allow_downgrade`).
+    pub fn install_check(&self, manifest: &crate::Manifest) -> (Vec<String>, Option<String>, Option<String>) {
+        let missing = manifest.missing_features(&self.features);
+        let new = manifest.semver();
+        let old = self.installed_version(&manifest.id);
+        let downgrade = match (&new, old) {
+            (Ok(new), Some(old)) => parse_version(&old).ok().filter(|o| new.cmp_precedence(o) == std::cmp::Ordering::Less).map(|_| old),
+            _ => None,
+        };
+        (missing, new.err(), downgrade)
     }
 
     /// Limits for plug-ins installed from now on.
@@ -182,37 +360,101 @@ impl Manager {
     /// install dialog. `None` grants nothing new: a fresh install gets no permissions, an update
     /// keeps the previous grant (cut back to what the new version still asks for), so an update
     /// can never gain a capability without the user approving it. The plug-in starts enabled.
-    pub fn install_bytes(&mut self, bytes: &[u8], grant: Option<Permissions>) -> Result<&Installed> {
+    ///
+    /// Refused, with nothing written: a plug-in that requires host features this version lacks, a
+    /// `version` that isn't semver, and a lower version than the installed one unless
+    /// `allow_downgrade` (the same version again is a repair, and allowed).
+    pub fn install_bytes(&mut self, bytes: &[u8], grant: Option<Permissions>, allow_downgrade: bool) -> Result<&Installed> {
         let plugin = Plugin::load(bytes, self.limits.clone())?;
+        let (missing, version, downgrade) = self.install_check(plugin.manifest());
+        if !missing.is_empty() {
+            return Err(Error::Unsupported(missing));
+        }
+        if let Some(e) = version {
+            return Err(Error::Manifest(e));
+        }
+        let new = plugin.manifest().version.clone();
+        if let Some(installed) = &downgrade
+            && !allow_downgrade
+        {
+            return Err(Error::Downgrade { installed: installed.clone(), new });
+        }
         let id = plugin.id().to_string();
-        let previous = self.plugins.get(&id).map(|i| i.grant.clone()).unwrap_or_default();
+        // a module that stopped loading keeps its grant for the version that replaces it
+        let previous = self.plugins.get(&id).map(|i| i.grant.clone()).or_else(|| self.kept.get(&id).map(|e| e.grant.clone())).unwrap_or_default();
         let grant = grant.unwrap_or(previous).intersect(&plugin.manifest().permissions);
         if let Some(dir) = &self.dir {
             write_atomic(&dir.join(format!("{id}.wasm")), bytes)?;
+            let file = dir.join(format!("{id}.wasm")).display().to_string();
+            self.failed.retain(|f| f.file != file);
         }
-        let log = self.plugins.remove(&id).map(|i| i.log).unwrap_or_default();
-        self.plugins.insert(id.clone(), Installed { plugin: Arc::new(plugin), enabled: true, grant, log, store: None, busy: false });
+        self.kept.remove(&id);
+        self.unloaded.remove(&id);
+        let old = self.plugins.remove(&id);
+        let mut log = old.as_ref().map(|i| i.log.clone()).unwrap_or_default();
+        let settings = match old.map(|i| i.settings) {
+            Some(s) => s,
+            None => {
+                let (s, damaged) = self.open_settings(&id);
+                log.extend(damaged);
+                s
+            }
+        };
+        // an update: what the new version no longer declares goes, new settings start at their defaults
+        let pruned = {
+            let mut s = settings.lock().unwrap_or_else(PoisonError::into_inner);
+            s.prune(plugin.manifest());
+            s.save()
+        };
+        if let Err(e) = pruned {
+            log.push_back(format!("settings: {e}"));
+        }
+        self.plugins.insert(id.clone(), Installed { plugin: Arc::new(plugin), enabled: true, grant, log, store: None, settings, busy: false });
         self.save()?;
         self.plugins
             .get_mut(&id)
             .map(|i| {
-                i.push_log(format!("installed version {}", i.plugin.manifest().version));
+                i.push_log(match downgrade {
+                    Some(old) => format!("downgraded from {old} to {new}"),
+                    None => format!("installed version {new}"),
+                });
                 &*i
             })
             .ok_or(Error::NotFound(id))
     }
 
-    /// Reads a `.wasm` file and installs it.
-    pub fn install_file(&mut self, path: &Path, grant: Option<Permissions>) -> Result<&Installed> {
+    /// Reads a `.wasm` file and installs it (see [`Manager::install_bytes`]).
+    pub fn install_file(&mut self, path: &Path, grant: Option<Permissions>, allow_downgrade: bool) -> Result<&Installed> {
         let bytes = read_module(path, &self.limits)?;
-        self.install_bytes(&bytes, grant)
+        self.install_bytes(&bytes, grant, allow_downgrade)
     }
 
-    /// Removes a plug-in, its module and its data.
+    /// Removes a plug-in, its module, its data and its settings.
+    ///
+    /// A plug-in in the folder that didn't load ([`Manager::failed`]: it needs features this version
+    /// lacks, or its module can't be read) is removed the same way, by its id there.
     pub fn uninstall(&mut self, id: &str) -> Result<()> {
-        self.plugins.remove(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        let is_failed = |f: &Failed| !id.is_empty() && f.id == id;
+        if !self.plugins.contains_key(id) && !self.failed.iter().any(is_failed) {
+            return Err(Error::NotFound(id.into()));
+        }
+        // a call still running keeps the store: held while the files go, and forgotten once they
+        // have, it can't write its file back (and if one can't be deleted, it keeps saving)
+        let store = self.plugins.get(id).map(|p| p.settings.clone());
+        let mut store = store.as_ref().map(|s| s.lock().unwrap_or_else(PoisonError::into_inner));
+        // the files first: if one can't be deleted, nothing is forgotten (its entry stays saved)
         if let Some(dir) = &self.dir {
-            for f in [dir.join(format!("{id}.wasm")), dir.join("data").join(format!("{id}.json"))] {
+            let modules: Vec<PathBuf> = self.failed.iter().filter(|f| is_failed(f)).filter_map(|f| f.path.clone()).collect();
+            // the modules before the data: a module that can't be deleted keeps its data too
+            let settings = SettingsStore::path_in(dir, id);
+            let mut bad = settings.clone().into_os_string();
+            bad.push(".bad");
+            let files = std::iter::once(dir.join(format!("{id}.wasm"))).chain(modules).chain([
+                dir.join("data").join(format!("{id}.json")),
+                settings,
+                bad.into(),
+            ]);
+            for f in files {
                 match std::fs::remove_file(&f) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -220,6 +462,14 @@ impl Manager {
                 }
             }
         }
+        if let Some(s) = store.as_mut() {
+            s.forget();
+        }
+        drop(store);
+        self.plugins.remove(id);
+        self.failed.retain(|f| !is_failed(f));
+        self.kept.remove(id);
+        self.unloaded.remove(id);
         self.save()
     }
 
@@ -251,8 +501,9 @@ impl Manager {
 
     fn save(&self) -> Result<()> {
         let Some(dir) = &self.dir else { return Ok(()) };
-        let state =
-            State { plugins: self.plugins.iter().map(|(id, p)| (id.clone(), Entry { enabled: p.enabled, grant: p.grant.clone() })).collect() };
+        let mut plugins = self.kept.clone();
+        plugins.extend(self.plugins.iter().map(|(id, p)| (id.clone(), Entry { enabled: p.enabled, grant: p.grant.clone() })));
+        let state = State { plugins };
         let bytes = serde_json::to_vec_pretty(&state).map_err(|e| Error::Io(e.to_string()))?;
         write_atomic(&dir.join("plugins.json"), &bytes)
     }
@@ -290,8 +541,11 @@ impl Manager {
         let perms = p.effective();
         let plugin = p.plugin.clone();
         let store = p.store.take().unwrap_or_default();
+        let settings = p.settings.clone();
         p.busy = true;
-        Ok(PendingCall { id: id.to_string(), plugin, perms, store, request, lent })
+        // the host builds every request, so a plug-in can't make its prepare step anything else
+        let read_only = matches!(request.get("hook").and_then(Value::as_str), Some("command.prepare" | "settings.prepare"));
+        Ok(PendingCall { id: id.to_string(), plugin, perms, store, settings, request, lent, read_only })
     }
 
     /// Hands a call from [`Manager::begin`] back with how it went (`None`: it never ran, e.g.
@@ -327,7 +581,7 @@ impl Manager {
     /// request and lent files or why it can't be made)`; nothing runs.
     #[allow(clippy::type_complexity)]
     pub fn export_calls(
-        &self,
+        &mut self,
         files: &[Value],
         destination: Option<(&str, &str, &Value)>,
     ) -> Vec<(String, Option<String>, Result<(Value, Vec<PathBuf>)>)> {
@@ -345,25 +599,166 @@ impl Manager {
         out
     }
 
-    fn destination_request(&self, id: &str, destination: &str, args: &Value, files: &[&Value]) -> Result<Value> {
+    /// The destination's request; `args` given (not null) are remembered for its dialog.
+    fn destination_request(&mut self, id: &str, destination: &str, args: &Value, files: &[&Value]) -> Result<Value> {
         let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
         let decl = p
             .plugin
             .manifest()
             .destination(destination)
             .ok_or_else(|| Error::Params(format!("plug-in {id} has no export destination {destination:?}")))?;
-        let args = dialog_args(&decl.dialog, args)?;
-        Ok(json!({"hook": "export.destination", "destination": destination, "args": args, "files": files}))
+        let checked = dialog_args(&decl.dialog, args)?;
+        if !args.is_null() {
+            let fields = decl.dialog.clone();
+            self.remember(id, &destination_scope(destination), &fields, &checked);
+        }
+        Ok(json!({"hook": "export.destination", "destination": destination, "args": checked, "files": files}))
+    }
+
+    /// Keeps the values a dialog ran with; a failure to save them only goes to the plug-in's log.
+    fn remember(&mut self, id: &str, scope: &str, fields: &[Field], args: &Value) {
+        let Some(p) = self.plugins.get_mut(id) else { return };
+        let r = {
+            let mut s = p.settings();
+            s.remember(scope, fields, args).and_then(|_| s.save())
+        };
+        if let Err(e) = r {
+            log::warn!("plug-in {id}: remembering dialog values: {e}");
+            p.push_log(format!("remembering dialog values: {e}"));
+        }
+    }
+
+    /// The values a command's dialog opens with: per field, what it last ran with (when the field
+    /// remembers and still takes it), else its default. `fields`: the dialog as prepared.
+    pub fn command_values(&self, id: &str, command: &str, fields: &[Field]) -> serde_json::Map<String, Value> {
+        self.plugins.get(id).map(|p| p.settings().dialog_values(&command_scope(command), fields)).unwrap_or_default()
+    }
+
+    /// The values an export destination's dialog opens with (see [`Manager::command_values`]).
+    pub fn destination_values(&self, id: &str, destination: &str) -> serde_json::Map<String, Value> {
+        let Some(p) = self.plugins.get(id) else { return Default::default() };
+        let Some(d) = p.plugin.manifest().destination(destination) else { return Default::default() };
+        p.settings().dialog_values(&destination_scope(destination), &d.dialog)
+    }
+
+    /// Asks plug-in `id` how to run `command` on `selection` (`{"hook": "command.prepare"}`) when
+    /// the command declares `prepare`; otherwise its dialog as declared. A prepare step that fails
+    /// (traps, runs out of budget, is disabled or busy, answers something invalid) is logged and
+    /// gives the declared dialog with the error, or the error when that dialog can't be shown (a
+    /// choice whose options only the plug-in can give).
+    pub fn prepare_command(&mut self, id: &str, command: &str, selection: &[String], host: &mut dyn HostApi) -> Result<Prepared> {
+        let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        let decl = p.plugin.manifest().command(command).ok_or_else(|| Error::Params(format!("plug-in {id} has no command {command:?}")))?.clone();
+        if !decl.prepare {
+            return Ok(Prepared::Dialog { fields: decl.dialog, error: None });
+        }
+        let req = json!({"hook": "command.prepare", "command": command, "selection": cap(selection)});
+        let answer = self.invoke(id, &req, host, &[]).and_then(|v| {
+            prepared_answer(&decl.dialog, &v).map_err(|e| {
+                // invoke logged failed calls; an answer that doesn't fit is logged here
+                if let Some(p) = self.plugins.get_mut(id) {
+                    p.push_log(format!("command.prepare: {e}"));
+                }
+                Error::Failed(format!("command.prepare: {e}"))
+            })
+        });
+        match answer {
+            Ok(a) => Ok(a),
+            Err(e) if decl.dialog.iter().any(Field::options_at_run_time) => Err(e),
+            Err(e) => Ok(Prepared::Dialog { fields: decl.dialog, error: Some(e.to_string()) }),
+        }
     }
 
     /// Runs a plug-in's menu command: `args` are checked against its dialog, `selection` are the
-    /// selected photo ids.
+    /// selected photo ids. Args given (not null) are remembered for the dialog.
+    ///
+    /// A command with `prepare` is asked first ([`Manager::prepare_command`]): a message comes back
+    /// as `{message, ran: false}` and nothing runs; with the arguments it gave, it runs with those
+    /// when `args` is null; with a dialog, `args` are checked against the fields as prepared.
     pub fn run_command(&mut self, id: &str, command: &str, args: &Value, selection: &[String], host: &mut dyn HostApi) -> Result<Value> {
         let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
         let decl = p.plugin.manifest().command(command).ok_or_else(|| Error::Params(format!("plug-in {id} has no command {command:?}")))?;
-        let args = dialog_args(&decl.dialog, args)?;
-        let req = json!({"hook": "command", "command": command, "args": args, "selection": cap(selection)});
+        let declared = decl.dialog.clone();
+        let (fields, checked) = match self.prepare_command(id, command, selection, host)? {
+            Prepared::Message(m) => return Ok(json!({"message": m, "ran": false})),
+            Prepared::Run(given) if args.is_null() => (declared, given),
+            Prepared::Run(_) => {
+                let a = dialog_args(&declared, args)?;
+                (declared, a)
+            }
+            // the prepare step failed: run only with arguments someone chose, never on defaults
+            Prepared::Dialog { error: Some(e), .. } if args.is_null() => return Err(Error::Failed(e)),
+            Prepared::Dialog { fields, .. } => {
+                let a = dialog_args(&fields, args)?;
+                (fields, a)
+            }
+        };
+        if !args.is_null() {
+            self.remember(id, &command_scope(command), &fields, &checked);
+        }
+        let req = json!({"hook": "command", "command": command, "args": checked, "selection": cap(selection)});
         self.invoke(id, &req, host, &[])
+    }
+
+    /// Plug-in `id`'s settings fields and values: the manifest's fields, prepared by the
+    /// `settings.prepare` hook when one of them declares `prepare` (a failure is logged and gives
+    /// the declared fields, with the error), and per field its value (the stored one when the field
+    /// as prepared takes it, else its default).
+    pub fn settings(&mut self, id: &str, host: &mut dyn HostApi) -> Result<SettingsView> {
+        let (fields, error) = self.prepare_settings(id, host)?;
+        let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        let values = p.settings().values(&fields);
+        Ok(SettingsView { fields, values, error })
+    }
+
+    fn prepare_settings(&mut self, id: &str, host: &mut dyn HostApi) -> Result<(Vec<Field>, Option<String>)> {
+        let p = self.plugins.get(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        let declared = p.plugin.manifest().settings.clone();
+        if !declared.iter().any(|f| f.prepare) {
+            return Ok((declared, None));
+        }
+        let answer = self.invoke(id, &json!({"hook": "settings.prepare"}), host, &[]).and_then(|v| {
+            prepared_settings(&declared, &v).map_err(|e| {
+                if let Some(p) = self.plugins.get_mut(id) {
+                    p.push_log(format!("settings.prepare: {e}"));
+                }
+                Error::Failed(format!("settings.prepare: {e}"))
+            })
+        });
+        Ok(match answer {
+            Ok(fields) => (fields, None),
+            Err(e) => (declared, Some(e.to_string())),
+        })
+    }
+
+    /// Changes plug-in `id`'s settings (`values`: key → value, `null` back to the default). Every
+    /// value is checked against its field (as prepared, see [`Manager::settings`]) before any is
+    /// kept: an unknown key or a value that doesn't fit refuses them all. Returns the settings now.
+    pub fn set_settings(&mut self, id: &str, values: &Value, host: &mut dyn HostApi) -> Result<serde_json::Map<String, Value>> {
+        let values = values.as_object().ok_or_else(|| Error::Params("values must be an object {key: value}".into()))?;
+        let (fields, _) = self.prepare_settings(id, host)?;
+        let mut checked = Vec::with_capacity(values.len());
+        for (k, v) in values {
+            let f = fields.iter().find(|f| f.key == *k).ok_or_else(|| Error::Params(format!("plug-in {id} has no setting {k:?}")))?;
+            // a choice whose options weren't given (the prepare step failed) shows "" while unset:
+            // saving the page then keeps it unset rather than refusing every other value
+            let unset = v.is_null() || (f.options_at_run_time() && v.as_str() == Some(""));
+            checked.push((k.clone(), if unset { None } else { Some(f.coerce(v).map_err(Error::Params)?) }));
+        }
+        let p = self.plugins.get_mut(id).ok_or_else(|| Error::NotFound(id.into()))?;
+        let mut s = p.settings();
+        let before: Vec<(String, Option<Value>)> = checked.iter().map(|(k, _)| (k.clone(), s.stored(k))).collect();
+        for (k, v) in checked {
+            if let Err(e) = s.set(&k, v) {
+                // all or nothing: put back what this call changed
+                for (k, v) in before {
+                    let _ = s.set(&k, v);
+                }
+                return Err(e);
+            }
+        }
+        s.save()?;
+        Ok(s.values(&fields))
     }
 
     /// Runs every enabled export hook on the exported files `[{path, photo?}]`. Each hook may read
@@ -528,6 +923,49 @@ impl Manager {
             .filter_map(|p| p.plugin.manifest().publish.clone().map(|s| (p.plugin.id().to_string(), s)))
             .collect()
     }
+}
+
+/// A `command.prepare` answer, checked: exactly one of `{dialog: {<field key>: {options?, default?}}}`,
+/// `{run: args}` (checked against `fields`) or `{message}`.
+fn prepared_answer(fields: &[Field], v: &Value) -> std::result::Result<Prepared, String> {
+    let o = v.as_object().filter(|o| o.len() == 1).ok_or("the answer must be an object with one of `dialog`, `run` or `message`")?;
+    if let Some(m) = o.get("message") {
+        let m = m.as_str().ok_or("`message` must be text")?;
+        return Ok(Prepared::Message(m.chars().take(MAX_PREPARE_MESSAGE).collect()));
+    }
+    if let Some(a) = o.get("run") {
+        if !a.is_object() {
+            return Err("`run` must be an object of arguments".into());
+        }
+        return dialog_args(fields, a).map(Prepared::Run).map_err(|e| format!("`run`: {e}"));
+    }
+    let d = o.get("dialog").ok_or("the answer must have one of `dialog`, `run` or `message`")?;
+    Ok(Prepared::Dialog { fields: prepare_fields(fields, d, |_| true)?, error: None })
+}
+
+/// A `settings.prepare` answer, checked: `{fields: {<key>: {options?, default?}}}` for settings
+/// that declare `prepare`.
+fn prepared_settings(fields: &[Field], v: &Value) -> std::result::Result<Vec<Field>, String> {
+    let o = v.as_object().filter(|o| o.len() == 1).ok_or("the answer must be an object {fields}")?;
+    let f = o.get("fields").ok_or("the answer must be an object {fields}")?;
+    prepare_fields(fields, f, |f| f.prepare)
+}
+
+/// `fields` with the options and defaults in `given` (`{<key>: {options?, default?}}`), each for a
+/// field `may` allows. A choice whose options are given at run time must get them.
+fn prepare_fields(fields: &[Field], given: &Value, may: impl Fn(&Field) -> bool) -> std::result::Result<Vec<Field>, String> {
+    let given = given.as_object().ok_or("expected an object {<field key>: {options?, default?}}")?;
+    if let Some(k) = given.keys().find(|k| !fields.iter().any(|f| f.key == **k && may(f))) {
+        return Err(format!("no field {:?} to prepare", k.chars().take(64).collect::<String>()));
+    }
+    fields
+        .iter()
+        .map(|f| match given.get(&f.key) {
+            Some(o) => f.prepared(o),
+            None if f.options_at_run_time() && may(f) => Err(format!("`{}`: no options given", f.key)),
+            None => Ok(f.clone()),
+        })
+        .collect()
 }
 
 /// Points `store` at `library`; data it claims from before is saved at once, so another library

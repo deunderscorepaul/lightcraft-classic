@@ -28,6 +28,7 @@ pub mod auto_mask;
 pub mod blemish;
 pub mod colorops;
 pub mod cull;
+pub mod curve;
 pub mod dust;
 pub mod finish;
 pub mod geometry;
@@ -48,6 +49,7 @@ pub mod transform;
 pub mod upright;
 pub mod visualize;
 
+pub use curve::{PARAM_AMOUNTS, PARAM_LUT, ParametricCurve};
 pub use output::{DeepImage, DeepSamples, DisplaySpace, OutputDepth, OutputSpace, OutputTrc, Proof, ProofLut, proof_profile, register_proof_profile};
 pub use visualize::{MaskView, Overlay};
 
@@ -109,6 +111,12 @@ pub struct SourceInfo {
     /// spectral sensitivities, so the photo's Profile option can start from them instead of the
     /// look fitted to its JPEG (`lcc_develop::CameraColour`).
     pub colorimetric: bool,
+    /// The source's straight alpha (0..1), EXIF-oriented and the size of the source buffer, when it
+    /// has transparency. The pixels handed to the renderer are flattened onto white in linear light
+    /// (`lcc_codecs::to_working`, issue #1212); an export that keeps transparency recovers
+    /// their colour (`lcc_codecs::unflatten`) and carries this plane through the geometry
+    /// beside the render ([`render_alpha`], issue #2976).
+    pub alpha: Option<Arc<Plane>>,
 }
 
 impl Default for SourceInfo {
@@ -127,6 +135,27 @@ impl Default for SourceInfo {
             filters: None,
             native_long: None,
             colorimetric: false,
+            alpha: None,
+        }
+    }
+}
+
+/// How a render shrinks its source to the output size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Downscale {
+    /// Mitchell–Netravali: soft, no visible ringing. Previews and thumbnails.
+    #[default]
+    Smooth,
+    /// Lanczos-3: keeps the detail a smaller output can hold, as a dedicated downscale does
+    /// (exports, #2970). Its slight overshoot at hard edges stays below the output sharpening's.
+    Sharp,
+}
+
+impl Downscale {
+    pub fn filter(self) -> lcc_raster::resample::Filter {
+        match self {
+            Downscale::Smooth => lcc_raster::resample::Filter::Mitchell,
+            Downscale::Sharp => lcc_raster::resample::Filter::Lanczos3,
         }
     }
 }
@@ -153,7 +182,7 @@ pub struct RenderRequest {
     pub space: OutputSpace,
     /// Sample format: 8-bit only, or also a 16-bit / linear float [`Rendered::deep`] (exports).
     pub depth: OutputDepth,
-    /// Soft proofing (CPU only; see [`Proof`]).
+    /// Soft proofing (a proof against an output-device profile renders on the CPU; see [`Proof`]).
     pub proof: Option<Proof>,
     /// Render only this window of the output that `max_w × max_h` describes (a zoomed view):
     /// the result is that window's pixels, as in the whole render. See [`PixelWindow`].
@@ -161,6 +190,11 @@ pub struct RenderRequest {
     /// Previews for a monitor with a display profile: render 8-bit into its primaries instead of
     /// `space` (see [`DisplaySpace`]; ignored by deep renders).
     pub display: Option<DisplaySpace>,
+    /// Filter of the downscale to the output size.
+    pub downscale: Downscale,
+    /// The output keeps the source's transparency (exports to PNG, TIFF and WebP): the caller
+    /// renders unflattened colour and asks [`render_alpha`] for the alpha (issue #2976).
+    pub alpha: bool,
 }
 
 /// A window of the (virtual) full output, in its pixels: what a zoomed view needs, rendered
@@ -213,6 +247,8 @@ impl RenderRequest {
             proof: None,
             window: None,
             display: None,
+            downscale: Downscale::Smooth,
+            alpha: false,
         }
     }
 }
@@ -229,6 +265,9 @@ pub struct Rendered {
     /// Which pixels of `image` show the photo, when lens corrections or perspective leave a blank
     /// border ([`geometry::Frame::coverage`]); `None` when all of them do. `histogram` leaves the rest out.
     pub coverage: Option<Arc<Coverage>>,
+    /// Straight alpha (0..1) of the output, the size of `image`, when the request keeps the
+    /// source's transparency and the source has some ([`render_alpha`]).
+    pub alpha: Option<Plane>,
 }
 
 /// Everything the per-pixel stage needs, precomputed at output resolution.
@@ -271,6 +310,10 @@ pub fn frame_for(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, apply_cro
     let mut frame = geometry::Frame::with_lens(src.width, src.height, s, apply_crop, info.lens.as_ref());
     if s.optics.remove_ca && s.section_enabled("optics") {
         frame.add_lateral_ca(optics::estimate_lateral_ca(src));
+        if apply_crop {
+            // The estimated CA moves the colour planes too: keep the crop inside every one of them.
+            frame.constrain_to_image(s.geometry.constrain_crop);
+        }
     }
     frame
 }
@@ -462,7 +505,8 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         }
     }
     let s = &*settings;
-    let frame = frame_for(src, info, s, req.apply_crop);
+    let mut frame = frame_for(src, info, s, req.apply_crop);
+    frame.downscale = req.downscale.filter();
     let whole_frame = frame.clone();
     let (full_w, full_h) = frame.fit(req.max_w, req.max_h);
     // sizes and scale are those of the whole output; a window only narrows what is drawn
@@ -589,6 +633,17 @@ pub const HDR_HISTOGRAM_DRAG_EDGE: usize = 192;
 /// an HDR edit shows its SDR rendition; this says how far its highlights go. `None` for SDR edits,
 /// high-bit-depth, windowed and proofed requests (their histogram stays the image's).
 pub fn hdr_histogram(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) -> Option<Histogram> {
+    hdr_histogram_with(s, req, |hreq| render(src, info, s, hreq))
+}
+
+/// [`hdr_histogram`], its render reusing (and refreshing) the intermediate results in `cache`, as
+/// [`render_cached`] does: the same histogram. A slider drag of an HDR edit then redoes only the
+/// stages the slider feeds (a loupe rendered on the GPU leaves its cache's CPU entries free).
+pub fn hdr_histogram_cached(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, cache: &StageCache) -> Option<Histogram> {
+    hdr_histogram_with(s, req, |hreq| render_cached(src, info, s, hreq, cache))
+}
+
+fn hdr_histogram_with(s: &DevelopSettings, req: &RenderRequest, render: impl FnOnce(&RenderRequest) -> Rendered) -> Option<Histogram> {
     // a drag's drafts keep their own histogram: a second render per tick would slow them down
     if !s.hdr.enabled || req.depth != OutputDepth::U8 || req.window.is_some() || req.proof.is_some() || req.quality == Quality::Draft {
         return None;
@@ -605,7 +660,7 @@ pub fn hdr_histogram(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: 
         display: None,
         ..*req
     };
-    let r = render(src, info, s, &hreq);
+    let r = render(&hreq);
     let deep = r.deep?;
     let DeepSamples::F32(v) = &deep.samples else { return None };
     Some(Histogram::of_hdr_image(v.as_chunks::<3>().0, deep.width, r.coverage.as_deref(), lcc_develop::Hdr::MAX_EV_LIMIT as f32))
@@ -620,6 +675,23 @@ pub fn render(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &Render
 /// identical to [`render`]'s.
 pub fn render_cached(src: &Arc<Rgb32f>, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, cache: &StageCache) -> Rendered {
     render_impl(Src::Shared(src), info, s, req, Some(cache))
+}
+
+/// The source's alpha ([`SourceInfo::alpha`]) through the same geometry as [`render`] of the same
+/// arguments: orientation, crop, straighten, flips, lens corrections, Transform / Upright and the
+/// output size. Develop settings never touch it; areas the warp brings in from outside the source
+/// are transparent. `None` when the source has no alpha or a plane that does not match `src`.
+pub fn render_alpha(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest) -> Option<Plane> {
+    let alpha = info.alpha.as_deref().filter(|a| a.width == src.width && a.height == src.height)?;
+    let effective = s.effective();
+    let rendition = settings_for(&effective, req);
+    let plan = plan(src, info, &rendition, req);
+    let a = plan.frame.sample_alpha(alpha, plan.w, plan.h);
+    // (only 8-bit renders are cut back to a window, as in `render_impl`)
+    Some(match plan.keep {
+        Some(k) if req.depth == OutputDepth::U8 => a.crop(k.x, k.y, k.w, k.h),
+        _ => a,
+    })
 }
 
 enum Src<'a> {
@@ -716,7 +788,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         let coverage = frame.coverage(src_img.width, src_img.height, w, h).map(Arc::new);
         let histogram = Histogram::of_srgb8_covered(&image, coverage.as_deref());
         lap("finish (deep)", &mut t);
-        return Rendered { image, histogram, deep: Some(deep), warnings, coverage };
+        return Rendered { image, histogram, deep: Some(deep), warnings, coverage, alpha: None };
     }
     let image = finish::finish(&prep, s, frame, info, req.space, req.display.as_ref(), req.proof, &post);
     lap("finish", &mut t);
@@ -747,7 +819,7 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
         }
         lap("visualize hdr", &mut t);
     }
-    Rendered { image, histogram, deep: None, warnings, coverage }
+    Rendered { image, histogram, deep: None, warnings, coverage, alpha: None }
 }
 
 /// The colour a colour-range mask would sample at normalized image point `p` (OkLab of the

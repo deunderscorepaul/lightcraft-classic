@@ -141,34 +141,52 @@ fn new_brush_starts_a_separate_mask_in_paint_mode() {
     h.settle(SETTLE);
 }
 
-/// A slider hides the overlay; a new mask, an added part, a duplicate or picking a mask in
-/// the list shows it again, so the Overlay menu's mode is what the photo shows (issue #1800).
+/// One rule for the mask overlay (upstream PR 2920, adapted): a mask shows its overlay by itself only
+/// while it has no settings; one with settings is judged by its effect when picked, added to or
+/// duplicated. O (or the eye) shows it to stay, hovering its row shows it, and while a slider is at
+/// work nothing covers the photo. Replaces issue #1800's re-show on every pick.
 #[test]
-fn a_new_or_picked_mask_shows_the_overlay_hidden_by_a_slider() {
+fn a_mask_shows_its_overlay_by_itself_only_without_settings() {
     use lcc_pipeline::Overlay;
     let mut h = detail("panel.masking");
+    let shown = |h: &Headless| matches!(crate::panels::detail::view_overlay(&h.app, &develop(h), false), Overlay::Mask { .. });
+    let rest = |h: &mut Headless| h.app.ui.mask_adjusting_until = None;
     exec(&mut h, "mask.add", json!({"kind": "linear", "start": [0.5, 0.2], "end": [0.5, 0.7]}));
     let first = h.app.session.active_mask.unwrap();
-    let hide = |h: &mut Headless| {
-        exec(h, "mask.adjust", json!({"values": {"exposure": 0.5}}));
-        assert!(!h.app.ui.mask_overlay);
-    };
-    let shown = |h: &Headless| matches!(crate::panels::detail::view_overlay(&h.app, &develop(h), false), Overlay::Mask { .. });
-    hide(&mut h);
+    assert!(shown(&h), "a new mask without settings shows what it selects");
+    exec(&mut h, "mask.adjust", json!({"values": {"exposure": 0.5}}));
+    assert!(!shown(&h), "nothing covers the photo while a slider works");
+    rest(&mut h);
+    assert!(!shown(&h), "a mask with settings shows its effect");
     exec(&mut h, "mask.add", json!({"kind": "radial", "center": [0.4, 0.5], "rx": 0.2, "ry": 0.2}));
-    assert!(shown(&h), "a new mask shows its overlay");
-    hide(&mut h);
+    assert!(shown(&h), "another new mask shows its overlay");
     let r = h.request("ui.clickWidget", json!({"id": format!("mask:{first}")}), T);
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(h.app.session.active_mask, Some(first));
-    assert!(shown(&h), "picking a mask in the list shows its overlay");
+    assert!(shown(&h), "the pointer on the picked row shows what it selects");
+    pointer(&mut h, json!([{"kind": "move", "x": 0.1, "y": 0.9}])); // the pointer leaves the list
+    assert_eq!(h.app.ui.mask_hover, None);
+    rest(&mut h);
+    assert!(!shown(&h), "picking a mask with settings shows its effect");
     for (cmd, params) in
         [("mask.addComponent", json!({"kind": "radial", "op": "add", "center": [0.6, 0.5], "rx": 0.1, "ry": 0.1})), ("mask.duplicate", json!({}))]
     {
-        hide(&mut h);
         exec(&mut h, cmd, params);
-        assert!(shown(&h), "{cmd} shows the overlay");
+        assert!(!shown(&h), "{cmd} on a mask with settings shows its effect");
     }
+    // hovering a mask's row shows it
+    h.app.ui.mask_hover = Some(first);
+    assert!(shown(&h), "hovering the row shows the overlay");
+    h.app.ui.mask_hover = None;
+    // O shows it to stay, through edits; a slider at work still hides it
+    exec(&mut h, "view.maskOverlay", json!({"show": true}));
+    assert!(shown(&h));
+    exec(&mut h, "mask.adjust", json!({"values": {"exposure": 0.7}}));
+    assert!(!shown(&h), "hidden while the slider works");
+    rest(&mut h);
+    assert!(shown(&h), "back when it rests: O keeps it on");
+    exec(&mut h, "mask.select", json!({"id": first}));
+    assert!(shown(&h), "O keeps it on for a picked mask too");
     h.settle(SETTLE);
 }
 
@@ -1134,11 +1152,11 @@ fn local_folder_listed_twice_opens_and_closes_each_row() {
 fn geometry_slider_drag_marks_the_grid() {
     let mut h = detail("panel.crop");
     let spec = lcc_develop::controls::find("geometry.vertical").unwrap();
-    let start = crate::widgets::SliderOut { value: None, drag_started: true, drag_stopped: false, reset: false };
+    let start = crate::widgets::SliderOut { value: None, drag_started: true, drag_stopped: false, reset: false, more: false };
     crate::panels::edit::apply_slider_out(&mut h.app, spec, start, |_, _| Ok(serde_json::Value::Null));
     assert_eq!(h.app.ui.dragging_control.as_deref(), Some("geometry.vertical"));
     h.step();
-    let stop = crate::widgets::SliderOut { value: None, drag_started: false, drag_stopped: true, reset: false };
+    let stop = crate::widgets::SliderOut { value: None, drag_started: false, drag_stopped: true, reset: false, more: false };
     crate::panels::edit::apply_slider_out(&mut h.app, spec, stop, |_, _| Ok(serde_json::Value::Null));
     assert!(h.app.ui.dragging_control.is_none());
     h.settle(SETTLE);
@@ -1168,6 +1186,29 @@ fn edit_in_external_editor_opens_the_copy() {
     assert_eq!(calls.len(), 1);
     assert!(calls[0].0.ends_with("-Edit.tif") && std::path::Path::new(&calls[0].0).exists(), "{calls:?}");
     assert_eq!(calls[0].1, "PhotoCraft");
+    let _ = std::fs::remove_dir_all(&dir);
+    h.settle(SETTLE);
+}
+
+/// An editor that won't open the copy: the copy is in the library already, so the command succeeds
+/// with `failed` set and a toast saying why, instead of an error a script would retry (and make
+/// another copy each time).
+#[test]
+fn edit_in_reports_an_editor_that_wont_open_without_failing() {
+    let dir = std::env::temp_dir().join(format!("lc-ui-ext-fail-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let services = Services { png: None, open_with: Some(Box::new(|_: &str, _: &str| Err("the editor quit".into()))), ..Default::default() };
+    let app = LccApp::new(lcc_engine::Session::with_demo().with_fs(), services);
+    let mut h = Headless::new(app, [1200.0, 800.0], 1.0);
+    h.app.ui.settings.external_editor = "PhotoCraft".into();
+    let n = h.app.session.catalog.len();
+    let r = h.request("engine.execute", json!({"command": "photo.editInExternal", "params": {"dir": dir.to_string_lossy()}}), T);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["failed"], "the editor quit", "{r}");
+    assert_eq!(h.app.session.catalog.len(), n + 1, "the copy stays in the library");
+    let toast = h.app.ui.toast().map(|t| t.0.clone()).unwrap_or_default();
+    assert!(toast.contains("the editor quit"), "{toast}");
     let _ = std::fs::remove_dir_all(&dir);
     h.settle(SETTLE);
 }
@@ -1205,11 +1246,11 @@ fn edit_in_photocraft_opens_a_psd_copy() {
     assert_eq!(r["ok"], false, "{r}");
     assert_eq!((h.app.session.catalog.len(), opened.lock().unwrap().len()), (n, 0), "no copy without PhotoCraft");
     // and it says so, however it was asked for (menu, shortcut, context menu)
-    let toast = h.app.ui.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
-    assert!(toast.contains("isn't installed"), "{toast:?}");
-    h.app.ui.toast = None;
+    let toast = h.app.ui.toast().map(|t| t.0.clone()).unwrap_or_default();
+    assert!(!toast.is_empty(), "the missing editor is reported");
+    h.app.ui.toasts.clear();
     let r = h.app.run("photo.editInPhotoCraft", json!({}));
-    assert!(r.is_err() && h.app.ui.toast.as_ref().is_some_and(|t| t.0.contains("isn't installed")), "{r:?} {:?}", h.app.ui.toast);
+    assert!(r.is_err() && h.app.ui.toast().is_some(), "{r:?} {:?}", h.app.ui.toasts);
     installed.store(true, std::sync::atomic::Ordering::SeqCst);
     let r = h.request("engine.execute", params, T);
     assert_eq!(r["ok"], true, "{r}");
@@ -1280,10 +1321,14 @@ fn open_original_in_external_editor_hands_over_the_raw_itself() {
     assert_eq!(std::fs::read(&a_path).unwrap(), b"raw sensor data", "the original is left as it is");
     assert!(std::fs::read_dir(&dir).unwrap().count() == 2, "nothing is written next to the originals");
 
-    // the editor can be named per call; the active photo must have a file for the menu
-    let r = exec(&mut h, "photo.openOriginalInExternal", json!({"ids": [a.0], "app": "/opt/dxo"}));
+    // the app can name the editor per call, an agent over the control channel can't; the active
+    // photo must have a file for the menu
+    let r = h.app.run("photo.openOriginalInExternal", json!({"ids": [a.0], "app": "/opt/dxo"})).unwrap();
     assert_eq!(r["opened"][0]["path"], a_path.as_str());
     assert_eq!(opened.lock().unwrap().last().unwrap().1, "/opt/dxo");
+    let r = h.request("engine.execute", json!({"command": "photo.openOriginalInExternal", "params": {"ids": [a.0], "app": "/bin/sh"}}), T);
+    assert_eq!(r["ok"], false, "{r}");
+    assert_eq!(opened.lock().unwrap().last().unwrap().1, "/opt/dxo", "nothing more opened");
     exec(&mut h, "library.select", json!({"ids": [a.0]}));
     assert!(crate::menus::ui_enabled(&h.app, "photo.openOriginalInExternal"));
     exec(&mut h, "library.select", json!({"ids": [demo.0]}));

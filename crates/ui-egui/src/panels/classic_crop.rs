@@ -133,7 +133,8 @@ pub(crate) fn transform_body(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
                     if app.ui.tool == "guidedUpright" {
                         app.ui.tool.clear();
                     }
-                    let _ = app.run("geometry.upright", json!({"mode": key}));
+                    let r = app.run("geometry.upright", json!({"mode": key}));
+                    super::upright_note(app, ui.ctx(), r.as_ref().ok());
                 }
             }
             let guided = d.geometry.upright == lcc_develop::Upright::Guided || app.ui.tool == "guidedUpright";
@@ -160,7 +161,8 @@ pub(crate) fn transform_body(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
                 ui.add_space(2.0);
                 if text_button(ui, "uprightUpdate", crate::i18n::tr("Update"), false).clicked() {
                     let mode = serde_json::to_value(d.geometry.upright).unwrap_or_default();
-                    let _ = app.run("geometry.upright", json!({"mode": mode}));
+                    let r = app.run("geometry.upright", json!({"mode": mode}));
+                    super::upright_note(app, ui.ctx(), r.as_ref().ok());
                 }
             }
             ui.add_space(4.0);

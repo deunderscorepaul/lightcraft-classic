@@ -21,8 +21,9 @@ pub(super) fn commands() -> impl Iterator<Item = &'static UiCommand> {
         .chain(crate::timelapse_ui::COMMANDS)
         .chain(crate::panels::filterbar::COMMANDS)
         .chain(crate::import_report::COMMANDS)
-        .chain(crate::touch::COMMANDS)
-        .chain(crate::touch_sheets::COMMANDS)
+        .chain(crate::modern::COMMANDS)
+        .chain(crate::modern_library::COMMANDS)
+        .chain(crate::modern_sheets::COMMANDS)
 }
 
 /// The Edit panel's sections the fork adds: Transform (Upright and the transform sliders, upstream's Geometry in the
@@ -42,6 +43,7 @@ const PLUGIN_COMMANDS: &[UiCommand] = &[
     ("plugins.manager", "Plug-in Manager…", None, "File>Plug-ins"),
     ("plugins.install", "Install Plug-in…", None, ""),
     ("plugins.runItem", "Run Plug-in Command", None, ""),
+    ("plugins.page", "Plug-in Settings", None, ""),
 ];
 #[cfg(target_arch = "wasm32")]
 const PLUGIN_COMMANDS: &[UiCommand] = &[];
@@ -54,10 +56,13 @@ pub(super) fn run(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Value,
     if let Some(r) = crate::catalog_ui::run(app, id, p) {
         return Some(r);
     }
-    if let Some(r) = crate::touch::run(app, id, p) {
+    if let Some(r) = crate::modern::run(app, id, p) {
         return Some(r);
     }
-    if let Some(r) = crate::touch_sheets::run(app, id, p) {
+    if let Some(r) = crate::modern_library::run(app, id, p) {
+        return Some(r);
+    }
+    if let Some(r) = crate::modern_sheets::run(app, id, p) {
         return Some(r);
     }
     #[cfg(not(target_arch = "wasm32"))]

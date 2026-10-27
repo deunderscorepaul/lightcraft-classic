@@ -7,6 +7,10 @@ The CPU pipeline (`crates/pipeline`) is the reference ("oracle"). `lcc-gpu` (`cr
 evaluates the same stages with wgpu compute shaders (WGSL) on Metal / Vulkan / DX12. Everything is
 pure Rust (wgpu, naga); the drivers are the system's. No GL backend is compiled in.
 
+CPU fast guided-filter allocation measurements and reproduction commands are documented in
+[guided-filter-memory.md](guided-filter-memory.md). That optimization retains the full-size base
+and does not change the GPU's coefficient buffers.
+
 Warped geometry uses a CPU-computed coverage bit mask for the source boundary.
 The CPU reference evaluates that boundary in double precision; GPU float
 rounding otherwise can turn a blank edge pixel into a photo pixel. The mask
@@ -48,6 +52,9 @@ Overrides (read once at launch):
 - `<PREFIX>_GPU=0`: GPU rendering off for the process (the window is unaffected).
 - Both `<PREFIX>_GPU=0` and `<PREFIX>_GPU_BACKEND=off` also keep AI Denoise, the face models
   and the AI mask model (SAM 3 on Metal) on the CPU.
+- `<PREFIX>_GPU_INIT_TIMEOUT=<seconds>` (whole seconds, 1–3600; default 30): how long creating a
+  compute device (rendering, AI Denoise, faces) and compiling its kernels may take. See *Device
+  creation time limit* below.
 
 **DX12 shader compiler (issue #471).** Every instance (window and compute) compiles DX12 shaders with
 FXC (`d3dcompiler_47.dll`, part of Windows; `lcc_gpu::backend::backend_options`). wgpu's
@@ -67,10 +74,36 @@ leaves them apart. The transposed convolution's merged store ran right on that c
 `nn::tests::a_layer_stores_every_pixels_channels_where_the_next_reads_them` catches the fault on such a card;
 `a_transposed_convolution_stores_every_pixels_channels_where_the_next_reads_them` checks the other store exactly.
 
+FXC also cannot address two things the WGSL looks harmless with, and answers with `X3550 … forcing loop to unroll`
+and then `X3511 unable to unroll loop` (the shader module fails, so the pipeline is never made): an array handed to a
+function through a pointer (`ptr<function, array<…>>`) that the function then indexes with a loop variable, and a vector
+indexed with a loop variable on the left of an assignment (`acc[ch] = …` with `acc: vec4<f32>`). The block-matching
+kernels (`wgsl/bm3d_*.wgsl`) keep their working arrays at module scope (`var<private>`, one copy of the transforms
+generated per array, `bm3d_transform.wgsl`) and accumulate in `array<f32, 4>` instead. A GPU test that only records a
+skip when the device cannot build the kernels hides this, so read the skip note (`cargo test … -- --nocapture`).
+
 **Off the startup path.** The compute device is created on a background thread once the window is
 up (`gpu::warm_up` from the first frame's settings), and never while GPU rendering is off: with
 Settings ▸ Performance ▸ *Use the GPU for rendering* unchecked (applied before the window opens),
 `<PREFIX>_GPU=0` or `<PREFIX>_GPU_BACKEND=off`, no GPU driver is loaded for rendering at all.
+
+**Device creation time limit (issue #3068).** Creating the wgpu instance, adapter and device calls
+into the driver, which on Linux may first talk to the display server; with one that accepts the
+connection and never answers (a crash-looping WSLg compositor, a stale `WAYLAND_DISPLAY` socket) those
+calls never returned, and every render waiting for the device, and every test that creates one, hung
+for good. wgpu's native calls are synchronous, so each compute device (rendering, denoise, faces) is
+now created, kernels included, on a thread of its own (`lc-gpu-device`, `crates/gpu/src/init.rs`), and
+the caller waits at most `<PREFIX>_GPU_INIT_TIMEOUT` seconds (default 30: a first run that compiles
+every kernel with FXC takes seconds). Past it that device is unavailable for the process, with the
+reason `GPU device creation did not finish in 30 s (<PREFIX>_GPU_INIT_TIMEOUT): …` reported like any
+other creation failure (`perf.gpuReason`, the no-GPU notice, the log), and the blocked thread is left
+behind. That thread, not the caller, holds what must last as long as the driver work does: its share
+of the GPU work in flight, so a quit meanwhile finds the GPU busy (`gpu::wait_idle` returns `false` at
+its own deadline, *Quitting* below), and the crash sentinel, so a quit meanwhile leaves the marker and
+the next launch starts on the CPU (*Crash sentinel* below). While it is left behind, creating another
+kind of device fails at once with the same reason rather than leave a second thread behind; if the
+driver ever answers, the marker is removed, its late device is leaked, not dropped, and later
+creations are tried again. The desktop window's own device is not covered (#410).
 
 **Quitting.** The devices are never dropped, and renders run on worker threads: a render still inside
 the driver while the process exits crashes there (a SIGSEGV in the NVIDIA Vulkan driver on Linux,
@@ -92,7 +125,9 @@ Mac). A kernel the driver refuses without crashing is caught by wgpu error scope
 (`gpu: rendering on the CPU: …`) and renders stay on the CPU. `<PREFIX>_GPU=0` (or Settings ▸
 uncheck *Use the GPU for rendering*) forces the CPU path from the start. If the marker is still there at the next launch, the process died inside
 the driver: the app starts with GPU rendering off (the preference is saved unchecked), removes the
-marker and says so in a notice. Checking *Use the GPU for rendering* again tries the GPU once more
+marker and says so in a notice. The same happens after a quit while a device creation that passed its
+time limit was still inside the driver (above): the driver hung rather than crashed, but it would
+likely hang again, so the next launch starts on the CPU too. Checking *Use the GPU for rendering* again tries the GPU once more
 (and re-arms the sentinel). Not with `<PREFIX>_NO_PREFS` (tests, scripts), and not in a `--memory` session,
 which writes nothing: it neither arms the sentinel nor removes a marker it finds (it still starts with GPU
 rendering off when one is there, and the next ordinary launch reports and clears it). Killing the app during
@@ -104,12 +139,22 @@ or worked around with `<PREFIX>_GPU_BACKEND`.
 **The window's renderer and its fallback (Windows).** Before the window opens, each renderer is probed in
 order: DX12, Vulkan, GL, then eframe's OpenGL renderer (glow). A probe creates a device and builds egui's
 pipeline inside wgpu error scopes, so a driver that cannot compile egui's shaders ("The parameter is
-incorrect. (0x80070057)" in `egui_pipeline`) is logged and skipped instead of killing the app. The renderer
+incorrect. (0x80070057)" in `egui_pipeline`) is logged and skipped instead of killing the app; no pop-up
+unless that renderer was forced (#1624). The renderer
 that worked is remembered in the settings folder (`window-renderer`); a start that dies before the window is up
 leaves `window-init.marker`, and the next start (relaunched automatically, at most 4 times) tries that
 renderer last. `<PREFIX>_GPU_BACKEND=dx12 | vulkan | gl | glow` (or `WGPU_BACKEND`) forces one; DX12 stays
 first because a broken Vulkan driver can crash the process uncatchably (#136). Compute keeps its own
 device and falls back to the CPU as before.
+
+**The window's surface: one frame in flight.** The window's wgpu options start from eframe's defaults
+(`NativeOptions::default().wgpu_options`, `window_gpu::base_options`), whose surface is egui-wgpu's
+`SurfaceConfig::LOW_LATENCY`: vsync, at most one frame queued ahead of the display (two drawables on
+Metal). egui-wgpu's bare `WgpuConfiguration::default()` is `HIGH_THROUGHPUT` (two frames queued, three
+drawables), and the window used it from #136 until this change, so a drag reached the screen one frame
+(8.3 ms at 120 Hz, 16.7 ms at 60 Hz) later. The window's own GPU work is small (egui's meshes and
+texture uploads; renders run on the compute device), which is what `LOW_LATENCY` is meant for.
+During a live window resize egui-wgpu still uses three drawables on macOS.
 
 **Troubleshooting a crash at startup (Windows).** Start the app from a `.cmd` file or a terminal
 with `set <PREFIX>_GPU_BACKEND=dx12` (the default since #136), or `=off` to keep the GPU out of
@@ -164,7 +209,18 @@ walks the drive.
   threads read adjacent pixels; vertical ones slide running sums down chunks of a column), `map`
   (log luminance, dark channel, guided-filter steps, white balance, luminance / colour NR, airlight
   sampling), `mask` (linear / radial / luminance / colour range / brush shapes, combine, finalize),
-  `finish` (the whole per-pixel stage) — each mirrors a named CPU function.
+  `finish` (the whole per-pixel stage), `fit` / `fit_pack` (the loupe's display fit: the 8-bit
+  output unpacked for `resize`'s Lanczos taps and packed back with the CPU's rounding) — each
+  mirrors a named CPU function.
+- Soft proofing against an output space (`RenderRequest::proof`, with its destination and display gamut
+  warnings) runs in `finish`; a proof against an output-device profile (its 3D table) renders on the CPU.
+- Display fit (`lcc_gpu::try_render_fitted`, used by `RenderJob::run` for jobs with a
+  `display_fit`): the render is shrunk to the size it is drawn on the device, after its histogram
+  is binned from the whole frame, and only the fitted image is read back (2560 → 1728 px: 11.4 →
+  3.7 ms with the fit, against the CPU's `fit_rgba8` after a full readback). It matches `fit_rgba8`
+  within 1 LSB (`the_display_fit_on_the_device_matches_the_cpus`). Overlays, a window that spots
+  grew, HDR renders and a monitor profile's conversion keep the CPU fit. A render at rest reads the full
+  image back with the fitted one, for the photo's view preview; a drag's updates cache the fitted one.
 - Per-stage hybrid: defringe and spot removal (rare, CPU-only for now) download the resampled image,
   run on the CPU and upload; heuristic mask shapes (Sky, Subject, Background, …) and brushes of more
   than 4096 dabs are evaluated on the CPU and uploaded; sources over the buffer limit are resampled
@@ -269,6 +325,11 @@ reduction (`DeepImage::to_rgba8`), so the histogram is still binned on the GPU. 
 compares the float samples (sRGB-encoded past 1, ×255) with the CPU's: max < 0.01, mean ≤ 0.0001 steps
 on the AMD Radeon 8060S across tone-map arms, light edits, vignette, curves, grain and an HDR request of
 an SDR edit. 16-bit and SDR float exports, soft proofs and Visualize HDR stay on the CPU (`handles`).
+An HDR view on an HDR display that takes texels (`HdrOutput::texel_headroom`) has its
+`Rgba16Float` texture made on the device (`lcc_gpu::try_render_hdr_texels`, `hdr_texels.wgsl`, the
+same transform as `lcc_engine::hdr_texture::encode_pixel`): 8 bytes a pixel come back instead of 12,
+and the CPU neither unpacks the floats nor encodes them (`the_gpus_hdr_texels_match_the_cpu_encoder`:
+within 2e-3 relative). HDR exports, gain maps and the CPU path keep the floats.
 3000 × 2000 HDR render (release, shared machine): CPU ~200–575 ms, GPU ~50–70 ms
 (`cargo test -p lcc-gpu --release --test it equivalence::hdr_render_time -- --ignored --nocapture`).
 
@@ -276,6 +337,13 @@ Remaining differences come from f32 vs f64 coordinate math, fast-math transcende
 Metal and summation order in the box filters — all far below one 8-bit step.
 
 ## Measurements
+**In the app:** Help ▸ Debug ▸ Frame Rate (`view.frameRate`, `{show?}`; `<PREFIX>_FPS=1`
+starts with it on, never saved) draws frames per second, each frame's UI CPU time against its
+time spent waiting (for vsync, or for the GPU), the latest whole-frame and zoom-window render
+times, the render queue, renders thrown away as superseded, the GPU adapter and its memory, and a
+graph of the last frames with a tick where a render arrived. Once a second it logs the same
+numbers (`fps-hud:`), so a scripted drag (`ui.dragWidget`) can be measured from the log.
+
 `render_bench` on `corpus/raw/arw-sony-a7m3-compressed.arw` (24 MP; loupe = 2560 px preview →
 1920×1280), min of 7 runs, wall clock, on a heavily shared machine (load average 60–110 on 14 cores,
 so CPU numbers are pessimistic; the GPU numbers are less affected):
@@ -316,6 +384,14 @@ average ≈ 105 on 32 threads, so compare the ratio, not the absolute numbers: 1
 16 ms slider budget at loupe size; the GPU path (unchanged, full-resolution blur, 10–18 ms for the
 whole NR drag) is the one that meets it.
 
+On Windows / DX12 the kernels cost more: FXC compiles each pipeline single-threaded inside
+`create_compute_pipeline` (issue #471). Built one after another, the 27 took ~2.2 s on an Intel Core
+Ultra 7 165U iGPU (`app.gpu` 2.4 s median, up to 7 s on the first run after an install), so
+`ctx::build_kernels` shares them out to worker threads (issue #2936): ~1.05 s there (`app.gpu` 1.2 s),
+most likely the largest kernel (`finish.wgsl`) alone (not timed per kernel). wgpu's error scopes are per thread, so every worker
+opens its own; a refused kernel still means no GPU. The `gpu:` info log line gives the kernel count
+and build time.
+
 ## Opening a photo (M5.4)
 - The loupe shows a stand-in at once (`media::QuickJob`): the photo's cached view render for its
   current settings, else (raws with their import look) the embedded camera JPEG, else a
@@ -347,7 +423,9 @@ A view's stages keep an uploaded source only up to 96 MB (a Preview-level source
   sources and rendered previews, evicted least recently used *across* them; the photo on screen
   stays), a quarter for decodes in flight (`memory::work_gate`: grid thumbnails, neighbour
   prefetch and import probes wait for room, loupe and export loads never wait), an eighth for the
-  GPU buffer pool (reuse by best fit within 25 %; freed after 3 s idle).
+  GPU buffer pool (reuse by best fit within 25 %; freed after 3 s idle). "RAM" honours container
+  and cgroup limits: on Linux it is the smaller of `MemTotal` and the process's cgroup memory limit
+  (`memory.max`, set on its cgroup or an ancestor; v1 `memory.limit_in_bytes`), as is merge's 75 %.
 - Decodes free the file's bytes and the raw samples as soon as they are consumed and colour /
   crop / orient in place. macOS keeps freed large blocks resident ("reusable") until the system
   is short of memory, so the resident size climbed with every photo decoded; the apps install
