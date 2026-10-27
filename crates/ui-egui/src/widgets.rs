@@ -1481,6 +1481,52 @@ pub fn icon_button_named(ui: &mut Ui, id: &str, icon: Icon, size: egui::Vec2, ac
     if !tooltip.is_empty() { resp.on_hover_text(tooltip) } else { resp }
 }
 
+/// An icon-only tool button in the tool strip with an optional indicator dot below the icon
+/// (showing that the tool has edits applied to the current photo).
+#[allow(clippy::too_many_arguments)]
+pub fn tool_button(
+    ui: &mut Ui,
+    id: &str,
+    icon: Icon,
+    size: egui::Vec2,
+    active: bool,
+    enabled: bool,
+    applied: bool,
+    name: &str,
+    tooltip: &str,
+) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (r, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, active, name));
+    register(ui.ctx(), format!("icon:{id}"), r);
+    let p = ui.painter();
+    let sq = Rect::from_center_size(r.center(), vec2(32.0f32.min(size.x), 32.0f32.min(size.y)));
+    if active {
+        p.rect_filled(sq, 4.0, t.tool_active);
+    } else if resp.hovered() && enabled {
+        p.rect_filled(sq, 4.0, t.hover.gamma_multiply(0.7));
+    }
+    let c = if !enabled {
+        t.text_disabled
+    } else if active {
+        t.pick
+    } else if resp.hovered() {
+        t.text
+    } else {
+        t.icon
+    };
+    let glyph = (size.x.min(size.y) * 0.58).min(20.0);
+    let icon_center = if applied { pos2(r.center().x, r.center().y - 1.5) } else { r.center() };
+    paint(p, Rect::from_center_size(icon_center, vec2(glyph, glyph)), icon, c);
+    if applied {
+        let dot_color = if active { t.pick } else { t.text_label };
+        let dot_center = pos2(r.center().x, r.bottom() - 4.0);
+        p.circle_filled(dot_center, 1.8, dot_color);
+        register(ui.ctx(), format!("dot:{id}"), Rect::from_center_size(dot_center, vec2(4.0, 4.0)));
+    }
+    if !tooltip.is_empty() { resp.on_hover_text(tooltip) } else { resp }
+}
+
 /// A borderless dropdown button: `text` followed by a painted chevron (no font glyph needed).
 pub fn dropdown(ui: &mut Ui, id: &str, text: &str, font: egui::FontId, color: Color32) -> Response {
     dropdown_within(ui, id, text, font, color, f32::INFINITY)
