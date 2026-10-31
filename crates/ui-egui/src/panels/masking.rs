@@ -194,6 +194,7 @@ fn tile_layout(width: f32, label: impl Fn(f32) -> f32) -> (usize, f32, f32) {
 }
 
 pub fn show(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
+    let popup_open_at_start = egui::Popup::is_any_open(ui.ctx());
     let t = Tokens::get(ui.ctx());
     let d = app.session.develop_of(id).unwrap_or_default();
     egui::Frame::NONE.inner_margin(egui::Margin { left: 12, right: 16, top: 4, bottom: 10 }).show(ui, |ui| {
@@ -344,6 +345,7 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
                 }
                 continue;
             }
+            let collapsed = app.ui.is_mask_collapsed(m.id);
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
             crate::widgets::announce_selected(&resp, m.name.clone(), Some(m.id) == app.session.active_mask);
             register(ui.ctx(), format!("mask:{}", m.id), r);
@@ -361,20 +363,41 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
                     t.chrome
                 },
             );
+
+            // Collapse / expand chevron on the left
+            let chev_r = Rect::from_center_size(pos2(r.left() + 10.0, r.center().y), vec2(14.0, 14.0));
+            register(ui.ctx(), format!("maskCollapse:{}", m.id), chev_r);
+            register(ui.ctx(), format!("button:maskCollapse:{}", m.id), chev_r);
+            let chev_resp = ui.interact(chev_r, egui::Id::new(("maskCollapse", m.id)), Sense::click());
+            paint(
+                ui.painter(),
+                chev_r.shrink(2.0),
+                if collapsed { Icon::ChevronRight } else { Icon::ChevronDown },
+                if chev_resp.hovered() { t.text } else { t.text_dim },
+            );
+            if chev_resp.clicked() {
+                app.ui.toggle_mask_collapsed(m.id);
+            }
+
             let icon = m.components.first().map(|c| kind_label(&c.shape).1).unwrap_or(Icon::Mask);
-            paint(ui.painter(), Rect::from_min_size(r.min + vec2(8.0, 7.0), vec2(16.0, 16.0)), icon, t.text_label);
-            // a long name is cut short (with …) before the bin and the eye, the full name on hover
+            paint(ui.painter(), Rect::from_min_size(pos2(r.left() + 22.0, r.min.y + 7.0), vec2(16.0, 16.0)), icon, t.text_label);
+            // a long name is cut short (with …) before the right buttons, the full name on hover
             let color = if m.visible { t.text } else { t.text_disabled };
-            let g = one_line(ui.painter(), &m.name, t.font(13.0), color, r.width() - 32.0 - 56.0);
+            let right_room = if sel || ui.rect_contains_pointer(r) { 92.0 } else { 28.0 };
+            let g = one_line(ui.painter(), &m.name, t.font(13.0), color, r.width() - 44.0 - right_room);
             let elided = g.elided;
-            let at = pos2(r.left() + 32.0, r.center().y - g.size().y / 2.0);
+            let at = pos2(r.left() + 44.0, r.center().y - g.size().y / 2.0);
             register(ui.ctx(), format!("maskName:{}", m.id), Rect::from_min_size(at, g.size()));
             ui.painter().galley(at, g, color);
             let resp = if elided { resp.on_hover_text(&m.name) } else { resp };
+
+            let right = r.right();
+            let cy = r.center().y;
+
             // show / hide on hover (and always while hidden)
-            // (the pointer test, not `hovered`: over the eye, the row itself no longer counts as hovered)
+            let mut eye_clicked = false;
             if ui.rect_contains_pointer(r) || !m.visible {
-                let er = Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(22.0, 22.0));
+                let er = Rect::from_center_size(pos2(right - 14.0, cy), vec2(22.0, 22.0));
                 register(ui.ctx(), format!("maskVisible:{}", m.id), er);
                 let eye = ui.interact(er, egui::Id::new(("maskVisible", m.id)), Sense::click());
                 crate::widgets::announce_selected(&eye, crate::i18n::tr("Show mask"), m.visible);
@@ -385,142 +408,262 @@ pub fn show(app: &mut LccApp, ui: &mut egui::Ui, id: PhotoId) {
                     if eye.hovered() { t.text } else { t.text_dim },
                 );
                 if eye.clicked() {
+                    eye_clicked = true;
                     let _ = app.run("mask.visible", json!({"id": m.id}));
                 }
             }
-            // delete on hover, left of the eye (issue #642; Lightroom has it only in the menu)
+
+            // delete only on hover over the parent mask (issue #642, #694)
+            let mut bin_clicked = false;
             if ui.rect_contains_pointer(r) {
-                let br = Rect::from_center_size(pos2(r.right() - 40.0, r.center().y), vec2(22.0, 22.0));
+                let br = Rect::from_center_size(pos2(right - 36.0, cy), vec2(22.0, 22.0));
                 register(ui.ctx(), format!("maskDeleteRow:{}", m.id), br);
+                register(ui.ctx(), "button:maskDelete", br);
+                register(ui.ctx(), format!("button:maskDeleteRow:{}", m.id), br);
                 let bin = ui.interact(br, egui::Id::new(("maskDeleteRow", m.id)), Sense::click());
                 crate::widgets::announce(&bin, crate::i18n::tr("Delete Mask"));
                 paint(ui.painter(), br.shrink(3.0), Icon::Trash, if bin.hovered() { t.text } else { t.text_dim });
                 let bin = bin.on_hover_text(crate::i18n::tr("Delete Mask"));
                 if bin.clicked() {
+                    bin_clicked = true;
                     let _ = app.run("mask.delete", json!({"id": m.id}));
                 }
             }
-            if resp.clicked() {
+
+            // minus button inline with parent mask (issue #694)
+            let mut minus_clicked = false;
+            if sel || ui.rect_contains_pointer(r) {
+                let mr = Rect::from_center_size(pos2(right - 58.0, cy), vec2(20.0, 20.0));
+                register(ui.ctx(), format!("maskMinus:{}", m.id), mr);
+                register(ui.ctx(), format!("button:maskMinus:{}", m.id), mr);
+                register(ui.ctx(), format!("button:maskMinus{}", m.id), mr);
+                let minus = ui.interact(mr, egui::Id::new(("maskMinus", m.id)), Sense::click());
+                crate::widgets::announce(&minus, crate::i18n::tr("Subtract from this mask"));
+                paint(ui.painter(), mr.shrink(3.0), Icon::Minus, if minus.hovered() { t.text } else { t.text_dim });
+                let minus = minus.on_hover_text(crate::i18n::tr("Subtract from this mask"));
+                if minus.clicked() {
+                    minus_clicked = true;
+                    if !sel {
+                        let _ = app.run("mask.select", json!({"id": m.id}));
+                    }
+                    app.ui.collapsed_masks.remove(&m.id);
+                }
+                egui::Popup::menu(&minus).show(|ui| component_menu(app, ui, "subtract"));
+            }
+
+            // plus button inline with parent mask (issue #694)
+            let mut plus_clicked = false;
+            if sel || ui.rect_contains_pointer(r) {
+                let pr = Rect::from_center_size(pos2(right - 78.0, cy), vec2(20.0, 20.0));
+                register(ui.ctx(), format!("maskPlus:{}", m.id), pr);
+                register(ui.ctx(), format!("button:maskPlus:{}", m.id), pr);
+                register(ui.ctx(), format!("button:maskPlus{}", m.id), pr);
+                let plus = ui.interact(pr, egui::Id::new(("maskPlus", m.id)), Sense::click());
+                crate::widgets::announce(&plus, crate::i18n::tr("Add to this mask"));
+                paint(ui.painter(), pr.shrink(3.0), Icon::Plus, if plus.hovered() { t.text } else { t.text_dim });
+                let plus = plus.on_hover_text(crate::i18n::tr("Add to this mask"));
+                if plus.clicked() {
+                    plus_clicked = true;
+                    if !sel {
+                        let _ = app.run("mask.select", json!({"id": m.id}));
+                    }
+                    app.ui.collapsed_masks.remove(&m.id);
+                }
+                egui::Popup::menu(&plus).show(|ui| component_menu(app, ui, "add"));
+            }
+
+            if resp.clicked() && !eye_clicked && !bin_clicked && !minus_clicked && !plus_clicked && !chev_resp.clicked() && !popup_open_at_start {
                 let _ = app.run("mask.select", json!({"id": m.id}));
+                if app.ui.active_mask_component.is_none() {
+                    app.ui.active_mask_component = Some(0);
+                }
             }
             if resp.double_clicked() {
                 app.ui.renaming_mask = Some((m.id, m.name.clone()));
             }
             crate::widgets::context_menu(&resp, |ui| mask_menu(app, ui, m.id, &m.name, m.visible, index, count));
+
             if sel {
-                // right under the selected mask: ＋ adds to it, − takes away from it (any mask
-                // type; Describe… opens its field here)
-                ui.horizontal(|ui| {
-                    ui.add_space(30.0);
-                    let plus = mask_icon(ui, &format!("maskPlus:{}", m.id), Icon::Plus, "Add to this mask", false);
-                    egui::Popup::menu(&plus).show(|ui| component_menu(app, ui, "add"));
-                    let minus = mask_icon(ui, &format!("maskMinus:{}", m.id), Icon::Minus, "Subtract from this mask", false);
-                    egui::Popup::menu(&minus).show(|ui| component_menu(app, ui, "subtract"));
-                });
                 describe_field(app, ui, false);
             }
-        }
-        if app.session.active_mask.is_none() && !d.masks.is_empty() {
-            ui.add_space(6.0);
-            show_overlay_row(app, ui);
+
+            // Sub masks (components) directly under the parent mask (issue #694)
+            if !collapsed {
+                let cur_d = app.session.develop_of(id).unwrap_or_default();
+                if let Some(cur_m) = cur_d.masks.iter().find(|x| x.id == m.id) {
+                    if sel {
+                        if app.ui.active_mask_component.is_none() && !cur_m.components.is_empty() {
+                            app.ui.active_mask_component = Some(0);
+                        } else if let Some(ci) = app.ui.active_mask_component
+                            && ci >= cur_m.components.len()
+                        {
+                            app.ui.active_mask_component = cur_m.components.len().checked_sub(1);
+                        }
+                    }
+                    for (i, c) in cur_m.components.iter().enumerate() {
+                        let (kind, icon) = kind_label(&c.shape);
+                        let label = c.name.clone().unwrap_or_else(|| match &c.shape {
+                            MaskShape::Prompt { text, .. } => format!("“{text}”"),
+                            _ => menu_label(kind).to_string(),
+                        });
+                        let comp_sel = sel && app.ui.active_mask_component == Some(i);
+                        if let Some((_, _, name)) = app.ui.renaming_component.as_mut().filter(|(mid, k, _)| *mid == m.id && *k == i) {
+                            let r =
+                                ui.add(egui::TextEdit::singleline(name).desired_width(ui.available_width() - 30.0).id_salt(("compRename", m.id, i)));
+                            register(ui.ctx(), format!("componentRename:{i}"), r.rect);
+                            if !r.has_focus() && !r.lost_focus() {
+                                r.request_focus();
+                            }
+                            if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                                app.ui.renaming_component = None;
+                            } else if r.lost_focus() {
+                                let name = name.trim().to_string();
+                                app.ui.renaming_component = None;
+                                if Some(&name) != c.name.as_ref() {
+                                    let _ = app.run("mask.component", json!({"id": m.id, "component": i, "action": "rename", "name": name}));
+                                }
+                            }
+                            continue;
+                        }
+                        ui.add_space(2.0);
+                        let full_w = ui.available_width();
+                        let indent = 20.0;
+                        let (full_r, _) = ui.allocate_exact_size(vec2(full_w, 28.0), Sense::hover());
+                        let r = Rect::from_min_size(pos2(full_r.min.x + indent, full_r.min.y), vec2(full_w - indent, 28.0));
+                        let resp = ui.interact(r, egui::Id::new(("compRow", m.id, i)), Sense::click());
+                        crate::widgets::announce_selected(&resp, label.clone(), comp_sel);
+                        register(ui.ctx(), format!("component:{i}"), r);
+                        ui.painter().rect_filled(
+                            r,
+                            4.0,
+                            if comp_sel {
+                                t.tool_active
+                            } else if resp.hovered() {
+                                t.hover.gamma_multiply(0.7)
+                            } else {
+                                t.chrome.gamma_multiply(0.9)
+                            },
+                        );
+
+                        let op = match c.op {
+                            lcc_develop::MaskOp::Add => "",
+                            lcc_develop::MaskOp::Subtract => "− ",
+                            lcc_develop::MaskOp::Intersect => "∩ ",
+                        };
+                        let icon_r = Rect::from_min_size(r.min + vec2(6.0, 6.0), vec2(16.0, 16.0));
+                        paint(ui.painter(), icon_r, icon, if comp_sel { t.text } else { t.text_label });
+
+                        let text = format!("{op}{label}{}", if c.invert { crate::i18n::tr(" (inverted)") } else { "" });
+                        let g = one_line(ui.painter(), &text, t.font(12.5), if comp_sel { t.text } else { t.text_dim }, r.width() - 28.0 - 52.0);
+                        let at = pos2(r.left() + 26.0, r.center().y - g.size().y / 2.0);
+                        ui.painter().galley(at, g, if comp_sel { t.text } else { t.text_dim });
+
+                        // Bin icon next to the three dots
+                        let bin_r = Rect::from_center_size(pos2(r.right() - 36.0, r.center().y), vec2(20.0, 20.0));
+                        register(ui.ctx(), format!("componentDelete:{i}"), bin_r);
+                        register(ui.ctx(), format!("button:componentDelete:{i}"), bin_r);
+                        register(ui.ctx(), format!("button:componentDelete{i}"), bin_r);
+                        let comp_bin = ui.interact(bin_r, egui::Id::new(("componentDelete", m.id, i)), Sense::click());
+                        crate::widgets::announce(&comp_bin, crate::i18n::tr("Delete component"));
+                        paint(ui.painter(), bin_r.shrink(2.5), Icon::Trash, if comp_bin.hovered() { t.text } else { t.text_dim });
+                        let comp_bin = comp_bin.on_hover_text(crate::i18n::tr("Delete component"));
+                        if comp_bin.clicked() {
+                            let _ = app.run("mask.component", json!({"id": m.id, "component": i, "action": "delete"}));
+                            if app.ui.active_mask_component == Some(i) {
+                                app.ui.active_mask_component = i.checked_sub(1);
+                            }
+                        }
+
+                        // Options (three dots) button
+                        let more_r = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(20.0, 20.0));
+                        register(ui.ctx(), format!("button:componentMenu{i}"), more_r);
+                        register(ui.ctx(), format!("button:componentMenu:{i}"), more_r);
+                        let more = ui.interact(more_r, egui::Id::new(("componentMenu", m.id, i)), Sense::click());
+                        let more = more.on_hover_text(crate::i18n::tr("Component options"));
+                        let g_dots = ui.painter().layout_no_wrap("…".to_string(), t.font(13.0), if more.hovered() { t.text } else { t.text_dim });
+                        let at_dots = pos2(more_r.center().x - g_dots.size().x / 2.0, more_r.center().y - g_dots.size().y / 2.0);
+                        ui.painter().galley(at_dots, g_dots, if more.hovered() { t.text } else { t.text_dim });
+                        egui::Popup::menu(&more).show(|ui| component_row_menu(app, ui, m.id, i, &label, cur_m.components.len()));
+
+                        if resp.clicked() && !comp_bin.clicked() && !more.clicked() && !popup_open_at_start {
+                            if !sel {
+                                let _ = app.run("mask.select", json!({"id": m.id}));
+                            }
+                            app.ui.active_mask_component = Some(i);
+                            match &c.shape {
+                                MaskShape::Brush { .. } => app.ui.tool = "brush".into(),
+                                MaskShape::Linear { .. } => app.ui.tool = "linear".into(),
+                                MaskShape::Radial { .. } => app.ui.tool = "radial".into(),
+                                MaskShape::ColorRange { .. } => app.ui.tool = "colorRange".into(),
+                                MaskShape::LuminanceRange { .. } => app.ui.tool = "luminanceRange".into(),
+                                MaskShape::DepthRange { .. } => app.ui.tool = "depthRange".into(),
+                                MaskShape::Object { .. } => app.ui.tool = "object".into(),
+                                MaskShape::Prompt { .. } => app.ui.tool = "prompt".into(),
+                                _ => {}
+                            }
+                        }
+                        if resp.double_clicked() {
+                            app.ui.renaming_component = Some((m.id, i, label.clone()));
+                        }
+                        crate::widgets::context_menu(&resp, |ui| component_row_menu(app, ui, m.id, i, &label, cur_m.components.len()));
+
+                        range_controls(app, ui, i, &c.shape);
+                    }
+
+                    // Core combination action bar and refinement sliders for the active mask
+                    if sel {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let total_w = 4.0 * 32.0 + 3.0 * 4.0;
+                            let pad = ((ui.available_width() - total_w) / 2.0).max(0.0);
+                            ui.add_space(pad);
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let add = mask_icon(ui, "maskAddComp", Icon::MaskAdd, "Add", false);
+                            egui::Popup::menu(&add).show(|ui| component_menu(app, ui, "add"));
+                            let sub = mask_icon(ui, "maskSubComp", Icon::MaskSubtract, "Subtract", false);
+                            egui::Popup::menu(&sub).show(|ui| component_menu(app, ui, "subtract"));
+                            let int = mask_icon(ui, "maskIntComp", Icon::MaskIntersect, "Intersect", false);
+                            egui::Popup::menu(&int).show(|ui| component_menu(app, ui, "intersect"));
+                            if mask_icon(ui, "maskInvert", Icon::MaskInvert, "Invert", cur_m.invert).clicked() {
+                                let _ = app.run("mask.invert", json!({}));
+                            }
+                        });
+                        ui.add_space(6.0);
+                        let refine = ControlSpec {
+                            id: "refine",
+                            label: "Refine Edges",
+                            section: Section::Light,
+                            min: 0.0,
+                            max: 100.0,
+                            default: 0.0,
+                            step: 1.0,
+                            decimals: 0,
+                            track: Track::Plain,
+                        };
+                        let out = slider(ui, &refine, cur_m.refine, true, None);
+                        apply_slider_out(app, &refine, out, |app, v| app.run("mask.refine", json!({"value": v})));
+                        let feather = ControlSpec { id: "maskFeather", label: "Feather", ..refine };
+                        let out = slider(ui, &feather, cur_m.feather, true, None);
+                        apply_slider_out(app, &feather, out, |app, v| app.run("mask.feather", json!({"value": v})));
+                    }
+                }
+            }
+            ui.add_space(4.0);
         }
     });
     app.ui.mask_hover = hovered_row;
-    let Some(mid) = app.session.active_mask else { return };
+    let Some(mid) = app.session.active_mask else {
+        if !d.masks.is_empty() {
+            divider(ui);
+            egui::Frame::NONE.inner_margin(egui::Margin { left: 12, right: 16, top: 4, bottom: 4 }).show(ui, |ui| {
+                show_overlay_row(app, ui);
+            });
+        }
+        return;
+    };
     let Some(m) = d.masks.iter().find(|m| m.id == mid).cloned() else { return };
     divider(ui);
-    egui::Frame::NONE.inner_margin(egui::Margin { left: 12, right: 16, top: 8, bottom: 8 }).show(ui, |ui| {
-        for (i, c) in m.components.iter().enumerate() {
-            let (kind, icon) = kind_label(&c.shape);
-            let label = c.name.clone().unwrap_or_else(|| match &c.shape {
-                MaskShape::Prompt { text, .. } => format!("“{text}”"),
-                _ => menu_label(kind).to_string(),
-            });
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                paint(ui.painter(), r, icon, t.text_label);
-                let op = match c.op {
-                    lcc_develop::MaskOp::Add => "",
-                    lcc_develop::MaskOp::Subtract => "− ",
-                    lcc_develop::MaskOp::Intersect => "∩ ",
-                };
-                if let Some((_, _, name)) = app.ui.renaming_component.as_mut().filter(|(mid, k, _)| *mid == m.id && *k == i) {
-                    // inline rename: Enter (or leaving the field) commits, Escape cancels
-                    let r = ui.add(egui::TextEdit::singleline(name).desired_width(ui.available_width() - 30.0).id_salt(("compRename", m.id, i)));
-                    register(ui.ctx(), format!("componentRename:{i}"), r.rect);
-                    if !r.has_focus() && !r.lost_focus() {
-                        r.request_focus();
-                    }
-                    if ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
-                        app.ui.renaming_component = None;
-                    } else if r.lost_focus() {
-                        let name = name.trim().to_string();
-                        app.ui.renaming_component = None;
-                        if Some(&name) != c.name.as_ref() {
-                            let _ = app.run("mask.component", json!({"id": m.id, "component": i, "action": "rename", "name": name}));
-                        }
-                    }
-                    return;
-                }
-                // a long name is cut short (with …) before the options button, not past the panel
-                let text = format!("{op}{label}{}", if c.invert { crate::i18n::tr(" (inverted)") } else { "" });
-                let room = (ui.available_width() - 30.0).max(0.0);
-                let resp = ui.scope(|ui| {
-                    ui.set_max_width(room);
-                    ui.add(egui::Label::new(text).truncate().sense(Sense::click()))
-                });
-                let resp = resp.inner;
-                register(ui.ctx(), format!("component:{i}"), resp.rect);
-                if resp.double_clicked() {
-                    app.ui.renaming_component = Some((m.id, i, label.clone()));
-                }
-                crate::widgets::context_menu(&resp, |ui| component_row_menu(app, ui, m.id, i, &label, m.components.len()));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let more = ui.small_button("…").on_hover_text(crate::i18n::tr("Component options"));
-                    register(ui.ctx(), format!("button:componentMenu{i}"), more.rect);
-                    egui::Popup::menu(&more).show(|ui| component_row_menu(app, ui, m.id, i, &label, m.components.len()));
-                });
-            });
-            range_controls(app, ui, i, &c.shape);
-        }
-        ui.add_space(6.0);
-        // one row of icons (issue #972, #694), strictly centered and enlarged
-        ui.horizontal(|ui| {
-            let total_w = 5.0 * 32.0 + 4.0 * 4.0;
-            let pad = ((ui.available_width() - total_w) / 2.0).max(0.0);
-            ui.add_space(pad);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let add = mask_icon(ui, "maskAddComp", Icon::MaskAdd, "Add", false);
-            egui::Popup::menu(&add).show(|ui| component_menu(app, ui, "add"));
-            let sub = mask_icon(ui, "maskSubComp", Icon::MaskSubtract, "Subtract", false);
-            egui::Popup::menu(&sub).show(|ui| component_menu(app, ui, "subtract"));
-            let int = mask_icon(ui, "maskIntComp", Icon::MaskIntersect, "Intersect", false);
-            egui::Popup::menu(&int).show(|ui| component_menu(app, ui, "intersect"));
-            if mask_icon(ui, "maskInvert", Icon::MaskInvert, "Invert", m.invert).clicked() {
-                let _ = app.run("mask.invert", json!({}));
-            }
-            if mask_icon(ui, "maskDelete", Icon::Trash, "Delete mask", false).clicked() {
-                let _ = app.run("mask.delete", json!({}));
-            }
-        });
-        ui.add_space(6.0);
-        let refine = ControlSpec {
-            id: "refine",
-            label: "Refine Edges",
-            section: Section::Light,
-            min: 0.0,
-            max: 100.0,
-            default: 0.0,
-            step: 1.0,
-            decimals: 0,
-            track: Track::Plain,
-        };
-        let out = slider(ui, &refine, m.refine, true, None);
-        apply_slider_out(app, &refine, out, |app, v| app.run("mask.refine", json!({"value": v})));
-        let feather = ControlSpec { id: "maskFeather", label: "Feather", ..refine };
-        let out = slider(ui, &feather, m.feather, true, None);
-        apply_slider_out(app, &feather, out, |app, v| app.run("mask.feather", json!({"value": v})));
-        ui.add_space(4.0);
+    egui::Frame::NONE.inner_margin(egui::Margin { left: 12, right: 16, top: 4, bottom: 4 }).show(ui, |ui| {
         show_overlay_row(app, ui);
     });
     if app.ui.tool == "brush" {
@@ -989,6 +1132,11 @@ pub(crate) fn start_object(app: &mut LccApp, ctx: &egui::Context, op: &str) {
     match r {
         Ok(_) => {
             app.ui.tool = "object".into();
+            if let Some(d) = app.session.active().and_then(|id| app.session.develop_of(id))
+                && let Some(m) = d.masks.iter().find(|m| Some(m.id) == app.session.active_mask)
+            {
+                app.ui.active_mask_component = Some(m.components.len().saturating_sub(1));
+            }
             app.toast(ctx, crate::i18n::tr("Click the object to select it · ⌥-click leaves a part out"));
         }
         Err(e) => app.ai_error(ctx, e, Some(("object", op))),
@@ -1130,6 +1278,14 @@ fn component_menu(app: &mut LccApp, ui: &mut egui::Ui, op: &str) {
                 let _ = app.run("tool.brush", json!({"op": op}));
             } else {
                 let _ = app.run("mask.addComponent", json!({"op": op, "kind": kind}));
+                if matches!(kind, "linear" | "radial" | "colorRange" | "luminanceRange" | "depthRange") {
+                    app.ui.tool = kind.to_string();
+                }
+            }
+            if let Some(d) = app.session.active().and_then(|id| app.session.develop_of(id))
+                && let Some(m) = d.masks.iter().find(|m| Some(m.id) == app.session.active_mask)
+            {
+                app.ui.active_mask_component = Some(m.components.len().saturating_sub(1));
             }
         }
     }

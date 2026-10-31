@@ -740,6 +740,8 @@ fn issue_694_masking_panel_ergonomics_and_overlay_menu() {
     assert!(has(&mut h, "button:maskSubComp"));
     assert!(has(&mut h, "button:maskIntComp"));
     assert!(has(&mut h, "button:maskInvert"));
+    h.request("ui.hoverWidget", json!({"id": "mask:1"}), T);
+    h.settle(SETTLE);
     assert!(has(&mut h, "button:maskDelete"));
 
     // Overlay row widgets: checkbox, menu button, color swatch, stack icon
@@ -754,6 +756,73 @@ fn issue_694_masking_panel_ergonomics_and_overlay_menu() {
     h.settle(Duration::from_secs(5));
     assert!(!has(&mut h, "slider:edge"), "redundant Edge slider should not be present");
     assert!(has(&mut h, "slider:refine"), "Refine Edges slider should be present");
+}
+
+/// Issue #694: Sub-actions (components) are directly under their parent mask, clickable to adjust,
+/// collapsible via disclosure chevron, have individual delete bin icons, and the parent mask delete
+/// bin icon appears only when hovering over the parent mask.
+#[test]
+fn issue_694_sub_actions_click_collapse_delete() {
+    let mut h = detail("panel.masking");
+    exec(&mut h, "mask.add", json!({"kind": "radial", "center": [0.5, 0.5], "rx": 0.2, "ry": 0.2}));
+    h.settle(SETTLE);
+    let has = |h: &mut Headless, id: &str| h.request("ui.widgets", json!({"filter": id}), T).to_string().contains(&format!("\"{id}\""));
+
+    // Add a linear component to the mask
+    exec(&mut h, "mask.addComponent", json!({"kind": "linear", "op": "add", "start": [0.3, 0.3], "end": [0.7, 0.7]}));
+    h.settle(SETTLE);
+
+    // Add a brush component to the mask
+    exec(&mut h, "tool.brush", json!({"op": "subtract"}));
+    h.settle(SETTLE);
+
+    assert_eq!(develop(&h).masks[0].components.len(), 3);
+
+    // Parent mask delete bin shows only on hover
+    assert!(!has(&mut h, "maskDeleteRow:1"), "parent bin hidden without hover");
+    h.request("ui.hoverWidget", json!({"id": "mask:1"}), T);
+    h.settle(SETTLE);
+    assert!(has(&mut h, "maskDeleteRow:1"), "parent bin visible when hovered");
+    assert!(has(&mut h, "button:maskDelete"), "parent bin button registered");
+
+    // Inline + and - buttons are present on the parent mask row
+    assert!(has(&mut h, "button:maskPlus:1"));
+    assert!(has(&mut h, "button:maskMinus:1"));
+
+    // Sub-components are present directly under parent mask
+    assert!(has(&mut h, "component:0"));
+    assert!(has(&mut h, "component:1"));
+    assert!(has(&mut h, "component:2"));
+    assert!(has(&mut h, "button:componentDelete:1"));
+
+    // Clicking a sub-component activates it and sets the tool
+    click(&mut h, "component:1");
+    h.settle(SETTLE);
+    assert_eq!(h.app.ui.active_mask_component, Some(1));
+    assert_eq!(h.app.ui.tool, "linear");
+
+    click(&mut h, "component:2");
+    h.settle(SETTLE);
+    assert_eq!(h.app.ui.active_mask_component, Some(2));
+    assert_eq!(h.app.ui.tool, "brush");
+
+    // Deleting a sub-component via its bin icon
+    click(&mut h, "button:componentDelete:1");
+    h.settle(SETTLE);
+    assert_eq!(develop(&h).masks[0].components.len(), 2);
+
+    // Collapsing the parent mask hides components
+    assert!(!h.app.ui.is_mask_collapsed(1));
+    click(&mut h, "button:maskCollapse:1");
+    h.settle(SETTLE);
+    assert!(h.app.ui.is_mask_collapsed(1));
+    assert!(!has(&mut h, "component:0"), "components hidden when collapsed");
+
+    // Expanding it shows them again
+    click(&mut h, "button:maskCollapse:1");
+    h.settle(SETTLE);
+    assert!(!h.app.ui.is_mask_collapsed(1));
+    assert!(has(&mut h, "component:0"), "components visible when expanded");
 }
 
 #[test]

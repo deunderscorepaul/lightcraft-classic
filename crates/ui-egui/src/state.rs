@@ -1054,6 +1054,12 @@ pub struct UiState {
     /// being adjusted.
     #[serde(skip)]
     pub mask_hover: Option<u32>,
+    /// Active mask component index within the currently selected mask.
+    #[serde(skip)]
+    pub active_mask_component: Option<usize>,
+    /// Mask IDs whose sub-actions are collapsed in the masking panel.
+    #[serde(default)]
+    pub collapsed_masks: std::collections::HashSet<u32>,
     /// Mirroring of the triangle / spiral crop guides (0..4).
     pub crop_overlay_orient: u8,
     pub crop_overlay: CropOverlay,
@@ -1893,6 +1899,8 @@ impl Default for UiState {
             mask_overlay_pinned: false,
             mask_adjusting_until: None,
             mask_hover: None,
+            active_mask_component: None,
+            collapsed_masks: Default::default(),
             view: ViewMode::Detail,
             modern: crate::modern::ModernUi::default(),
             left_panel: false,
@@ -2142,6 +2150,20 @@ impl UiState {
             self.folded_sections.retain(|s| s != id);
         } else {
             self.folded_sections.push(id.to_string());
+        }
+    }
+
+    /// Whether a mask's components are collapsed in the Masking panel.
+    pub fn is_mask_collapsed(&self, id: u32) -> bool {
+        self.collapsed_masks.contains(&id)
+    }
+
+    /// Toggle whether a mask's components are collapsed in the Masking panel.
+    pub fn toggle_mask_collapsed(&mut self, id: u32) {
+        if self.collapsed_masks.contains(&id) {
+            self.collapsed_masks.remove(&id);
+        } else {
+            self.collapsed_masks.insert(id);
         }
     }
 

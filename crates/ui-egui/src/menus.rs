@@ -1669,6 +1669,11 @@ pub fn run_ui_command(app: &mut LccApp, id: &str, p: &Value) -> Option<Result<Va
                         }
                         app.ui.brush_erase = false;
                         app.ui.mask_overlay = true;
+                        if let Some(d) = app.session.active().and_then(|id| app.session.develop_of(id))
+                            && let Some(m) = d.masks.iter().find(|m| Some(m.id) == app.session.active_mask)
+                        {
+                            app.ui.active_mask_component = Some(m.components.len().saturating_sub(1));
+                        }
                     }
                     app.ui.right = RightPanel::Masking;
                     app.ui.view = ViewMode::Detail;
