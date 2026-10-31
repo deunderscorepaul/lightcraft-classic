@@ -3302,7 +3302,9 @@ fn mask_overlay(app: &mut LccApp, ui: &mut egui::Ui, resp: &egui::Response, map:
                 }
                 _ => {}
             }
+            let pin_allowed = sel || app.ui.mask_unselected_pins;
             if app.ui.mask_pins
+                && pin_allowed
                 && mode.shows(sel, live)
                 && let Some(at) = component_pin(&c.shape)
             {

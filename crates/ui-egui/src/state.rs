@@ -1027,6 +1027,12 @@ pub struct UiState {
     pub mask_overlay_color: [u8; 3],
     pub mask_overlay_opacity: f32,
     pub mask_pins: bool,
+    /// Whether unselected mask pins are shown (Alt+V / Option+V).
+    #[serde(default = "yes")]
+    pub mask_unselected_pins: bool,
+    /// Automatically toggle mask overlay while adjusting or editing.
+    #[serde(default = "yes")]
+    pub mask_overlay_auto: bool,
     /// When the Remove tool's spot pins and the mask pins show (Shift+H cycles). Mask pins also
     /// need [`mask_pins`](Self::mask_pins).
     pub tool_overlay: ToolOverlay,
@@ -1922,6 +1928,8 @@ impl Default for UiState {
             mask_overlay_color: [230, 30, 40],
             mask_overlay_opacity: 50.0,
             mask_pins: true,
+            mask_unselected_pins: true,
+            mask_overlay_auto: true,
             tool_overlay: ToolOverlay::Auto,
             mask_overlay_all: false,
             crop_overlay: CropOverlay::Thirds,
